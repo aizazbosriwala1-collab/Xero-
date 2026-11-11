@@ -16,6 +16,12 @@ import { encryptionService, EncryptionService } from '../src/services/encryption
 import { sanitizeObject } from '../src/services/logger.js';
 import { config } from '../src/config/env.js';
 import { adminHandler } from '../src/telegram/handlers/admin.js';
+import { customerHandler } from '../src/telegram/handlers/customer.js';
+import {
+  getProductListKeyboard,
+  getProductDetailKeyboard,
+  getMoreDetailsKeyboard,
+} from '../src/telegram/keyboards.js';
 
 interface TestResult {
   name: string;
@@ -1348,6 +1354,303 @@ export async function runComprehensiveTests() {
       "SELECT COUNT(*) as count FROM giveaway_claims WHERE user_id = 'ref_master_x'"
     );
     assert.strictEqual(parseInt(count?.count || '0', 10), 1);
+  });
+
+  // =========================================================================
+  // CATEGORY 16: ALL PRODUCTS LIVE CATALOGUE NAVIGATION & PAGINATION
+  // =========================================================================
+  currentCategory = 'Catalogue Navigation & Pagination';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  // Setup: Seed 190 live products to test large catalogue pagination
+  const bulkProductIds: string[] = [];
+  for (let i = 1; i <= 190; i++) {
+    const pId = `nav_bulk_${String(i).padStart(3, '0')}`;
+    bulkProductIds.push(`sp_${pId}`);
+    await insertTestProduct({
+      id: pId,
+      name: `Tool Item ${String(i).padStart(3, '0')}`,
+      your_cost: 2.00,
+      stock: 15,
+      is_unlimited: false,
+      requires_email: false,
+      type: 'account',
+      duration: '1 Month',
+      warranty: '30 Days',
+    });
+  }
+
+  // Seed zero-stock item, hidden item, unavailable item, and unlimited stock item
+  await insertTestProduct({
+    id: 'nav_zero_stock',
+    name: 'Zero Stock Tool',
+    your_cost: 1.00,
+    stock: 0,
+    is_unlimited: false,
+    requires_email: false,
+  });
+
+  await insertTestProduct({
+    id: 'nav_unlimited_stock',
+    name: 'Unlimited Stock Key',
+    your_cost: 1.50,
+    stock: 0,
+    is_unlimited: true,
+    requires_email: false,
+  });
+
+  await insertTestProduct({
+    id: 'nav_hidden_item',
+    name: 'Hidden Exclusive Tool',
+    your_cost: 2.50,
+    stock: 50,
+    is_unlimited: false,
+  });
+  // Hide the item via product_overrides
+  await db.query(`
+    INSERT INTO product_overrides (product_id, is_hidden, updated_at)
+    VALUES ('sp_nav_hidden_item', TRUE, CURRENT_TIMESTAMP)
+    ON CONFLICT (product_id) DO UPDATE SET is_hidden = TRUE
+  `);
+
+  await it('Large catalogue (190+ products) dynamically creates multiple pages', 'unit', async () => {
+    const pageSize = 6;
+    const catalog = await pricingService.getCatalog({ page: 1, pageSize });
+    assert.ok(catalog.total >= 191, `Expected at least 191 visible items (190 bulk + 1 unlimited), got ${catalog.total}`);
+    const expectedPages = Math.ceil(catalog.total / pageSize);
+    const totalPages = Math.ceil(catalog.total / pageSize);
+    assert.strictEqual(totalPages, expectedPages, `Expected ${expectedPages} pages for ${catalog.total} products with page size 6`);
+    assert.ok(totalPages >= 32, `Expected at least 32 pages for large catalogue, got ${totalPages}`);
+    assert.strictEqual(catalog.items.length, 6);
+  });
+
+  await it('First page navigation: PREVIOUS is disabled, NEXT is active', 'unit', async () => {
+    const pageSize = 6;
+    const catalog = await pricingService.getCatalog({ page: 1, pageSize });
+    const totalPages = Math.ceil(catalog.total / pageSize);
+
+    const keyboard = getProductListKeyboard({
+      products: catalog.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
+      page: 1,
+      totalPages,
+      catId: 'all',
+    });
+
+    // Verify row structure
+    // Row 0-5: product buttons
+    assert.strictEqual(keyboard.inline_keyboard.length, 6 + 1 + 1); // 6 products + nav + back/home
+    for (let i = 0; i < 6; i++) {
+      const btn = keyboard.inline_keyboard[i][0];
+      assert.ok(btn.text.includes('—'), 'Product button must contain selling price');
+      assert.ok(btn.callback_data && btn.callback_data.startsWith('p:'), 'Callback must route to product detail');
+    }
+
+    // Pagination row (index 6): PREVIOUS (noop), PAGE 1 / 32 (noop), NEXT (cat:all:2)
+    const navRow = keyboard.inline_keyboard[6];
+    assert.strictEqual(navRow[0].text, '⬅️ PREVIOUS');
+    assert.strictEqual(navRow[0].callback_data, 'noop');
+    assert.strictEqual(navRow[1].text, `PAGE 1 / ${totalPages}`);
+    assert.strictEqual(navRow[1].callback_data, 'noop');
+    assert.strictEqual(navRow[2].text, 'NEXT ➡️');
+    assert.strictEqual(navRow[2].callback_data, 'cat:all:2');
+
+    // Bottom row (index 7): BACK to categories, HOME
+    const bottomRow = keyboard.inline_keyboard[7];
+    assert.strictEqual(bottomRow[0].callback_data, 'm:prod');
+    assert.strictEqual(bottomRow[1].callback_data, 'm:home');
+  });
+
+  await it('Middle page navigation: both PREVIOUS and NEXT are active', 'unit', async () => {
+    const pageSize = 6;
+    const page = 15;
+    const catalog = await pricingService.getCatalog({ page, pageSize });
+    const totalPages = Math.ceil(catalog.total / pageSize);
+
+    const keyboard = getProductListKeyboard({
+      products: catalog.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
+      page,
+      totalPages,
+      catId: 'all',
+    });
+
+    const navRow = keyboard.inline_keyboard[catalog.items.length];
+    assert.strictEqual(navRow[0].text, '⬅️ PREVIOUS');
+    assert.strictEqual(navRow[0].callback_data, 'cat:all:14');
+    assert.strictEqual(navRow[1].text, `PAGE 15 / ${totalPages}`);
+    assert.strictEqual(navRow[2].text, 'NEXT ➡️');
+    assert.strictEqual(navRow[2].callback_data, 'cat:all:16');
+  });
+
+  await it('Last page navigation: PREVIOUS is active, NEXT is disabled', 'unit', async () => {
+    const pageSize = 6;
+    const catalogAll = await pricingService.getCatalog({ page: 1, pageSize });
+    const totalPages = Math.ceil(catalogAll.total / pageSize);
+
+    const catalogLast = await pricingService.getCatalog({ page: totalPages, pageSize });
+
+    const keyboard = getProductListKeyboard({
+      products: catalogLast.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
+      page: totalPages,
+      totalPages,
+      catId: 'all',
+    });
+
+    const navRow = keyboard.inline_keyboard[catalogLast.items.length];
+    assert.strictEqual(navRow[0].text, '⬅️ PREVIOUS');
+    assert.strictEqual(navRow[0].callback_data, `cat:all:${totalPages - 1}`);
+    assert.strictEqual(navRow[1].text, `PAGE ${totalPages} / ${totalPages}`);
+    assert.strictEqual(navRow[2].text, 'NEXT ➡️');
+    assert.strictEqual(navRow[2].callback_data, 'noop');
+  });
+
+  await it('Product click opens exact live product detail with quantity, buy, details, and navigation', 'unit', async () => {
+    const targetProduct = await db.queryRow<any>("SELECT * FROM supplier_products WHERE id = 'sp_nav_bulk_042'");
+    assert.ok(targetProduct);
+
+    // Call getAdjacentProducts for sp_nav_bulk_042
+    const adj = await customerHandler.getAdjacentProducts('sp_nav_bulk_042', 'all', 6);
+    assert.ok(adj.prevProductId, 'Should have a previous product');
+    assert.ok(adj.nextProductId, 'Should have a next product');
+    assert.ok(adj.currentPage >= 1);
+
+    const keyboard = getProductDetailKeyboard({
+      productId: 'sp_nav_bulk_042',
+      quantity: 2,
+      catId: 'all',
+      page: adj.currentPage,
+      prevProductId: adj.prevProductId,
+      prevProductPage: adj.prevPage,
+      nextProductId: adj.nextProductId,
+      nextProductPage: adj.nextPage,
+    });
+
+    // Row 0: Quantity [➖, Qty: 2, ➕]
+    assert.strictEqual(keyboard.inline_keyboard[0][0].callback_data, `qty:sp_nav_bulk_042:1:all:${adj.currentPage}`);
+    assert.strictEqual(keyboard.inline_keyboard[0][1].text, 'Qty: 2');
+    assert.strictEqual(keyboard.inline_keyboard[0][2].callback_data, `qty:sp_nav_bulk_042:3:all:${adj.currentPage}`);
+
+    // Row 1: Actions [🛒 BUY NOW, 📋 MORE DETAILS]
+    assert.strictEqual(keyboard.inline_keyboard[1][0].callback_data, 'buy:sp_nav_bulk_042:2');
+    assert.strictEqual(keyboard.inline_keyboard[1][1].callback_data, `det:sp_nav_bulk_042:all:${adj.currentPage}`);
+
+    // Row 2: Product navigation [⬅️ PREVIOUS PRODUCT, NEXT PRODUCT ➡️]
+    assert.strictEqual(keyboard.inline_keyboard[2][0].text, '⬅️ PREVIOUS PRODUCT');
+    assert.strictEqual(keyboard.inline_keyboard[2][0].callback_data, `p:${adj.prevProductId}:all:${adj.prevPage}`);
+    assert.strictEqual(keyboard.inline_keyboard[2][1].text, 'NEXT PRODUCT ➡️');
+    assert.strictEqual(keyboard.inline_keyboard[2][1].callback_data, `p:${adj.nextProductId}:all:${adj.nextPage}`);
+
+    // Row 3: List navigation [📋 BACK TO LIST, 🏠 HOME]
+    assert.strictEqual(keyboard.inline_keyboard[3][0].text, '📋 BACK TO LIST');
+    assert.strictEqual(keyboard.inline_keyboard[3][0].callback_data, `cat:all:${adj.currentPage}`);
+    assert.strictEqual(keyboard.inline_keyboard[3][1].callback_data, 'm:home');
+  });
+
+  await it('First product has no PREVIOUS PRODUCT and last product has no NEXT PRODUCT', 'unit', async () => {
+    // Fetch all active IDs in order
+    const all = await db.query<any>(`
+      SELECT sp.id FROM supplier_products sp
+      LEFT JOIN product_overrides po ON sp.id = po.product_id
+      WHERE (po.is_hidden IS NULL OR po.is_hidden = FALSE)
+        AND (sp.is_unlimited = TRUE OR sp.latest_stock > 0)
+        AND sp.is_available = TRUE
+      ORDER BY po.is_featured DESC NULLS LAST, sp.original_name ASC
+    `);
+
+    const firstId = all.rows[0].id;
+    const lastId = all.rows[all.rows.length - 1].id;
+
+    const firstAdj = await customerHandler.getAdjacentProducts(firstId, 'all', 6);
+    assert.strictEqual(firstAdj.prevProductId, null, 'First product must have no previous product');
+    assert.ok(firstAdj.nextProductId !== null, 'First product must have next product');
+
+    const firstKb = getProductDetailKeyboard({
+      productId: firstId,
+      quantity: 1,
+      catId: 'all',
+      page: 1,
+      prevProductId: firstAdj.prevProductId,
+      nextProductId: firstAdj.nextProductId,
+    });
+    // Check product navigation row: only 1 button (NEXT PRODUCT ➡️)
+    const navRowFirst = firstKb.inline_keyboard[2];
+    assert.strictEqual(navRowFirst.length, 1);
+    assert.strictEqual(navRowFirst[0].text, 'NEXT PRODUCT ➡️');
+
+    const lastAdj = await customerHandler.getAdjacentProducts(lastId, 'all', 6);
+    assert.ok(lastAdj.prevProductId !== null, 'Last product must have previous product');
+    assert.strictEqual(lastAdj.nextProductId, null, 'Last product must have no next product');
+
+    const lastKb = getProductDetailKeyboard({
+      productId: lastId,
+      quantity: 1,
+      catId: 'all',
+      page: lastAdj.currentPage,
+      prevProductId: lastAdj.prevProductId,
+      nextProductId: lastAdj.nextProductId,
+    });
+    const navRowLast = lastKb.inline_keyboard[2];
+    assert.strictEqual(navRowLast.length, 1);
+    assert.strictEqual(navRowLast[0].text, '⬅️ PREVIOUS PRODUCT');
+  });
+
+  await it('BACK TO LIST button strictly preserves originating catalogue page', 'unit', async () => {
+    // When visiting a product from page 7
+    const originatingPage = 7;
+    const kb = getProductDetailKeyboard({
+      productId: 'sp_nav_bulk_042',
+      quantity: 1,
+      catId: 'all',
+      page: originatingPage,
+    });
+
+    const backButton = kb.inline_keyboard[kb.inline_keyboard.length - 1][0];
+    assert.strictEqual(backButton.text, '📋 BACK TO LIST');
+    assert.strictEqual(backButton.callback_data, `cat:all:${originatingPage}`);
+
+    // More details screen back button preserves product and page
+    const detailsKb = getMoreDetailsKeyboard('sp_nav_bulk_042', 'all', originatingPage);
+    assert.strictEqual(detailsKb.inline_keyboard[0][0].text, '⬅️ BACK TO PRODUCT');
+    assert.strictEqual(detailsKb.inline_keyboard[0][0].callback_data, `p:sp_nav_bulk_042:all:${originatingPage}`);
+  });
+
+  await it('Catalogue filtering excludes hidden products and zero-stock products', 'unit', async () => {
+    const catalog = await pricingService.getCatalog({ page: 1, pageSize: 250 });
+    const hiddenFound = catalog.items.find(i => i.id === 'sp_nav_hidden_item');
+    assert.strictEqual(hiddenFound, undefined, 'Hidden product must not appear in customer catalogue');
+
+    const zeroStockFound = catalog.items.find(i => i.id === 'sp_nav_zero_stock');
+    assert.strictEqual(zeroStockFound, undefined, 'Zero stock product without unlimited flag must not appear');
+  });
+
+  await it('Unlimited-stock products with zero stock remain available in catalogue', 'unit', async () => {
+    const catalog = await pricingService.getCatalog({ page: 1, pageSize: 250 });
+    const unlimitedItem = catalog.items.find(i => i.id === 'sp_nav_unlimited_stock');
+    assert.ok(unlimitedItem, 'Unlimited stock product must remain visible and available in catalogue');
+    assert.strictEqual(unlimitedItem.isUnlimited, true);
+    assert.strictEqual(unlimitedItem.stock, 0);
+  });
+
+  await it('All Telegram callback_data strings strictly respect <= 64 bytes limit', 'unit', async () => {
+    const pId = 'sp_nav_bulk_190';
+    const catId = 'cat_streaming_services';
+    const page = 32;
+    const qty = 99;
+
+    const callbacks = [
+      `p:${pId}:${catId}:${page}`,
+      `qty:${pId}:${qty}:${catId}:${page}`,
+      `buy:${pId}:${qty}`,
+      `det:${pId}:${catId}:${page}`,
+      `cat:${catId}:${page}`,
+      'm:prod',
+      'm:home',
+      'm:feat',
+    ];
+
+    for (const cb of callbacks) {
+      const byteLen = Buffer.byteLength(cb, 'utf8');
+      assert.ok(byteLen <= 64, `Callback data "${cb}" (${byteLen} bytes) exceeds Telegram 64-byte limit!`);
+    }
   });
 
   // SUMMARY & STATS DYNAMIC COMPUTATION

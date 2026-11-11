@@ -225,7 +225,7 @@ export class PricingService {
     pageSize?: number;
   } = {}): Promise<{ items: ProductCatalogItem[]; total: number }> {
     const page = Math.max(1, params.page || 1);
-    const pageSize = Math.min(50, Math.max(1, params.pageSize || 10));
+    const pageSize = Math.min(250, Math.max(1, params.pageSize || 10));
     const offset = (page - 1) * pageSize;
 
     let whereClause = 'WHERE 1=1';

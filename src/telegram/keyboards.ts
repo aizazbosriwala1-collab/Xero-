@@ -87,26 +87,146 @@ export function getCategoryKeyboard(categories: Array<{ id: string; name: string
 }
 
 /**
- * Product Card Inline Buttons (Buy, Quantity, Details, Back)
+ * Product List Inline Buttons (Product items with selling price, pagination, back/home)
  */
-export function getProductCardKeyboard(productId: string, quantity = 1, backCatId = 'all'): TelegramInlineKeyboardMarkup {
+export function getProductListKeyboard(params: {
+  products: Array<{ id: string; name: string; sellingPrice: string }>;
+  page: number;
+  totalPages: number;
+  catId: string;
+}): TelegramInlineKeyboardMarkup {
+  const { products, page, totalPages, catId } = params;
+  const rows: any[][] = [];
+
+  // Each product button shows: Product Name — Selling Price USDT
+  for (const p of products) {
+    const label = `${p.name} — ${p.sellingPrice} USDT`;
+    rows.push([
+      {
+        text: label,
+        callback_data: `p:${p.id}:${catId}:${page}`,
+      },
+    ]);
+  }
+
+  // Pagination row: ⬅️ PREVIOUS | PAGE X / Y | NEXT ➡️
+  const navRow: any[] = [];
+  if (page > 1) {
+    navRow.push({ text: '⬅️ PREVIOUS', callback_data: `cat:${catId}:${page - 1}` });
+  } else {
+    navRow.push({ text: '⬅️ PREVIOUS', callback_data: 'noop' });
+  }
+
+  navRow.push({ text: `PAGE ${page} / ${Math.max(1, totalPages)}`, callback_data: 'noop' });
+
+  if (page < totalPages) {
+    navRow.push({ text: 'NEXT ➡️', callback_data: `cat:${catId}:${page + 1}` });
+  } else {
+    navRow.push({ text: 'NEXT ➡️', callback_data: 'noop' });
+  }
+  rows.push(navRow);
+
+  // Bottom navigation row: ⬅️ BACK | 🏠 HOME
+  rows.push([
+    { text: '⬅️ BACK', callback_data: 'm:prod' },
+    { text: '🏠 HOME', callback_data: 'm:home' },
+  ]);
+
+  return { inline_keyboard: rows };
+}
+
+/**
+ * Product Detail Inline Buttons (Quantity controls, Buy Now, More Details, Prev/Next Product, Back to list, Home)
+ */
+export function getProductDetailKeyboard(params: {
+  productId: string;
+  quantity?: number;
+  catId?: string;
+  page?: number;
+  prevProductId?: string | null;
+  prevProductPage?: number;
+  nextProductId?: string | null;
+  nextProductPage?: number;
+}): TelegramInlineKeyboardMarkup {
+  const {
+    productId,
+    quantity = 1,
+    catId = 'all',
+    page = 1,
+    prevProductId = null,
+    prevProductPage = page,
+    nextProductId = null,
+    nextProductPage = page,
+  } = params;
+
+  const rows: any[][] = [];
+
+  // Row 1: Quantity controls
+  const decQty = Math.max(1, quantity - 1);
+  const incQty = quantity + 1;
+  rows.push([
+    { text: '➖', callback_data: `qty:${productId}:${decQty}:${catId}:${page}` },
+    { text: `Qty: ${quantity}`, callback_data: 'noop' },
+    { text: '➕', callback_data: `qty:${productId}:${incQty}:${catId}:${page}` },
+  ]);
+
+  // Row 2: Action buttons (Buy Now, More Details)
+  rows.push([
+    { text: '🛒 BUY NOW', callback_data: `buy:${productId}:${quantity}` },
+    { text: '📋 MORE DETAILS', callback_data: `det:${productId}:${catId}:${page}` },
+  ]);
+
+  // Row 3: Product Navigation (⬅️ PREVIOUS PRODUCT | NEXT PRODUCT ➡️)
+  const productNavRow: any[] = [];
+  if (prevProductId) {
+    productNavRow.push({
+      text: '⬅️ PREVIOUS PRODUCT',
+      callback_data: `p:${prevProductId}:${catId}:${prevProductPage}`,
+    });
+  }
+  if (nextProductId) {
+    productNavRow.push({
+      text: 'NEXT PRODUCT ➡️',
+      callback_data: `p:${nextProductId}:${catId}:${nextProductPage}`,
+    });
+  }
+  if (productNavRow.length > 0) {
+    rows.push(productNavRow);
+  }
+
+  // Row 4: List Navigation (📋 BACK TO LIST preserves page, 🏠 HOME)
+  rows.push([
+    { text: '📋 BACK TO LIST', callback_data: `cat:${catId}:${page}` },
+    { text: '🏠 HOME', callback_data: 'm:home' },
+  ]);
+
+  return { inline_keyboard: rows };
+}
+
+/**
+ * More Details Screen Keyboard
+ */
+export function getMoreDetailsKeyboard(productId: string, catId = 'all', page = 1): TelegramInlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [
-        { text: '➖', callback_data: `qty:${productId}:${Math.max(1, quantity - 1)}:${backCatId}` },
-        { text: `Qty: ${quantity}`, callback_data: 'noop' },
-        { text: '➕', callback_data: `qty:${productId}:${quantity + 1}:${backCatId}` },
-      ],
-      [
-        { text: '🛒 BUY NOW', callback_data: `buy:${productId}:${quantity}` },
-        { text: '📋 MORE DETAILS', callback_data: `det:${productId}` },
-      ],
-      [
-        { text: '⬅️ BACK', callback_data: `cat:${backCatId}:1` },
+        { text: '⬅️ BACK TO PRODUCT', callback_data: `p:${productId}:${catId}:${page}` },
         { text: '🏠 HOME', callback_data: 'm:home' },
-      ]
-    ]
+      ],
+    ],
   };
+}
+
+/**
+ * Backwards compatibility helper for existing references
+ */
+export function getProductCardKeyboard(productId: string, quantity = 1, backCatId = 'all', page = 1): TelegramInlineKeyboardMarkup {
+  return getProductDetailKeyboard({
+    productId,
+    quantity,
+    catId: backCatId,
+    page,
+  });
 }
 
 /**

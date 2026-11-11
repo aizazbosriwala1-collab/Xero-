@@ -16,6 +16,9 @@ import {
   getCustomerMainReplyKeyboard,
   getCategoryKeyboard,
   getProductCardKeyboard,
+  getProductListKeyboard,
+  getProductDetailKeyboard,
+  getMoreDetailsKeyboard,
   getDepositMethodsKeyboard,
   getBinanceInvoiceKeyboard,
   getBackHomeKeyboard,
@@ -113,16 +116,17 @@ export class CustomerHandler {
       return;
     }
 
-    // Category / Products List
+    // Category / Products List (Multi-item Paginated List)
     if (data.startsWith('cat:')) {
-      const [, catId, pageStr] = data.split(':');
-      const page = parseInt(pageStr || '1', 10);
+      const [, catId = 'all', pageStr = '1'] = data.split(':');
+      const page = Math.max(1, parseInt(pageStr || '1', 10));
       const isAll = catId === 'all';
+      const pageSize = 6;
 
       const catalog = await pricingService.getCatalog({
         categoryId: isAll ? undefined : catId,
         page,
-        pageSize: 5,
+        pageSize,
       });
 
       if (catalog.items.length === 0) {
@@ -132,29 +136,41 @@ export class CustomerHandler {
         return;
       }
 
-      // Display first product card in category with pagination
-      const first = catalog.items[0];
-      const cardText = this.formatProductCard(first);
-      await telegramClient.editMessageText(chatId, messageId, cardText, {
-        reply_markup: getProductCardKeyboard(first.id, 1, catId),
+      const totalPages = Math.max(1, Math.ceil(catalog.total / pageSize));
+      const categoryTitle = isAll ? 'ALL PRODUCTS' : (catalog.items[0]?.category.name || 'PRODUCTS');
+      const listHeader = `⚡ *${categoryTitle.toUpperCase()}*\n\n` +
+        `Browse our live inventory below. Tap any product to view full details and purchase:\n` +
+        `_Showing ${catalog.items.length} items (Page ${page} of ${totalPages})_`;
+
+      await telegramClient.editMessageText(chatId, messageId, listHeader, {
+        reply_markup: getProductListKeyboard({
+          products: catalog.items.map(p => ({
+            id: p.id,
+            name: p.name,
+            sellingPrice: p.sellingPrice,
+          })),
+          page,
+          totalPages,
+          catId,
+        }),
       });
       return;
     }
 
-    // Quantity selector
-    if (data.startsWith('qty:')) {
-      const [, productId, qtyStr, backCatId] = data.split(':');
-      const qty = parseInt(qtyStr || '1', 10);
-      const product = await db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]);
-      if (!product) return;
+    // Product Detail Screen
+    if (data.startsWith('p:')) {
+      const [, productId, catId = 'all', pageStr = '1'] = data.split(':');
+      const page = Math.max(1, parseInt(pageStr || '1', 10));
+      await this.showProductDetail(chatId, messageId, productId, 1, catId, page);
+      return;
+    }
 
-      const card = (await pricingService.getCatalog({ search: product.original_name })).items[0];
-      if (card) {
-        const text = this.formatProductCard(card);
-        await telegramClient.editMessageText(chatId, messageId, text, {
-          reply_markup: getProductCardKeyboard(card.id, qty, backCatId),
-        });
-      }
+    // Quantity selector in Product Detail Screen
+    if (data.startsWith('qty:')) {
+      const [, productId, qtyStr, backCatId = 'all', pageStr = '1'] = data.split(':');
+      const qty = Math.max(1, parseInt(qtyStr || '1', 10));
+      const page = Math.max(1, parseInt(pageStr || '1', 10));
+      await this.showProductDetail(chatId, messageId, productId, qty, backCatId, page);
       return;
     }
 
@@ -183,13 +199,20 @@ export class CustomerHandler {
 
     // Product More Details
     if (data.startsWith('det:')) {
-      const [, productId] = data.split(':');
+      const [, productId, catId = 'all', pageStr = '1'] = data.split(':');
+      const page = Math.max(1, parseInt(pageStr || '1', 10));
       const product = await db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]);
       if (!product) return;
 
-      const detailsText = `📋 *PRODUCT DETAILS*\n\n*${product.original_name}*\n\n${product.original_description || 'No additional description provided.'}\n\n🛡️ *Warranty:* ${product.warranty_summary || 'Standard replacement guarantee'}`;
-      await telegramClient.sendMessage(chatId, detailsText, {
-        reply_markup: getBackHomeKeyboard('m:prod'),
+      const detailsText = `📋 *PRODUCT DETAILS*\n\n` +
+        `*${product.original_name}*\n\n` +
+        `${product.original_description || 'No additional description provided.'}\n\n` +
+        `⏱️ *Duration:* ${product.duration || '1 Month'}\n` +
+        `🛡️ *Warranty:* ${product.warranty_summary || 'Standard replacement guarantee'}\n` +
+        `🔑 *Delivery:* ${product.requires_email ? 'Manual invite / access via email' : 'Instant credentials via bot ledger'}`;
+
+      await telegramClient.editMessageText(chatId, messageId, detailsText, {
+        reply_markup: getMoreDetailsKeyboard(productId, catId, page),
       });
       return;
     }
@@ -621,6 +644,143 @@ export class CustomerHandler {
     } catch (err: any) {
       await telegramClient.sendMessage(chatId, `❌ *PURCHASE FAILED*\n\n${err.message}`, {
         reply_markup: getBackHomeKeyboard('m:prod'),
+      });
+    }
+  }
+
+  /**
+   * Resolve adjacent (previous/next) product IDs and page locations within category/all
+   */
+  public async getAdjacentProducts(
+    productId: string,
+    catId = 'all',
+    pageSize = 6
+  ): Promise<{
+    prevProductId: string | null;
+    prevPage: number;
+    nextProductId: string | null;
+    nextPage: number;
+    currentPage: number;
+    total: number;
+    index: number;
+  }> {
+    const isAll = catId === 'all';
+    let whereClause = `WHERE (po.is_hidden IS NULL OR po.is_hidden = FALSE)
+      AND (sp.is_unlimited = TRUE OR sp.latest_stock > 0)
+      AND sp.is_available = TRUE`;
+    const queryParams: any[] = [];
+
+    if (!isAll) {
+      whereClause += ` AND po.category_id = $1`;
+      queryParams.push(catId);
+    }
+
+    const sql = `
+      SELECT sp.id
+      FROM supplier_products sp
+      LEFT JOIN product_overrides po ON sp.id = po.product_id
+      ${whereClause}
+      ORDER BY po.is_featured DESC NULLS LAST, sp.original_name ASC
+    `;
+
+    const res = await db.query<{ id: string }>(sql, queryParams);
+    const ids = res.rows.map(r => r.id);
+    const index = ids.indexOf(productId);
+    const total = ids.length;
+
+    if (index === -1) {
+      return {
+        prevProductId: null,
+        prevPage: 1,
+        nextProductId: null,
+        nextPage: 1,
+        currentPage: 1,
+        total,
+        index: -1,
+      };
+    }
+
+    const currentPage = Math.floor(index / pageSize) + 1;
+    const prevIndex = index - 1;
+    const nextIndex = index + 1;
+
+    const prevProductId = prevIndex >= 0 ? ids[prevIndex] : null;
+    const prevPage = prevIndex >= 0 ? Math.floor(prevIndex / pageSize) + 1 : currentPage;
+
+    const nextProductId = nextIndex < total ? ids[nextIndex] : null;
+    const nextPage = nextIndex < total ? Math.floor(nextIndex / pageSize) + 1 : currentPage;
+
+    return {
+      prevProductId,
+      prevPage,
+      nextProductId,
+      nextPage,
+      currentPage,
+      total,
+      index,
+    };
+  }
+
+  /**
+   * Render individual product detail view with quantity controls, buy now, more details, prev/next product, back to list
+   */
+  public async showProductDetail(
+    chatId: number,
+    messageId: number | undefined,
+    productId: string,
+    quantity = 1,
+    catId = 'all',
+    page = 1
+  ): Promise<void> {
+    const isAll = catId === 'all';
+    const catalog = await pricingService.getCatalog({
+      categoryId: isAll ? undefined : catId,
+      page: 1,
+      pageSize: 50,
+      includeHidden: true,
+    });
+
+    let product = catalog.items.find(item => item.id === productId);
+    if (!product) {
+      const searchRes = await pricingService.getCatalog({ includeHidden: true });
+      product = searchRes.items.find(item => item.id === productId);
+    }
+
+    if (!product) {
+      const notFoundMsg = '⚠️ Product is no longer available in the catalogue.';
+      if (messageId) {
+        await telegramClient.editMessageText(chatId, messageId, notFoundMsg, {
+          reply_markup: getBackHomeKeyboard(`cat:${catId}:${page}`),
+        });
+      } else {
+        await telegramClient.sendMessage(chatId, notFoundMsg, {
+          reply_markup: getBackHomeKeyboard(`cat:${catId}:${page}`),
+        });
+      }
+      return;
+    }
+
+    const adj = await this.getAdjacentProducts(productId, catId, 6);
+    const text = this.formatProductCard(product);
+
+    const keyboard = getProductDetailKeyboard({
+      productId: product.id,
+      quantity,
+      catId,
+      page,
+      prevProductId: adj.prevProductId,
+      prevProductPage: adj.prevPage,
+      nextProductId: adj.nextProductId,
+      nextProductPage: adj.nextPage,
+    });
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, {
+        reply_markup: keyboard,
+      });
+    } else {
+      await telegramClient.sendMessage(chatId, text, {
+        reply_markup: keyboard,
       });
     }
   }
