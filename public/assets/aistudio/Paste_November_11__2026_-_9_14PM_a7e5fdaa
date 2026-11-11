@@ -1,0 +1,1652 @@
+XERO KHAN — COMPLETE FIRST-RUN TELEGRAM COMMERCE BOT
+
+PROJECT STATUS
+
+This is a completely fresh project.
+
+No previous repository, codebase, database, migration, deployment, uploaded file, or existing application should be assumed.
+
+Build XERO KHAN from scratch as a clean standalone Telegram commerce bot.
+
+PUBLIC BRAND:
+XERO KHAN
+
+INTERNAL PROJECT:
+xero-khan-bot
+
+TAGLINE:
+Digital Tools. Instant Access.
+
+PRIMARY GOAL
+
+Create one coherent, production-oriented Telegram commerce bot covering the complete customer journey:
+
+Telegram /start
+→ premium colourful menu
+→ live supplier products
+→ categories and search
+→ product details
+→ admin-controlled selling price
+→ wallet
+→ Binance or manual deposit
+→ payment verification
+→ wallet credit
+→ checkout
+→ supplier order
+→ automatic or pending delivery
+→ My Orders
+→ support
+→ referrals
+→ dynamic giveaways
+
+Do not make a visual-only prototype.
+
+Do not stop at sample code, mock data, architecture notes, placeholder handlers, or an unfinished dashboard.
+
+Build the backend, Telegram bot, PostgreSQL schema, Redis integration, supplier integration, payment flows, admin controls, migrations, tests, Railway configuration, and GitHub-ready repository.
+
+Do not promise guaranteed production success without evidence.
+
+Prove completion through working code, migrations, tests, build results, and a controlled smoke-test report.
+
+==================================================
+1. REQUIRED STACK
+==================================================
+
+Use:
+
+- Node.js
+- TypeScript
+- Telegram Bot API
+- Express or another Railway-compatible HTTP server
+- Telegram webhook mode in production
+- PostgreSQL as the authoritative database
+- Redis only for non-authoritative FSM, cache, rate limiting, and temporary coordination
+- Decimal-safe money arithmetic
+- Versioned SQL migrations
+- Structured sanitized logs
+- Automated tests
+- Environment variables for secrets
+- GitHub-ready repository
+- Railway-ready deployment
+
+PostgreSQL must be the source of truth for:
+
+- users
+- wallets
+- ledger
+- deposits
+- payments
+- products
+- price overrides
+- orders
+- supplier references
+- referrals
+- giveaways
+- claims
+- support tickets
+- admin configuration
+- audit logs
+
+Redis must never be the source of truth for financial or order data.
+
+Never use JavaScript floating-point equality for money.
+
+Use PostgreSQL NUMERIC/DECIMAL and a reliable Decimal library.
+
+==================================================
+2. SECURITY AND CLEAN-ROOM RULES
+==================================================
+
+Create a completely fresh repository.
+
+Do not import or reuse any Birthday application.
+
+Do not use any previous project name.
+
+Do not place real credentials in:
+
+- source files
+- Git history
+- frontend/browser code
+- Telegram messages
+- database migrations
+- test fixtures
+- README examples
+- logs
+- screenshots
+
+Create a safe `.env.example` containing variable names and placeholders only.
+
+Never expose:
+
+- Telegram bot token
+- supplier reseller key
+- Binance API key
+- Binance API secret
+- database URL
+- Redis URL
+- webhook secret
+- HMAC signatures
+- complete signed URLs
+
+All production credentials will be configured later in Railway.
+
+==================================================
+3. PREMIUM TELEGRAM USER EXPERIENCE
+==================================================
+
+The main interface must be Telegram.
+
+Create a polished, colourful, emoji-supported, button-driven experience using Telegram's supported inline/reply keyboard capabilities.
+
+Do not force ordinary customers to type technical commands.
+
+Configure useful fallback commands, but make buttons the primary interface.
+
+CUSTOMER MAIN MENU:
+
+🛍️ PRODUCTS
+🔥 FEATURED
+🔎 SEARCH
+💰 WALLET
+➕ ADD FUNDS
+📦 MY ORDERS
+🎁 GIVEAWAYS
+👥 REFER & EARN
+🛟 SUPPORT
+👤 PROFILE
+🌐 LANGUAGE
+
+Every screen should have appropriate:
+
+⬅️ BACK
+🏠 HOME
+
+Use:
+
+- compact layouts
+- clear headings
+- suitable emojis
+- product cards
+- category buttons
+- pagination
+- search
+- quantity controls
+- confirmation screens
+- loading/progress messages where appropriate
+- safe callback handling
+- useful customer error messages
+
+Do not send all products in one giant Telegram message.
+
+Handle Telegram callback-data length limits.
+
+Use message editing where appropriate to keep navigation clean.
+
+If message editing fails, safely send a new message.
+
+Prevent old, duplicated, expired, or repeatedly pressed buttons from causing duplicate actions.
+
+Configure fallback Telegram commands:
+
+/start
+/products
+/search
+/wallet
+/deposit
+/orders
+/giveaways
+/referral
+/support
+/profile
+/help
+
+==================================================
+4. LIVE SUPPLIER CATALOGUE
+==================================================
+
+Integrate:
+
+AiToolShop Reseller API v1
+
+Use environment variables:
+
+AITOOLSHOP_BASE_URL
+AITOOLSHOP_RESELLER_API_KEY
+
+Expected base URL:
+
+https://aitoolshop.aitoolifystudio.io/api/reseller/v1
+
+Authenticate server-side using:
+
+Authorization: Bearer <API_KEY>
+
+Never put the supplier key in query strings or customer-visible content.
+
+Implement:
+
+GET /balance
+GET /products
+POST /order
+GET /orders
+GET /order/{order_ref}
+
+The supplier API currently returns a large live catalogue, approximately 190 products, but never hard-code a product count.
+
+Do not seed a fake or sample customer catalogue.
+
+Do not build the bot around example Netflix, Canva, Gemini, Claude, ChatGPT, or other manually selected products.
+
+The live response from:
+
+GET /products
+
+must be the supplier catalogue source.
+
+Synchronize every returned supplier product and all relevant fields, including:
+
+- id
+- name
+- description
+- price_usdt
+- your_cost
+- stock
+- stock_quantity
+- is_unlimited
+- duration
+- requires_email
+- type
+- legacy aliases where present
+
+Supplier product ID is the canonical supplier identifier.
+
+Create a local PostgreSQL mirror for:
+
+- supplier product ID
+- supplier
+- original name
+- original description
+- latest supplier cost
+- latest stock
+- unlimited-stock state
+- requires-email state
+- supplier type
+- supplier availability
+- last synchronization time
+- local category
+- local display-name override
+- local description override
+- admin visibility
+- featured state
+- customer selling-price configuration
+- warranty summary
+- creation and update timestamps
+
+SUPPLIER SYNCHRONIZATION RULES
+
+Supplier remains authoritative for:
+
+- product identity
+- supplier cost
+- stock
+- unlimited-stock state
+- supplier availability
+- requires-email state
+
+XERO KHAN PostgreSQL remains authoritative for:
+
+- retail/customer selling price
+- markup
+- visibility
+- featured state
+- categories
+- customer-facing display overrides
+- orders
+- wallets
+- giveaways
+- referrals
+- support configuration
+
+Synchronization must:
+
+- import all live products
+- upsert idempotently
+- update supplier stock
+- update supplier cost
+- add newly introduced supplier products
+- preserve local retail prices
+- preserve admin visibility
+- preserve category assignments
+- preserve display overrides
+- preserve featured state
+- preserve giveaway relationships
+- never delete historical orders
+- mark removed/missing products unavailable instead of deleting history
+- hide zero-stock products by default
+- allow admin to show unavailable items if desired
+- restore product availability when supplier stock returns
+- support startup synchronization
+- support scheduled synchronization
+- support manual admin refresh
+- use bounded timeouts
+- never block server startup indefinitely
+
+Before every real supplier purchase:
+
+- revalidate product
+- revalidate stock
+- revalidate supplier cost
+- confirm customer selling-price snapshot
+- confirm customer wallet
+- confirm ordering safety flag
+- prevent purchase if product is unavailable
+
+==================================================
+5. CATEGORIES, SEARCH, AND PRODUCT CARDS
+==================================================
+
+Create customer-friendly categories without losing any supplier product.
+
+Support:
+
+- dynamic local categories
+- uncategorized fallback
+- admin category management
+- category reassignment
+- featured products
+- search by product name
+- search by description keywords
+- pagination
+- in-stock filtering
+- product-type filtering where useful
+
+Product card should show:
+
+- customer-facing product name
+- concise readable description
+- selling price
+- availability
+- stock indicator where appropriate
+- unlimited-stock indicator where appropriate
+- product type
+- email requirement
+- warranty summary
+- quantity selector
+- Buy button
+
+Do not expose supplier cost to customers.
+
+Preserve access to the supplier's complete description through a More Details button where Telegram message size allows.
+
+==================================================
+6. FULL ADMIN-CONTROLLED PRICING
+==================================================
+
+Supplier controls cost.
+
+Admin controls the customer selling price.
+
+Example:
+
+Supplier cost: 0.12 USDT
+Admin may sell it for: 0.14 USDT
+
+This is only an example.
+
+Do not make 0.02 USDT a universal hard-coded markup.
+
+Support admin-configurable:
+
+- global percentage markup
+- global fixed markup
+- category pricing rule
+- low-cost product pricing rule
+- per-product percentage markup
+- per-product fixed markup
+- per-product fixed retail price
+- reset to default pricing
+- hide/show product
+- feature/unfeature product
+- category assignment
+- customer display-name override
+- customer-description override
+
+Define and test price precedence:
+
+1. Per-product fixed retail price
+2. Per-product markup rule
+3. Category pricing rule
+4. Global default pricing rule
+5. Safe fallback above or equal to supplier cost
+
+Do not sell below supplier cost unless an authorized admin explicitly confirms a privileged override.
+
+When admin changes a price:
+
+- save it in PostgreSQL
+- invalidate relevant Redis cache
+- customer catalogue refresh must immediately show the saved price
+- no code change required
+- no redeployment required
+- supplier refresh must not overwrite it
+
+At checkout, snapshot:
+
+- supplier cost
+- customer unit price
+- markup
+- quantity
+- total customer charge
+- supplier product identifier
+- selected configuration
+
+Use Decimal-safe rounding.
+
+==================================================
+7. CUSTOMER WALLET AND IMMUTABLE LEDGER
+==================================================
+
+Implement a safe PostgreSQL wallet and append-only immutable ledger.
+
+Support:
+
+- deposit credits
+- purchase debits
+- purchase holds/reservations where needed
+- hold releases
+- refunds
+- giveaway rewards
+- referral rewards where enabled
+- admin adjustments with reason
+- reconciliation
+
+Never directly alter a wallet balance without a ledger entry.
+
+Each financial mutation requires:
+
+- unique operation reference
+- idempotency key
+- user
+- amount
+- currency
+- reason
+- source
+- actor
+- timestamp
+- audit trail
+- PostgreSQL transaction
+
+Tests must prove:
+
+- wallet balance matches ledger
+- duplicate requests do not duplicate money
+- failed operations roll back
+- concurrent operations remain safe
+
+==================================================
+8. BINANCE USDT AUTOMATIC DEPOSITS
+==================================================
+
+Implement Binance automatic incoming-payment verification using the previously proven transaction-history concept.
+
+PROVEN REFERENCE BEHAVIOUR
+
+A real 0.48 USDT transfer was made from another Binance account to the receiving Binance account.
+
+The previous isolated read-only verification produced:
+
+- HTTP 200 OK
+- Binance response code 000000
+- message success
+- one record returned
+- currency USDT
+- amount 0.48
+- incoming direction confirmed
+- expected 0.48 matched actual 0.48
+- transactionId present
+- transactionTime present
+- orderType C2C
+- payerInfo present
+- receiverInfo present
+- TEST PAYMENT DETECTED=true
+
+Use this behaviour as the verification reference.
+
+The intended endpoint is:
+
+GET /sapi/v1/pay/transactions
+
+IMPORTANT:
+
+Do not blindly copy any later broken production implementation.
+
+First implement and test an isolated read-only Binance verifier.
+
+Use environment variables:
+
+BINANCE_PAY_ENABLED
+BINANCE_API_BASE_URL
+BINANCE_API_KEY
+BINANCE_API_SECRET
+BINANCE_RECEIVER_ID
+BINANCE_RECV_WINDOW_MS
+BINANCE_REQUEST_TIMEOUT_MS
+BINANCE_MIN_DEPOSIT_USDT
+BINANCE_MAX_DEPOSIT_USDT
+
+Use:
+
+- X-MBX-APIKEY
+- HMAC-SHA256 signature
+- current timestamp in milliseconds
+- supported recvWindow
+- exact encoded query string
+- bounded query window
+- HTTP timeout
+- sanitized diagnostics
+
+Do not use:
+
+- VPN or proxy-based regional bypasses
+- geographic eligibility bypasses
+- identity workarounds
+- fake transaction results
+- screenshots as Binance proof
+- customer claims as verification
+- server-initiated transfers
+
+BINANCE CUSTOMER FLOW
+
+➕ ADD FUNDS
+→ BINANCE USDT
+→ Enter amount
+→ Create pending invoice
+→ Show exact amount
+→ Show configured receiver information
+→ Customer pays
+→ I HAVE PAID
+→ Request transaction ID where required
+→ Backend verifies Binance independently
+→ Atomic wallet credit
+
+Use buttons and FSM.
+
+Do not require complicated command syntax from ordinary users.
+
+A Binance invoice must contain:
+
+- UUID
+- Telegram user ID
+- expected Decimal amount
+- currency USDT
+- receiver configuration reference
+- PENDING status
+- created time
+- expiry time
+- attempt count
+- transaction ID nullable
+- verified time nullable
+- safe error classification
+- idempotency reference
+
+VERIFICATION RULES
+
+Verify all applicable conditions:
+
+- successful Binance response
+- exact transaction ID when submitted
+- actual incoming payment
+- exact currency USDT
+- exact Decimal amount
+- allowed incoming order type
+- receiver identity match where returned data supports it
+- valid transaction time
+- transaction in invoice window
+- transaction ID unused
+- invoice belongs to requesting user
+- invoice remains pending
+- invoice is not expired
+- result is unambiguous
+
+Never verify on amount alone.
+
+Examples:
+
+Expected 2.00 and valid incoming 2.00 USDT:
+VERIFIED
+
+Expected 2.00 and actual 1.99:
+NOT VERIFIED
+
+Expected 2.00 and actual 3.00:
+NOT VERIFIED
+
+Wrong currency:
+NOT VERIFIED
+
+Outgoing transaction:
+NOT VERIFIED
+
+Wrong receiver:
+NOT VERIFIED
+
+Duplicate transaction:
+NOT VERIFIED
+
+Ambiguous same-amount candidate:
+REQUIRE TRANSACTION ID OR ADMIN REVIEW
+
+API temporarily unavailable:
+KEEP PENDING, ZERO CREDIT, ALLOW SAFE RETRY
+
+Binance eligibility or permission rejection:
+KEEP PENDING, ZERO CREDIT, SHOW ACCURATE SAFE MESSAGE
+
+Do not classify every failure as “API unreachable.”
+
+Classify:
+
+- DNS failure
+- network failure
+- TLS failure
+- timeout
+- HTTP rejection
+- malformed JSON
+- authentication rejection
+- API permission rejection
+- invalid signature
+- timestamp/recvWindow rejection
+- rate limit
+- eligibility/restricted-location response
+- successful response with no transaction
+- wrong amount
+- wrong currency
+- wrong direction
+- wrong receiver
+- duplicate transaction
+- ambiguous transaction
+- exact valid match
+
+Sanitized logs may include:
+
+- masked deposit ID
+- expected amount
+- HTTP status
+- Binance code
+- Binance message
+- returned-record count
+- masked transaction reference
+- error classification
+
+Never log:
+
+- full API key
+- API secret
+- signature
+- complete signed URL
+- complete receiver UID
+- complete transaction ID
+- database URL
+
+BINANCE CREDIT TRANSACTION
+
+In one PostgreSQL transaction:
+
+1. Lock pending deposit
+2. Confirm PENDING
+3. Confirm unexpired
+4. Confirm user ownership
+5. Confirm verified Binance transaction
+6. Confirm Binance transaction ID has never been consumed
+7. Insert immutable payment record
+8. Insert immutable wallet ledger credit
+9. Update wallet through established wallet architecture
+10. Mark deposit VERIFIED
+11. Store Binance reference
+12. Commit once
+
+On any failure:
+
+ROLL BACK EVERYTHING
+
+Create a unique database index on Binance transaction ID.
+
+Repeated or concurrent Verify button presses must credit once only.
+
+Before real credit activation, run a read-only Binance test.
+
+If external Binance eligibility, permission, or server-location restrictions block verification, fail closed and report the sanitized error. Do not fabricate a workaround.
+
+==================================================
+9. MANUAL PAYMENTS
+==================================================
+
+Bootstrap:
+
+EASYPAISA
+
+Account title:
+Muhammad Abbas
+
+Account number:
+03705851403
+
+JAZZCASH
+
+Account title:
+Muhammad Abbas
+
+Account number:
+03705851403
+
+Store this configuration centrally in payment-method data.
+
+Do not scatter payment details through Telegram handlers.
+
+Admin must be able to edit:
+
+- payment title
+- account number
+- instructions
+- minimum amount
+- maximum amount
+- enabled state
+- active state
+- proof requirement
+- review-time message
+
+MANUAL DEPOSIT FLOW
+
+➕ ADD FUNDS
+→ EASYPAISA or JAZZCASH
+→ Enter amount
+→ Show account details
+→ Customer pays
+→ Submit TXID/reference
+→ Upload proof screenshot
+→ PENDING_REVIEW
+→ Admin notification
+→ Admin review
+→ Approve or reject
+→ Customer notification
+→ Atomic wallet credit on approval
+
+Require both TXID and proof screenshot by default.
+
+Store Telegram file identifiers safely.
+
+Use duplicate/manual TXID protection.
+
+Flag repeated TXIDs for review.
+
+Admin approval pressed twice must not credit twice.
+
+Use one PostgreSQL transaction for:
+
+- deposit lock
+- status validation
+- payment record
+- ledger credit
+- wallet update
+- approval status
+- audit log
+
+==================================================
+10. SAFE SUPPLIER ORDERING
+==================================================
+
+Supplier POST endpoint:
+
+POST /order
+
+Order body may contain:
+
+- product_id
+- quantity
+- customer_email when required
+- idempotency_key
+
+Generate one permanent unique supplier idempotency key for each local order.
+
+Send the same key through:
+
+- request body
+- Idempotency-Key header when supported
+
+Never generate a new idempotency key when retrying the same local order.
+
+CUSTOMER CHECKOUT
+
+Product
+→ Quantity
+→ Customer email if required
+→ Price confirmation
+→ Wallet check
+→ Confirm purchase
+→ Local order
+→ Financial reservation/debit
+→ Supplier call
+→ Delivery or pending state
+
+Support:
+
+- completed
+- pending_invite
+- pending
+- replayed
+- failed
+- uncertain/reconciling
+
+When supplier returns completed status:
+
+- securely store delivered items
+- deliver them to the correct Telegram customer
+- allow retrieval through My Orders
+- never show them to another user
+- never print credentials in normal logs
+
+When supplier returns pending_invite:
+
+- mark Pending Delivery
+- notify customer
+- poll/reconcile safely
+- allow admin review
+- retrieve final result through GET /order/{order_ref}
+
+For requires_email products:
+
+- collect and validate email
+- send the correct number of addresses if quantity requires it
+- never place order without required email
+
+On timeout or uncertain response:
+
+- do not issue a blind second order
+- retain the same idempotency key
+- reconcile using the same key/reference
+- query the order endpoint when reference is available
+- do not refund until supplier outcome is known
+
+Handle stable supplier error codes:
+
+AUTH_HEADER_REQUIRED
+INVALID_API_KEY
+INSUFFICIENT_BALANCE
+INVALID_PRODUCT_ID
+INVALID_QUANTITY
+CUSTOMER_EMAIL_REQUIRED
+INVALID_CUSTOMER_EMAIL
+KEY_BLOCKED
+ACCOUNT_BLOCKED
+PRODUCT_NOT_FOUND
+ORDER_NOT_FOUND
+UNKNOWN_ENDPOINT
+OUT_OF_STOCK
+RATE_LIMITED
+API_DISABLED
+INTERNAL_ERROR
+
+A supplier order is successful only when the API confirms success.
+
+If the supplier definitively rejects without charging:
+
+- release customer funds atomically
+
+If the outcome is uncertain:
+
+- reconcile before refunding or retrying
+
+Respect documented rate limits.
+
+==================================================
+11. REFERRALS
+==================================================
+
+Create one referral link/system.
+
+A referral does not qualify merely because a user joined through the link.
+
+A referral qualifies only after the referred user completes the configured successful purchase requirement.
+
+Prevent:
+
+- self-referral
+- circular referral
+- duplicate qualification
+- one purchase qualifying repeatedly
+- multiple rewards from one qualification unless configuration explicitly allows it
+- refunded/cancelled purchases remaining qualified when policy excludes them
+- race-condition qualification
+
+Customer referral screen should show:
+
+- referral link
+- total referred users
+- qualified referrals
+- pending referrals
+- eligible rewards/giveaways
+- progress
+
+==================================================
+12. FULLY DYNAMIC GIVEAWAYS
+==================================================
+
+Do not hard-code giveaway rewards or thresholds.
+
+Admin must be able to:
+
+- create
+- edit
+- pause
+- activate
+- end
+- archive
+- select reward product
+- set reward quantity
+- define required criteria
+- define required qualified referrals
+- define start/end dates if desired
+- define claim limits
+- inspect eligible users
+- inspect claims
+- approve or automatically fulfil according to configuration
+
+Example configuration:
+
+Reward:
+Any selected synchronized product
+
+Criteria:
+5 qualified referrals
+
+This is only an example.
+
+Admin may select any product and any valid threshold.
+
+Customer giveaway view should show:
+
+- active giveaway
+- reward
+- requirements
+- progress such as 3/5
+- eligible state
+- claim state
+- delivery state
+
+Supplier refresh must not delete giveaway configuration.
+
+When giveaway reward is a supplier product:
+
+- revalidate availability at fulfilment
+- use unique supplier idempotency
+- preserve customer entitlement if temporarily out of stock
+- allow audited admin substitution where configured
+
+Prevent duplicate claims.
+
+==================================================
+13. ADMIN CONTROL CENTER
+==================================================
+
+Use:
+
+TELEGRAM_ADMIN_IDS
+
+Only authorized Telegram IDs may access admin functions.
+
+Create a premium button-driven admin menu:
+
+📊 DASHBOARD
+🛍️ PRODUCTS
+💲 PRICING
+🗂️ CATEGORIES
+📦 ORDERS
+💰 WALLETS
+💳 DEPOSITS
+🎁 GIVEAWAYS
+👥 REFERRALS
+🔄 SUPPLIER SYNC
+🧾 LEDGER
+🛟 SUPPORT
+📢 BROADCASTS
+⚙️ SETTINGS
+🩺 SYSTEM HEALTH
+
+ADMIN PRODUCT CONTROLS
+
+- Search supplier products
+- View supplier cost
+- View current stock
+- View selling price
+- Set retail price
+- Set fixed markup
+- Set percentage markup
+- Reset pricing
+- Hide/show
+- Feature/unfeature
+- Assign category
+- Edit display name
+- Edit customer description
+- Refresh supplier data
+
+ADMIN PAYMENT CONTROLS
+
+- Enable/disable Binance
+- Enable/disable Easypaisa
+- Enable/disable JazzCash
+- Change payment details
+- Change limits
+- Review manual deposits
+- Approve/reject
+- View duplicate TXID alerts
+- View Binance error classifications
+
+ADMIN ORDER CONTROLS
+
+- Search orders
+- View customer order
+- View supplier reference
+- Reconcile supplier order
+- Retry safely using same idempotency key
+- Refund through immutable ledger
+- View pending invite
+- Check delivery status
+
+ADMIN GIVEAWAY CONTROLS
+
+- Create
+- Edit
+- Activate
+- Pause
+- End
+- Select product
+- Set qualification criteria
+- Set required qualified referrals
+- View progress
+- Review claims
+
+ADMIN WALLET CONTROLS
+
+- Search user
+- View ledger
+- View balance
+- Perform audited adjustment
+- Require reason
+- Require confirmation
+- Never directly edit balance without ledger
+
+Every privileged admin mutation requires:
+
+- authorization
+- confirmation where dangerous
+- audit log
+- idempotency where applicable
+- sanitized output
+
+Never show credentials or secrets in admin screens.
+
+==================================================
+14. SUPPORT AND WARRANTY
+==================================================
+
+Implement support tickets:
+
+- Create ticket
+- Link order
+- Select issue type
+- Add message
+- Upload screenshot/proof
+- Admin reply
+- Customer reply
+- Open
+- Waiting
+- Resolved
+- Closed
+
+Show warranty information based on supplier text and admin configuration.
+
+Do not promise a warranty if the supplier product does not provide one.
+
+Allow a clear customer-facing warranty summary.
+
+==================================================
+15. LANGUAGE SYSTEM
+==================================================
+
+Make all messages translation-key based.
+
+Initial language:
+
+- English
+
+Prepare proper structure for:
+
+- Urdu
+- Roman Urdu
+
+Customer language preference must persist.
+
+Do not duplicate business logic per language.
+
+==================================================
+16. DATABASE AND MIGRATIONS
+==================================================
+
+Create additive, versioned, idempotent migrations.
+
+Include at least:
+
+- users
+- user_profiles
+- wallets
+- ledger_entries
+- payment_methods
+- deposits
+- deposit_attempts
+- payment_transactions
+- supplier_products
+- product_overrides
+- product_categories
+- local_orders
+- supplier_orders
+- delivered_items
+- referrals
+- referral_qualifications
+- giveaways
+- giveaway_criteria
+- giveaway_progress
+- giveaway_claims
+- support_tickets
+- support_messages
+- Telegram processed updates
+- admin_audit_logs
+- system_settings
+- schema_migrations
+
+Use:
+
+- foreign keys
+- unique indexes
+- CHECK constraints
+- status constraints
+- appropriate NUMERIC precision
+- timestamps
+- immutable references
+- safe transaction boundaries
+
+Important uniqueness protections:
+
+- Binance transaction ID
+- manual TXID where appropriate
+- Telegram update ID
+- local order idempotency key
+- supplier order idempotency key
+- ledger operation reference
+- referral qualification
+- giveaway claim
+
+==================================================
+17. STARTUP AND DEADLOCK SAFETY
+==================================================
+
+Do not create recursive initialization.
+
+Avoid any equivalent of:
+
+ensureTemplates()
+→ syncFromEnvironment()
+→ getByCode()
+→ ensureTemplates()
+
+Initialization methods must be non-recursive and guarded.
+
+Recommended startup sequence:
+
+1. Validate required configuration presence
+2. Initialize sanitized logger
+3. Connect PostgreSQL
+4. Run idempotent migrations
+5. Initialize repositories/services
+6. Seed baseline payment templates
+7. Sync payment configuration without recursion
+8. Initialize Redis non-authoritatively
+9. Bind HTTP server to Railway PORT
+10. Expose health/readiness endpoints
+11. Register Telegram webhook with bounded timeout
+12. Start non-blocking catalogue sync/reconciliation jobs
+
+The server must bind before optional external services can indefinitely block readiness.
+
+Use:
+
+- bounded timeouts
+- advisory locking where appropriate
+- finally cleanup
+- PostgreSQL client release
+- graceful shutdown
+- granular startup logs
+- retry only for clearly transient failures
+- no infinite wait
+
+A supplier, Redis, Binance, or Telegram failure must not silently exhaust the PostgreSQL pool.
+
+==================================================
+18. TELEGRAM WEBHOOK
+==================================================
+
+Environment variables:
+
+TELEGRAM_BOT_TOKEN
+TELEGRAM_WEBHOOK_URL
+TELEGRAM_WEBHOOK_SECRET
+TELEGRAM_ADMIN_IDS
+PORT
+
+Implement:
+
+- secure webhook endpoint
+- Telegram secret-token verification
+- getMe startup check
+- setWebhook
+- bounded timeout
+- duplicate update protection
+- sanitized diagnostics
+- graceful shutdown
+
+Do not expose the Telegram token.
+
+==================================================
+19. SAFETY FLAGS
+==================================================
+
+Default:
+
+RECOVERY_MODE=true
+LIVE_ORDERING_ENABLED=false
+
+RECOVERY_MODE may allow:
+
+- /start
+- admin access
+- product browsing
+- catalogue sync
+- health checks
+- controlled payment read-only tests
+- controlled manual review tests
+
+LIVE_ORDERING_ENABLED=false must block real supplier POST /order calls.
+
+It must not prevent catalogue browsing.
+
+Payment methods must have independent state controls.
+
+Binance automatic credit must require:
+
+- method enabled
+- configuration complete
+- successful verifier readiness
+- safe database state
+
+Do not silently enable live supplier ordering.
+
+==================================================
+20. FIRST-RUN TESTING
+==================================================
+
+Create meaningful automated tests.
+
+TELEGRAM
+
+- non-admin /start
+- premium menu
+- navigation
+- pagination
+- search
+- product detail
+- callback idempotency
+- customer cannot access admin
+- admin access works
+- restart preserves state
+
+CATALOGUE
+
+- supplier product synchronization
+- changing product count without hard-coding
+- all fields mapped
+- new product added
+- missing product marked unavailable
+- stock updated
+- zero-stock hidden
+- unlimited-stock supported
+- requires-email supported
+- supplier refresh preserves admin price
+- supplier refresh preserves category
+- supplier refresh preserves giveaway configuration
+
+PRICING
+
+- supplier cost 0.12 and admin retail 0.14
+- per-product fixed price
+- per-product markup
+- category rule
+- global rule
+- correct priority
+- Decimal rounding
+- cache invalidation
+- customer refresh shows new price
+- no accidental below-cost sale
+
+WALLET
+
+- deposit credit
+- purchase debit
+- refund
+- immutable ledger
+- ledger reconciliation
+- duplicate operation
+- concurrent operation
+- rollback
+
+BINANCE
+
+- exact incoming 2.00 USDT
+- expected 2.00 but actual 1.99
+- expected 2.00 but actual 3.00
+- wrong currency
+- outgoing
+- wrong receiver
+- outside time window
+- expired invoice
+- duplicate transaction
+- ambiguous transaction
+- valid C2C
+- authentication rejection
+- signature rejection
+- timestamp rejection
+- permission rejection
+- eligibility restriction
+- rate limit
+- malformed response
+- network failure
+- timeout
+- zero records
+- exact match credits once
+- concurrent Verify credits once
+- read-only test changes no wallet
+- secret-safe logs
+
+MANUAL PAYMENTS
+
+- Easypaisa pending submission
+- JazzCash pending submission
+- reference required
+- proof required
+- duplicate TXID
+- approval
+- rejection
+- simultaneous approval credits once
+- Telegram file identifier
+
+SUPPLIER ORDERS
+
+- completed order
+- delivered content
+- requires-email
+- pending_invite
+- timeout
+- same idempotency key retry
+- replayed response
+- uncertain reconciliation
+- 401
+- 402
+- 409
+- 429
+- 500
+- no double supplier purchase
+- no credentials in logs
+
+REFERRALS AND GIVEAWAYS
+
+- referral link alone not qualified
+- successful referred purchase qualifies once
+- self-referral rejected
+- duplicate qualification rejected
+- admin-selected product
+- admin-selected threshold
+- dynamic progress
+- paused giveaway
+- duplicate claim rejected
+- out-of-stock reward preserves entitlement
+- idempotent fulfilment
+
+STARTUP
+
+- migrations idempotent
+- no recursive setup
+- PostgreSQL pool not exhausted
+- server reaches listening state
+- webhook failure does not deadlock server
+- catalogue failure does not deadlock server
+- bounded external timeouts
+- graceful shutdown
+
+Run:
+
+- complete tests
+- typecheck
+- lint
+- production build
+
+Do not weaken test assertions to produce green results.
+
+==================================================
+21. GITHUB AND RAILWAY READINESS
+==================================================
+
+Create:
+
+- clean Git repository structure
+- `.gitignore`
+- `.env.example`
+- README
+- migration command
+- test command
+- lint command
+- build command
+- start command
+- Railway configuration where appropriate
+- health endpoint
+- readiness endpoint
+- graceful shutdown
+- deployment checklist
+- pre-deploy migration strategy
+
+Required environment-variable names:
+
+NODE_ENV
+PORT
+
+DATABASE_URL
+REDIS_URL
+
+TELEGRAM_BOT_TOKEN
+TELEGRAM_WEBHOOK_URL
+TELEGRAM_WEBHOOK_SECRET
+TELEGRAM_ADMIN_IDS
+
+AITOOLSHOP_BASE_URL
+AITOOLSHOP_RESELLER_API_KEY
+
+BINANCE_PAY_ENABLED
+BINANCE_API_BASE_URL
+BINANCE_API_KEY
+BINANCE_API_SECRET
+BINANCE_RECEIVER_ID
+BINANCE_RECV_WINDOW_MS
+BINANCE_REQUEST_TIMEOUT_MS
+BINANCE_MIN_DEPOSIT_USDT
+BINANCE_MAX_DEPOSIT_USDT
+
+RECOVERY_MODE
+LIVE_ORDERING_ENABLED
+MANUAL_PAYMENTS_ENABLED
+
+Bootstrap manual payment configuration:
+
+Easypaisa:
+Muhammad Abbas
+03705851403
+
+JazzCash:
+Muhammad Abbas
+03705851403
+
+Admin must be able to edit or disable these later without deployment.
+
+Never include actual secret values in generated files.
+
+==================================================
+22. EXECUTION PHASES
+==================================================
+
+Execute sequentially without waiting for micromanagement:
+
+PHASE 1
+Create architecture and environment contract.
+
+PHASE 2
+Create PostgreSQL schema and migrations.
+
+PHASE 3
+Create Telegram customer and admin UX.
+
+PHASE 4
+Implement live supplier catalogue synchronization.
+
+PHASE 5
+Implement categories, search, dynamic prices, and product cards.
+
+PHASE 6
+Implement wallet and immutable ledger.
+
+PHASE 7
+Implement Easypaisa and JazzCash manual deposits.
+
+PHASE 8
+Implement isolated Binance read-only verifier and sanitized diagnostics.
+
+PHASE 9
+Implement Binance invoices and atomic credit behind safe readiness controls.
+
+PHASE 10
+Implement supplier ordering behind LIVE_ORDERING_ENABLED=false.
+
+PHASE 11
+Implement referrals, giveaways, support, and admin tools.
+
+PHASE 12
+Run migrations, tests, typecheck, lint, and build.
+
+PHASE 13
+Fix every implementation-caused failure.
+
+PHASE 14
+Prepare repository for GitHub and Railway.
+
+Do not:
+
+- place a live supplier order
+- make a new real Binance payment
+- credit a real wallet during automated tests
+- enable LIVE_ORDERING_ENABLED
+- expose credentials
+
+==================================================
+23. COMPLETION GATE
+==================================================
+
+Do not declare XERO KHAN complete merely because compilation succeeds.
+
+Prove the following controlled flow:
+
+/start
+→ colourful premium menu
+→ live synchronized supplier products
+→ categories/search
+→ product detail
+→ correct admin retail price
+→ wallet
+→ Add Funds
+→ Binance invoice path
+→ Easypaisa/JazzCash submission
+→ admin review
+→ wallet credit
+→ checkout
+→ supplier revalidation
+→ idempotent supplier-order preparation
+→ order status
+→ My Orders
+→ support
+→ referral progress
+→ giveaway progress
+→ admin product control
+→ admin price change
+→ customer refresh showing updated price
+
+Confirm:
+
+- supplier refresh does not erase retail prices
+- supplier refresh updates stock
+- new supplier products synchronize
+- zero-stock products cannot be bought
+- duplicate buttons cannot duplicate payment/order
+- database restart preserves state
+- Telegram bot works after restart
+- safety flags remain active
+
+==================================================
+24. FINAL REPORT
+==================================================
+
+Return a complete but concise final report containing:
+
+1. Architecture created
+2. Full file tree
+3. Customer menu
+4. Admin menu
+5. PostgreSQL schema
+6. Migrations
+7. Supplier endpoints integrated
+8. Catalogue-sync behaviour
+9. Product count discovered during a mocked or authorized read-only test
+10. Pricing precedence
+11. Admin price controls
+12. Wallet/ledger design
+13. Binance read-only verifier status
+14. Sanitized Binance diagnostic status
+15. Manual payment configuration
+16. Supplier idempotency and reconciliation
+17. Referral qualification rule
+18. Giveaway configuration
+19. Startup/deadlock protections
+20. Tests added
+21. Exact test totals
+22. Typecheck result
+23. Lint result
+24. Build result
+25. Environment-variable names
+26. GitHub readiness
+27. Railway readiness
+28. Remaining external blockers
+29. Controlled deployment checklist
+30. Controlled Telegram smoke-test checklist
+
+Do not claim an external integration succeeded unless it was actually tested with authorized credentials.
+
+Do not expose any secret in the report.
+
+BEGIN NOW.
+
+Build the complete fresh XERO KHAN Telegram commerce bot.

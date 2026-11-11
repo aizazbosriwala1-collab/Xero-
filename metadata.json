@@ -1,0 +1,6 @@
+{
+  "name": "XERO KHAN — Telegram Commerce Bot",
+  "description": "Production-grade Telegram commerce bot with live supplier synchronization, decimal-safe ledger, Binance & manual deposits, admin pricing controls, and dynamic giveaways.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
