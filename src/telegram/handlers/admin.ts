@@ -278,14 +278,18 @@ export class AdminHandler {
     if (data === 'adm:hlth') {
       const binanceTest = await binanceService.testReadOnlyVerification();
       const sanitized: any = getSanitizedConfig();
+      const receiverConfigured = Boolean(binanceService.getReceiverId());
 
       const text = `🩺 *SYSTEM HEALTH & DIAGNOSTICS*\n\n` +
         `• Node Env: *${sanitized.nodeEnv}*\n` +
         `• Database Pool: *CONNECTED (PostgreSQL)*\n` +
         `• Redis: *${sanitized.redisConfigured ? 'CONNECTED' : 'IN-MEMORY FALLBACK'}*\n` +
-        `• Supplier API: *${sanitized.supplier.baseUrl}*\n` +
-        `• Binance Verifier: *${binanceTest.status} (${binanceTest.classification})*\n` +
-        `• Binance Message: _${binanceTest.message}_\n` +
+        `• Supplier API: *${sanitized.supplier.baseUrl}*\n\n` +
+        `⚡ *Binance Pay Status:*\n` +
+        `• Configured Receiver: *${receiverConfigured ? 'YES' : 'NO'}*\n` +
+        `• Receiver Match Capability: *${receiverConfigured ? 'AVAILABLE' : 'UNAVAILABLE'}*\n` +
+        `• Binance Readiness: *${binanceTest.status === 'READY' ? 'READY' : 'BLOCKED'}*\n\n` +
+        `🛡️ *Safety Flags:*\n` +
         `• Recovery Mode: *${config.safety.recoveryMode}*\n` +
         `• Live Ordering Flag: *${config.safety.liveOrderingEnabled}*\n\n` +
         `_Zero credential leakage. All secrets masked._`;

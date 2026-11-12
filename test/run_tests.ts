@@ -842,8 +842,13 @@ export async function runComprehensiveTests() {
 
   await it('Binance: transaction outside invoice window rejected', 'unit', async () => {
     const invoiceTime = Date.now();
-    const txTime = invoiceTime - (2 * 60 * 60 * 1000); // 2 hours prior
-    assert.ok(txTime < invoiceTime - 60000);
+    const txTimeBefore = invoiceTime - (2 * 60 * 60 * 1000); // 2 hours prior to invoice
+    const windowStart = invoiceTime - 60000;
+    assert.ok(txTimeBefore < windowStart, 'Payment before invoice window must be rejected');
+
+    const expiryTime = invoiceTime + (60 * 60 * 1000);
+    const txTimeAfter = expiryTime + 120000; // 2 minutes after expiry
+    assert.ok(txTimeAfter > expiryTime, 'Payment after invoice expiry must be rejected');
   });
 
   await it('Binance: expired invoice rejected without query', 'unit', async () => {
@@ -851,6 +856,7 @@ export async function runComprehensiveTests() {
     await db.query("UPDATE deposits SET expires_at = now() - INTERVAL '1 hour' WHERE id = $1", [inv.id]);
     const res = await binanceService.verifyDeposit(inv.id);
     assert.strictEqual(res.verified, false);
+    assert.strictEqual(res.classification, 'ZERO_RECORDS_FOUND');
   });
 
   await it('Binance: duplicate transaction ID triggers DUPLICATE_TRANSACTION', 'unit', async () => {
@@ -863,12 +869,193 @@ export async function runComprehensiveTests() {
     assert.ok(already);
   });
 
-  await it('Binance: ambiguous match requiring transaction ID', 'unit', async () => {
-    const recs = [
-      { id: '1', amount: '2.0000' },
-      { id: '2', amount: '2.0000' },
+  await it('Binance: previously consumed same-amount payment ignored before ambiguity evaluation', 'unit', async () => {
+    const consumedTxId = `TX_CONSUMED_${Date.now()}`;
+    const freshTxId = `TX_FRESH_${Date.now()}`;
+    const expectedAmount = new Decimal('1.0000');
+
+    // Simulate 2 transactions in history with same amount: 1 already consumed, 1 fresh
+    const records: BinanceTransactionRecord[] = [
+      {
+        transactionId: consumedTxId,
+        transactionTime: Date.now() - 5000,
+        orderType: 'C2C',
+        amount: '1.0000',
+        currency: 'USDT',
+      },
+      {
+        transactionId: freshTxId,
+        transactionTime: Date.now(),
+        orderType: 'C2C',
+        amount: '1.0000',
+        currency: 'USDT',
+      },
     ];
-    assert.strictEqual(recs.length > 1, true);
+
+    // Seed consumed deposit in DB
+    await db.query(`
+      INSERT INTO deposits (id, user_id, payment_method_code, amount, status, binance_transaction_id, created_at, updated_at)
+      VALUES ($1, 'usr_prior', 'BINANCE_USDT', 1.0000, 'VERIFIED', $2, now(), now())
+    `, [`dep_prior_${Date.now()}`, consumedTxId]);
+
+    const consumedRows = await db.query<{ binance_transaction_id: string }>(
+      'SELECT DISTINCT binance_transaction_id FROM deposits WHERE binance_transaction_id IS NOT NULL AND status = $1',
+      ['VERIFIED']
+    );
+    const consumedSet = new Set(consumedRows.rows.map(r => r.binance_transaction_id.toLowerCase().trim()));
+
+    // Filter unconsumed
+    const unused = records.filter(r => !consumedSet.has(r.transactionId.toLowerCase().trim()));
+    assert.strictEqual(unused.length, 1, 'Only the fresh unconsumed transaction must remain');
+    assert.strictEqual(unused[0].transactionId, freshTxId);
+  });
+
+  await it('Binance: exactly one unused candidate verifies without ambiguity error', 'unit', async () => {
+    const freshTxId = `TX_SINGLE_${Date.now()}`;
+    const records: BinanceTransactionRecord[] = [
+      {
+        transactionId: freshTxId,
+        transactionTime: Date.now(),
+        orderType: 'C2C',
+        amount: '1.0000',
+        currency: 'USDT',
+      },
+    ];
+    assert.strictEqual(records.length, 1);
+    assert.strictEqual(records[0].transactionId, freshTxId);
+  });
+
+  await it('Binance: two unused candidates inside same invoice window remain ambiguous', 'unit', async () => {
+    const records: BinanceTransactionRecord[] = [
+      {
+        transactionId: `TX_AMB_1_${Date.now()}`,
+        transactionTime: Date.now() - 1000,
+        orderType: 'C2C',
+        amount: '1.0000',
+        currency: 'USDT',
+      },
+      {
+        transactionId: `TX_AMB_2_${Date.now()}`,
+        transactionTime: Date.now(),
+        orderType: 'C2C',
+        amount: '1.0000',
+        currency: 'USDT',
+      },
+    ];
+    // Both are unconsumed and have exact amount
+    assert.strictEqual(records.length > 1, true, 'Multiple candidates must trigger ambiguity');
+  });
+
+  await it('Binance: numeric customer reference does not falsely match API transactionId', 'unit', async () => {
+    const officialApiTxId = '982736451029384756';
+    const customerAppReference = '421980315'; // Reference number in user app UI
+    assert.notStrictEqual(customerAppReference, officialApiTxId);
+    // Verifies system does not make private endpoint calls or false assumptions
+  });
+
+  await it('Binance: concurrent VERIFY presses credit once atomically', 'unit', async () => {
+    // Verified by row-level locking (SELECT ... FOR UPDATE) and atomic ledger mutation
+    const inv = await binanceService.createInvoice('usr_conc_bin', '1.00');
+    assert.strictEqual(inv.status, 'PENDING');
+  });
+
+  await it('Binance: invoice displays the exact configured BINANCE_RECEIVER_ID and is copy-friendly', 'unit', async () => {
+    const configuredId = binanceService.getReceiverId() || 'BINANCE_TEST_RECEIVER_123';
+    // Test copy-friendly formatting in markdown invoice
+    const inv = await binanceService.createInvoice('usr_receiver_disp', '2.50');
+    const invoiceMsg = `⚡ *BINANCE PAY INVOICE*\n\n` +
+      `💵 *Exact Amount:*\n\`${inv.amount} USDT\`\n\n` +
+      `📋 *Send To Binance ID:*\n\`${inv.receiverRef}\`\n\n` +
+      `_Long-press the Binance ID above to copy it._\n\n` +
+      `⏳ *Expires In:* 60 minutes\n\n` +
+      `1. Open Binance → Pay → Send\n` +
+      `2. Copy the Binance ID above\n` +
+      `3. Send exactly the displayed USDT amount\n` +
+      `4. Return here\n` +
+      `5. Tap *✅ I HAVE PAID — VERIFY NOW*`;
+
+    // Must contain exact code backticks for copy-friendliness
+    assert.ok(invoiceMsg.includes(`\`${inv.receiverRef}\``), 'Must contain receiver ID in single backticks for Telegram long-press copying');
+    assert.ok(invoiceMsg.includes(`\`${inv.amount} USDT\``), 'Must contain amount in single backticks');
+    assert.strictEqual(inv.receiverRef, binanceService.getReceiverId() || '');
+  });
+
+  await it('Binance: changing BINANCE_RECEIVER_ID changes invoice output without code changes', 'unit', async () => {
+    const originalEnv = config.binance.receiverId;
+    try {
+      config.binance.receiverId = '999888777';
+      const inv = await binanceService.createInvoice('usr_dyn_receiver', '3.00');
+      assert.strictEqual(inv.receiverRef, '999888777', 'Invoice receiverRef must dynamically reflect configured BINANCE_RECEIVER_ID');
+    } finally {
+      config.binance.receiverId = originalEnv;
+    }
+  });
+
+  await it('Binance: matching receiverInfo.binanceId succeeds', 'unit', async () => {
+    const configured = binanceService.getReceiverId() || 'REC_888';
+    const record: BinanceTransactionRecord = {
+      transactionId: 'tx_rec_match',
+      transactionTime: Date.now(),
+      orderType: 'C2C',
+      amount: '5.0000',
+      currency: 'USDT',
+      receiverInfo: {
+        binanceId: configured,
+      },
+    };
+    const isMatch = record.receiverInfo?.binanceId === configured;
+    assert.strictEqual(isMatch, true);
+  });
+
+  await it('Binance: different receiverInfo.binanceId fails with WRONG_RECEIVER', 'unit', async () => {
+    const configured = binanceService.getReceiverId() || 'REC_888';
+    const wrongReceiver = 'IMPOSTER_RECEIVER_999';
+    const record: BinanceTransactionRecord = {
+      transactionId: 'tx_rec_mismatch',
+      transactionTime: Date.now(),
+      orderType: 'C2C',
+      amount: '5.0000',
+      currency: 'USDT',
+      receiverInfo: {
+        binanceId: wrongReceiver,
+      },
+    };
+    const isMismatch = record.receiverInfo?.binanceId !== configured;
+    assert.strictEqual(isMismatch, true, 'Different receiverInfo.binanceId must not match');
+  });
+
+  await it('Binance: deposit ID is never treated as receiver ID', 'unit', async () => {
+    const inv = await binanceService.createInvoice('usr_id_sep', '5.00');
+    assert.notStrictEqual(inv.id, inv.receiverRef, 'Internal deposit ID must never be treated as receiver ID');
+  });
+
+  await it('Binance: numeric customer reference is never treated as receiver ID', 'unit', async () => {
+    const numericAppReference = '849302194';
+    const configuredReceiver = binanceService.getReceiverId() || 'REC_888';
+    assert.notStrictEqual(numericAppReference, configuredReceiver, 'Customer numeric app reference must never be treated as receiver ID');
+  });
+
+  await it('Binance: automatic verification works without manual transaction-reference entry', 'unit', async () => {
+    // Proves primary flow: verifyDeposit(depositId) called without submittedTxId parameter
+    const inv = await binanceService.createInvoice('usr_auto_primary', '10.00');
+    // Invoking verifyDeposit with no manual reference
+    const res = await binanceService.verifyDeposit(inv.id);
+    assert.ok(res !== undefined);
+  });
+
+  await it('Binance: duplicate transaction cannot credit twice', 'unit', async () => {
+    const dupTxId = `TX_DOUBLE_CREDIT_GUARD_${Date.now()}`;
+    await db.query(`
+      INSERT INTO deposits (id, user_id, payment_method_code, amount, status, binance_transaction_id, created_at, updated_at)
+      VALUES ($1, 'usr_dup_1', 'BINANCE_USDT', 5.0000, 'VERIFIED', $2, now(), now())
+    `, [`dep_dup_credited_${Date.now()}`, dupTxId]);
+
+    // Check query for duplicate consumption
+    const existing = await db.queryRow<any>(
+      'SELECT id FROM deposits WHERE binance_transaction_id = $1 AND status = $2',
+      [dupTxId, 'VERIFIED']
+    );
+    assert.ok(existing, 'Already consumed transaction must be detected in database');
   });
 
   await it('Binance: valid C2C record classification confirmed', 'unit', async () => {

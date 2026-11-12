@@ -273,7 +273,7 @@ export class CustomerHandler {
       return;
     }
 
-    // Binance: Verify payment button
+    // Binance: Verify payment button (Primary Flow: Create Invoice -> Pay -> I HAVE PAID)
     if (data.startsWith('bin_v:')) {
       const [, depositId] = data.split(':');
       await telegramClient.sendMessage(chatId, '🔍 Checking Binance transaction history for matching incoming transfer...');
@@ -284,8 +284,9 @@ export class CustomerHandler {
           reply_markup: getBackHomeKeyboard('m:wall'),
         });
       } else {
+        const isAmbiguous = verifyResult.classification === 'AMBIGUOUS_TRANSACTION';
         await telegramClient.sendMessage(chatId, `⚠️ *VERIFICATION RESULT: ${verifyResult.classification}*\n\n${verifyResult.message}`, {
-          reply_markup: getBinanceInvoiceKeyboard(depositId),
+          reply_markup: getBinanceInvoiceKeyboard(depositId, isAmbiguous),
         });
       }
       return;
@@ -493,14 +494,18 @@ export class CustomerHandler {
 
       await redis.clearFsmState(userId);
       const invoice = await binanceService.createInvoice(userId, amountDec);
-      const invoiceMsg = `⚡ *BINANCE PAY INVOICE CREATED*\n\n` +
-        `• Invoice ID: \`${invoice.id}\`\n` +
-        `• Exact Amount: \`${invoice.amount} USDT\`\n` +
-        `• Binance Pay Receiver ID: \`${invoice.receiverRef}\`\n` +
-        `• Expires In: \`60 minutes\`\n\n` +
-        `1. Open Binance App -> Binance Pay -> Send\n` +
-        `2. Send exactly *${invoice.amount} USDT* to the Receiver ID\n` +
-        `3. Tap *I HAVE PAID* below for automatic verification.`;
+      const receiverId = invoice.receiverRef || config.binance.receiverId || '';
+
+      const invoiceMsg = `⚡ *BINANCE PAY INVOICE*\n\n` +
+        `💵 *Exact Amount:*\n\`${invoice.amount} USDT\`\n\n` +
+        `📋 *Send To Binance ID:*\n\`${receiverId}\`\n\n` +
+        `_Long-press the Binance ID above to copy it._\n\n` +
+        `⏳ *Expires In:* 60 minutes\n\n` +
+        `1. Open Binance → Pay → Send\n` +
+        `2. Copy the Binance ID above\n` +
+        `3. Send exactly the displayed USDT amount\n` +
+        `4. Return here\n` +
+        `5. Tap *✅ I HAVE PAID — VERIFY NOW*`;
 
       await telegramClient.sendMessage(chatId, invoiceMsg, {
         reply_markup: getBinanceInvoiceKeyboard(invoice.id),

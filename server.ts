@@ -23,9 +23,12 @@ async function startServer() {
   logger.info('Tagline: Digital Tools. Instant Access.');
   logger.info('====================================================');
 
-  // Validate encryption key at startup
+  // Validate encryption key and Binance receiver configuration at startup
   encryptionService.validateKeyAtStartup();
   logger.info('Delivered credentials encryption key verified (AES-256-GCM v1)');
+
+  const { binanceService } = await import('./src/services/binance.js');
+  binanceService.validateReceiverConfigAtStartup();
 
   const sanitized = getSanitizedConfig();
   logger.info('Runtime configuration loaded safely', { config: sanitized });
