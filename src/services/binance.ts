@@ -385,7 +385,11 @@ export class BinanceService {
   /**
    * Verify an incoming deposit invoice against Binance transactions.
    */
-  public async verifyDeposit(depositId: string, submittedTxId?: string): Promise<BinanceVerificationResult> {
+  public async verifyDeposit(
+    depositId: string,
+    submittedTxId?: string,
+    customerId?: string
+  ): Promise<BinanceVerificationResult> {
     const deposit = await db.queryRow<any>(
       'SELECT * FROM deposits WHERE id = $1',
       [depositId]
@@ -396,6 +400,15 @@ export class BinanceService {
         verified: false,
         classification: 'ZERO_RECORDS_FOUND',
         message: 'Deposit invoice not found.',
+      };
+    }
+
+    // Verify invoice belongs to this customer if customerId is provided
+    if (customerId && deposit.user_id !== String(customerId)) {
+      return {
+        verified: false,
+        classification: 'ELIGIBILITY_RESTRICTED',
+        message: 'This deposit invoice does not belong to your account.',
       };
     }
 
@@ -420,6 +433,23 @@ export class BinanceService {
 
     const expectedAmount = new Decimal(deposit.amount);
     const expectedCurrency = (deposit.currency || 'USDT').toUpperCase();
+
+    // Guard against customer submitting invoice ID, receiver ID, or customer ID as transaction ID
+    if (submittedTxId && submittedTxId.trim()) {
+      const cleanSub = submittedTxId.trim().toLowerCase();
+      const configuredRec = this.getReceiverId() ? this.getReceiverId()!.toLowerCase() : '';
+      const recRef = deposit.receiver_ref ? String(deposit.receiver_ref).toLowerCase().trim() : '';
+      const invId = depositId.toLowerCase();
+      const usrId = String(deposit.user_id).toLowerCase();
+
+      if (cleanSub === invId || (configuredRec && cleanSub === configuredRec) || (recRef && cleanSub === recRef) || cleanSub === usrId) {
+        return {
+          verified: false,
+          classification: 'ZERO_RECORDS_FOUND',
+          message: 'The submitted value is not a Binance Transaction ID. Please enter the official Transaction ID found in your Binance Pay history.',
+        };
+      }
+    }
 
     // 1. Tightly bounded time window based on deposit created_at and expires_at / verification time
     // Buffer: 60s before invoice creation (to absorb slight client clock skew)
@@ -521,19 +551,11 @@ export class BinanceService {
     // Step G: EXCLUDE every transaction already attached to a verified/consumed deposit BEFORE ambiguity evaluation
     const unusedMatches = amountMatches.filter(r => !consumedTxIds.has(r.transactionId.toLowerCase().trim()));
 
-    // If manual submittedTxId is provided, also verify it against official transactionId
-    // Note: Do not assume numeric customer-visible Binance reference equals API transactionId!
-    let eligibleCandidates = unusedMatches;
-    if (submittedTxId && submittedTxId.trim()) {
-      const cleanSub = submittedTxId.trim().toLowerCase();
-      eligibleCandidates = unusedMatches.filter(c => c.transactionId.toLowerCase() === cleanSub);
-    }
+    // Sort unused candidates chronologically by transactionTime
+    unusedMatches.sort((a, b) => Number(a.transactionTime) - Number(b.transactionTime));
 
-    // Sort eligible candidates chronologically by transactionTime
-    eligibleCandidates.sort((a, b) => Number(a.transactionTime) - Number(b.transactionTime));
-
-    // Sanitized diagnostics (zero secret or payer PII leakage)
-    const diagnostics = {
+    // Sanitized diagnostics helper (zero secret or payer PII leakage)
+    const buildDiagnostics = (candidates: BinanceTransactionRecord[]) => ({
       windowStart: new Date(windowStartMs).toISOString(),
       windowEnd: new Date(windowEndMs).toISOString(),
       recordsFetched: fetchedRecords.length,
@@ -542,9 +564,41 @@ export class BinanceService {
       recordsAfterDirectionReceiver: receiverMatches.length,
       recordsAfterAmount: amountMatches.length,
       recordsAfterAlreadyUsed: unusedMatches.length,
-      eligibleCandidatesCount: eligibleCandidates.length,
-      maskedCandidateIds: eligibleCandidates.map(c => maskId(c.transactionId)),
-    };
+      eligibleCandidatesCount: candidates.length,
+      maskedCandidateIds: candidates.map(c => maskId(c.transactionId)),
+    });
+
+    // If manual submittedTxId is provided, also validate against official Binance Pay transactionId
+    // Never treat invoice ID, Binance receiver ID, Telegram ID, or unrelated numeric reference as transactionId!
+    let eligibleCandidates = unusedMatches;
+    if (submittedTxId && submittedTxId.trim()) {
+      const cleanSub = submittedTxId.trim().toLowerCase();
+      const configuredRec = this.getReceiverId() ? this.getReceiverId()!.toLowerCase() : '';
+      const invId = depositId.toLowerCase();
+      const usrId = String(deposit.user_id).toLowerCase();
+
+      // Guard: customer submitted the invoice ID, receiver ID, or user ID instead of official transactionId
+      if (cleanSub === invId || (configuredRec && cleanSub === configuredRec) || cleanSub === usrId) {
+        return {
+          verified: false,
+          classification: 'ZERO_RECORDS_FOUND',
+          message: 'The submitted value is not a Binance Transaction ID. Please enter the official Transaction ID found in your Binance Pay history.',
+          sanitizedDetails: buildDiagnostics([]),
+        };
+      }
+
+      eligibleCandidates = unusedMatches.filter(c => c.transactionId.toLowerCase() === cleanSub);
+      if (eligibleCandidates.length === 0) {
+        return {
+          verified: false,
+          classification: 'ZERO_RECORDS_FOUND',
+          message: 'The submitted Binance Transaction ID was not found in your recent matching incoming transactions.',
+          sanitizedDetails: buildDiagnostics([]),
+        };
+      }
+    }
+
+    const diagnostics = buildDiagnostics(eligibleCandidates);
 
     logger.info('Binance verification matching diagnostics', {
       depositId,

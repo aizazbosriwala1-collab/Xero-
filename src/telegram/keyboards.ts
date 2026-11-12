@@ -246,13 +246,13 @@ export function getDepositMethodsKeyboard(): TelegramInlineKeyboardMarkup {
 /**
  * Binance Invoice Action Keyboard
  */
-export function getBinanceInvoiceKeyboard(depositId: string, showManualTxid = false): TelegramInlineKeyboardMarkup {
+export function getBinanceInvoiceKeyboard(depositId: string, showManualTxid = true): TelegramInlineKeyboardMarkup {
   const rows: any[][] = [
     [{ text: '✅ I HAVE PAID — VERIFY NOW', callback_data: `bin_v:${depositId}` }],
   ];
 
   if (showManualTxid) {
-    rows.push([{ text: '🔑 ENTER TRANSACTION ID', callback_data: `bin_tx:${depositId}` }]);
+    rows.push([{ text: '🔎 VERIFY WITH TRANSACTION ID', callback_data: `bin_tx:${depositId}` }]);
   }
 
   rows.push([

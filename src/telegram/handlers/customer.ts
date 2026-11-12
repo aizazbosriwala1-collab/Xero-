@@ -277,26 +277,33 @@ export class CustomerHandler {
     if (data.startsWith('bin_v:')) {
       const [, depositId] = data.split(':');
       await telegramClient.sendMessage(chatId, '🔍 Checking Binance transaction history for matching incoming transfer...');
-      const verifyResult = await binanceService.verifyDeposit(depositId);
+      const verifyResult = await binanceService.verifyDeposit(depositId, undefined, userId);
 
       if (verifyResult.verified) {
         await telegramClient.sendMessage(chatId, `✅ *PAYMENT VERIFIED!*\n\n${verifyResult.message}`, {
           reply_markup: getBackHomeKeyboard('m:wall'),
         });
       } else {
-        const isAmbiguous = verifyResult.classification === 'AMBIGUOUS_TRANSACTION';
-        await telegramClient.sendMessage(chatId, `⚠️ *VERIFICATION RESULT: ${verifyResult.classification}*\n\n${verifyResult.message}`, {
-          reply_markup: getBinanceInvoiceKeyboard(depositId, isAmbiguous),
+        await telegramClient.sendMessage(chatId, `⚠️ *VERIFICATION RESULT: ${verifyResult.classification}*\n\n${verifyResult.message}\n\n_If you completed the payment in Binance, you can also tap below to verify with your Transaction ID:_`, {
+          reply_markup: getBinanceInvoiceKeyboard(depositId, true),
         });
       }
       return;
     }
 
-    // Binance: Enter Transaction ID
+    // Binance: Enter Transaction ID fallback
     if (data.startsWith('bin_tx:')) {
       const [, depositId] = data.split(':');
       await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } });
-      await telegramClient.sendMessage(chatId, '🔑 Please send your Binance Transaction ID (found in Binance Pay Transaction details):', {
+      const prompt = `🔎 *VERIFY WITH BINANCE TRANSACTION ID*\n\n` +
+        `Please enter the official Binance Pay *Transaction ID* for this payment.\n\n` +
+        `Where to find it:\n` +
+        `1. Open Binance App → Pay → Transaction History\n` +
+        `2. Tap on the sent transaction\n` +
+        `3. Copy the *Transaction ID*\n\n` +
+        `_Note: Enter only the official Transaction ID. Do not enter the invoice ID, Binance receiver ID, or your personal ID._`;
+
+      await telegramClient.sendMessage(chatId, prompt, {
         reply_markup: getBackHomeKeyboard('m:dep'),
       });
       return;
@@ -518,14 +525,14 @@ export class CustomerHandler {
       const depositId = fsm.data?.depositId;
       await redis.clearFsmState(userId);
       await telegramClient.sendMessage(chatId, `🔍 Verifying submitted Transaction ID \`${text}\`...`);
-      const res = await binanceService.verifyDeposit(depositId, text);
+      const res = await binanceService.verifyDeposit(depositId, text, userId);
       if (res.verified) {
         await telegramClient.sendMessage(chatId, `✅ *PAYMENT VERIFIED!*\n\n${res.message}`, {
           reply_markup: getBackHomeKeyboard('m:wall'),
         });
       } else {
         await telegramClient.sendMessage(chatId, `⚠️ *VERIFICATION FAILED (${res.classification})*\n\n${res.message}`, {
-          reply_markup: getBinanceInvoiceKeyboard(depositId),
+          reply_markup: getBinanceInvoiceKeyboard(depositId, true),
         });
       }
       return;

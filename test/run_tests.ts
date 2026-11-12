@@ -1058,6 +1058,46 @@ export async function runComprehensiveTests() {
     assert.ok(existing, 'Already consumed transaction must be detected in database');
   });
 
+  await it('Binance Fallback: customer entering invoice ID or receiver ID as TXID is rejected', 'unit', async () => {
+    const origReceiver = config.binance.receiverId;
+    config.binance.receiverId = 'BINANCE_TEST_REC_777';
+    try {
+      const inv = await binanceService.createInvoice('usr_tx_guard', '1.00');
+      // Customer mistakenly pastes the deposit/invoice ID as the transaction ID
+      const resInv = await binanceService.verifyDeposit(inv.id, inv.id, 'usr_tx_guard');
+      assert.strictEqual(resInv.verified, false);
+      assert.strictEqual(resInv.classification, 'ZERO_RECORDS_FOUND');
+
+      // Customer mistakenly pastes the receiver ID as the transaction ID
+      const resRec = await binanceService.verifyDeposit(inv.id, 'BINANCE_TEST_REC_777', 'usr_tx_guard');
+      assert.strictEqual(resRec.verified, false);
+      assert.strictEqual(resRec.classification, 'ZERO_RECORDS_FOUND');
+    } finally {
+      config.binance.receiverId = origReceiver;
+    }
+  });
+
+  await it('Binance Fallback: invoice ownership enforced (other customer cannot verify)', 'unit', async () => {
+    const inv = await binanceService.createInvoice('usr_owner_true', '2.00');
+    const resOther = await binanceService.verifyDeposit(inv.id, undefined, 'usr_imposter');
+    assert.strictEqual(resOther.verified, false);
+    assert.strictEqual(resOther.classification, 'ELIGIBILITY_RESTRICTED');
+  });
+
+  await it('Binance Fallback: wrong or not-found TXID produces zero credit', 'unit', async () => {
+    const inv = await binanceService.createInvoice('usr_not_found', '5.00');
+    const wrongTxId = 'TX_DOES_NOT_EXIST_999999';
+    const res = await binanceService.verifyDeposit(inv.id, wrongTxId, 'usr_not_found');
+    assert.strictEqual(res.verified, false, 'Wrong TXID must never verify');
+    assert.ok(
+      res.classification === 'ZERO_RECORDS_FOUND' || res.classification === 'AUTH_REJECTION',
+      `Expected ZERO_RECORDS_FOUND or AUTH_REJECTION, got ${res.classification}`
+    );
+
+    const d = await db.queryRow<any>('SELECT status FROM deposits WHERE id = $1', [inv.id]);
+    assert.strictEqual(d.status, 'PENDING', 'Deposit status must remain PENDING with zero credit');
+  });
+
   await it('Binance: valid C2C record classification confirmed', 'unit', async () => {
     const record: BinanceTransactionRecord = {
       transactionId: 'c2c_tx_123',
