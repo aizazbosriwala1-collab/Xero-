@@ -11,6 +11,7 @@ import {
   binanceService,
   BinanceTransactionRecord,
   BINANCE_DIAGNOSTIC_FIXED_WINDOW,
+  normalizeBinanceIdentifier,
 } from '../src/services/binance.js';
 import { orderService } from '../src/services/order.js';
 import { referralService } from '../src/services/referral.js';
@@ -4170,6 +4171,368 @@ export async function runComprehensiveTests() {
       const attRow = await db.queryRow<any>('SELECT payload, response FROM deposit_attempts WHERE deposit_id = $1 ORDER BY created_at DESC LIMIT 1', [inv.id]);
       const attStr = JSON.stringify(attRow || {});
       assert.strictEqual(attStr.includes(fullOrderId), false, 'deposit_attempts must store masked ID only');
+    });
+  });
+
+  // =========================================================================
+  // 16. RECEIVER VALIDATION RUNTIME CRASH MICRO-FIX SUITE (A - I)
+  // =========================================================================
+  currentCategory = 'Receiver Validation Runtime Fix';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('A. Live-shaped record with numeric receiverInfo.binanceId normalizes cleanly without crash and matches configured string receiver', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      config.binance.receiverId = '465000123';
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = `usr_num_rec_${Date.now()}`;
+      const inv = await binanceService.createInvoice(userId, '0.30');
+      const liveOrderId = `ORD_NUM_REC_${Date.now()}`;
+      const liveTxId = `TX_NUM_REC_${Date.now()}`;
+
+      // Live Binance shape: receiverInfo.binanceId returned as JSON number
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            message: 'success',
+            data: [
+              {
+                transactionId: liveTxId,
+                orderId: liveOrderId,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '0.30',
+                currency: 'USDT',
+                receiverInfo: { binanceId: 465000123 },
+              },
+            ],
+          }),
+      }) as any);
+
+      const queryRes = await binanceService.queryTransactions({ startTime: Date.now() - 60000, endTime: Date.now(), limit: 10 });
+      assert.strictEqual(queryRes.records[0].receiverBinanceId, '465000123');
+      assert.strictEqual(queryRes.records[0].receiverInfo?.binanceId, '465000123');
+      assert.strictEqual(queryRes.records[0].orderId, liveOrderId);
+      assert.strictEqual(queryRes.records[0].transactionId, liveTxId);
+
+      const res = await binanceService.verifyDeposit(inv.id, liveOrderId, userId);
+      assert.strictEqual(res.verified, true);
+      assert.strictEqual(res.classification, 'VERIFIED');
+      assert.strictEqual(res.sanitizedDetails?.identifierMatchField, 'MATCHED_ORDER_ID');
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.3000');
+    });
+  });
+
+  await it('B & C. String & BigInt receiver IDs normalize safely with zero precision loss', 'unit', async () => {
+    assert.strictEqual(normalizeBinanceIdentifier('  465000123  '), '465000123');
+    assert.strictEqual(normalizeBinanceIdentifier(465000123), '465000123');
+    assert.strictEqual(normalizeBinanceIdentifier(90071992547409931234n), '90071992547409931234');
+    assert.notStrictEqual(normalizeBinanceIdentifier(90071992547409931234n), '90071992547409931235');
+
+    // Direct verification with BigInt/string receiver on internal record evaluation
+    await withMockBinanceEnv(async () => {
+      config.binance.receiverId = '90071992547409931234';
+      const evalMatch = (binanceService as any).evaluateReceiverValidation({
+        transactionId: 'tx_bi_1',
+        transactionTime: Date.now(),
+        orderType: 'C2C',
+        amount: '1.0000',
+        currency: 'USDT',
+        receiverInfo: { binanceId: 90071992547409931234n as any },
+      });
+      assert.strictEqual(evalMatch.classification, 'OK');
+      assert.strictEqual(evalMatch.officialReceiver, '90071992547409931234');
+      assert.strictEqual(evalMatch.receiverMatch, true);
+
+      const evalMismatch = (binanceService as any).evaluateReceiverValidation({
+        transactionId: 'tx_bi_2',
+        transactionTime: Date.now(),
+        orderType: 'C2C',
+        amount: '1.0000',
+        currency: 'USDT',
+        receiverInfo: { binanceId: 90071992547409931235n as any },
+      });
+      assert.strictEqual(evalMismatch.classification, 'WRONG_RECEIVER');
+      assert.strictEqual(evalMismatch.receiverMatch, false);
+    });
+  });
+
+  await it('D. Missing receiver information (absent receiverInfo, null receiverInfo, absent binanceId, null binanceId) returns ELIGIBILITY_RESTRICTED with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      config.binance.receiverId = '465000123';
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = `usr_miss_rec_${Date.now()}`;
+      const missingVariants: Array<Record<string, unknown>> = [
+        {}, // receiverInfo absent
+        { receiverInfo: null }, // receiverInfo null
+        { receiverInfo: {} }, // binanceId absent
+        { receiverInfo: { binanceId: null } }, // binanceId null
+      ];
+
+      for (let i = 0; i < missingVariants.length; i++) {
+        const inv = await binanceService.createInvoice(userId, '0.30');
+        const ordId = `ORD_MISS_${i}_${Date.now()}`;
+        binanceService.setFetchOverride(async () => ({
+          status: 200,
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              code: '000000',
+              data: [
+                {
+                  transactionId: `TX_MISS_${i}_${Date.now()}`,
+                  orderId: ordId,
+                  transactionTime: Date.now(),
+                  orderType: 'C2C',
+                  amount: '0.30',
+                  currency: 'USDT',
+                  ...missingVariants[i],
+                },
+              ],
+            }),
+        }) as any);
+
+        const res = await binanceService.verifyDeposit(inv.id, ordId, userId);
+        assert.strictEqual(res.verified, false);
+        assert.strictEqual(res.classification, 'ELIGIBILITY_RESTRICTED');
+      }
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.0000');
+    });
+  });
+
+  await it('E. Invalid receiver shapes (object, array, boolean, NaN, Infinity, empty, whitespace) never throw or credit', 'mock_integration', async () => {
+    for (const badVal of [{ id: '123' }, ['123'], true, false, NaN, Infinity, -Infinity, '', '   \t\n  ', null, undefined]) {
+      assert.strictEqual(normalizeBinanceIdentifier(badVal), null, `Expected null for invalid shape: ${String(badVal)}`);
+    }
+
+    await withMockBinanceEnv(async () => {
+      config.binance.receiverId = '465000123';
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = `usr_bad_rec_${Date.now()}`;
+      for (const badJsonShape of [{ id: '465000123' }, ['465000123'], true, false, '', '   ']) {
+        const inv = await binanceService.createInvoice(userId, '0.30');
+        const ordId = `ORD_BAD_REC_${Math.random().toString(36).slice(2, 8)}_${Date.now()}`;
+        binanceService.setFetchOverride(async () => ({
+          status: 200,
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              code: '000000',
+              data: [
+                {
+                  transactionId: `TX_BAD_${Date.now()}`,
+                  orderId: ordId,
+                  transactionTime: Date.now(),
+                  orderType: 'C2C',
+                  amount: '0.30',
+                  currency: 'USDT',
+                  receiverInfo: { binanceId: badJsonShape },
+                },
+              ],
+            }),
+        }) as any);
+
+        const res = await binanceService.verifyDeposit(inv.id, ordId, userId);
+        assert.strictEqual(res.verified, false);
+        assert.strictEqual(res.classification, 'ELIGIBILITY_RESTRICTED');
+      }
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.0000');
+    });
+  });
+
+  await it('F & G. Wrong numeric receiver returns WRONG_RECEIVER and missing configured receiver returns ELIGIBILITY_RESTRICTED with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      config.binance.receiverId = '465000123';
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = `usr_fg_rec_${Date.now()}`;
+      const invWrong = await binanceService.createInvoice(userId, '0.30');
+      const ordWrong = `ORD_WNUM_${Date.now()}`;
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: `TX_WNUM_${Date.now()}`,
+                orderId: ordWrong,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '0.30',
+                currency: 'USDT',
+                receiverInfo: { binanceId: 999888777 },
+              },
+            ],
+          }),
+      }) as any);
+
+      const resWrong = await binanceService.verifyDeposit(invWrong.id, ordWrong, userId);
+      assert.strictEqual(resWrong.verified, false);
+      assert.strictEqual(resWrong.classification, 'WRONG_RECEIVER');
+
+      // G. Missing configured receiver must never silently skip receiver validation
+      config.binance.receiverId = undefined;
+      const invNoCfg = await binanceService.createInvoice(userId, '0.30');
+      const ordNoCfg = `ORD_NOCFG_${Date.now()}`;
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: `TX_NOCFG_${Date.now()}`,
+                orderId: ordNoCfg,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '0.30',
+                currency: 'USDT',
+                receiverInfo: { binanceId: 465000123 },
+              },
+            ],
+          }),
+      }) as any);
+
+      const resNoCfg = await binanceService.verifyDeposit(invNoCfg.id, ordNoCfg, userId);
+      assert.strictEqual(resNoCfg.verified, false);
+      assert.strictEqual(resNoCfg.classification, 'ELIGIBILITY_RESTRICTED');
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.0000');
+    });
+  });
+
+  await it('H & I. Full fresh 0.3 USDT live-shaped flow: reaches readiness gate cleanly under RECOVERY_MODE=true, credits once atomically when permitted, idempotent retry, and zero sensitive log leakage', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ apiKey, apiSecret }) => {
+      const secretNumericReceiver = 887766554;
+      config.binance.receiverId = String(secretNumericReceiver);
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+
+      const userId = `usr_fresh03_${Date.now()}`;
+      const inv = await binanceService.createInvoice(userId, '0.30');
+      const freshOrderId = `465195606769900${String(Date.now()).slice(-3)}`;
+      const freshTxId = `BIN_TX_FRESH03_${Date.now()}`;
+      const payerSecretId = 'PAYER_PRIVATE_ID_8811';
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            message: 'success',
+            data: [
+              {
+                transactionId: freshTxId,
+                orderId: freshOrderId,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '0.3',
+                currency: 'USDT',
+                payerInfo: { name: 'Fresh Payer', binanceId: payerSecretId },
+                receiverInfo: { binanceId: secretNumericReceiver },
+              },
+            ],
+          }),
+      }) as any);
+
+      const capturedLogs: string[] = [];
+      const origStdoutWrite = process.stdout.write.bind(process.stdout);
+      const origConsoleLog = console.log;
+      console.log = (...args: any[]) => {
+        capturedLogs.push(args.map(a => String(a)).join(' '));
+        origConsoleLog(...args);
+      };
+
+      try {
+        // Step 1: With RECOVERY_MODE=true (production default safety), reaches readiness gate cleanly (NEVER BINANCE_API_ERROR!)
+        config.safety.recoveryMode = true;
+        const gateRes = await binanceService.verifyDeposit(inv.id, freshOrderId, userId);
+        assert.strictEqual(gateRes.verified, false);
+        assert.strictEqual(gateRes.classification, 'ELIGIBILITY_RESTRICTED');
+        assert.notStrictEqual(gateRes.classification, 'BINANCE_API_ERROR');
+        assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.0000');
+
+        // Verify receiver_validation_completed stage log emitted sanitized fields without sensitive IDs/secrets
+        const stageLog = capturedLogs.find(line => line.includes('receiver_validation_completed'));
+        assert.ok(stageLog, 'Must emit sanitized stage: receiver_validation_completed');
+        const parsedLog = JSON.parse(stageLog!);
+        assert.strictEqual(parsedLog.meta.officialReceiverPresent, true);
+        assert.strictEqual(parsedLog.meta.configuredReceiverPresent, true);
+        assert.strictEqual(parsedLog.meta.receiverMatch, true);
+        assert.strictEqual(parsedLog.meta.officialReceiverType, 'number');
+        assert.strictEqual(parsedLog.meta.normalizationSucceeded, true);
+        assert.strictEqual(parsedLog.meta.classification, 'OK');
+        assert.strictEqual(typeof parsedLog.meta.durationMs, 'number');
+
+        const joinedLogs = capturedLogs.join('\n');
+        for (const sensitive of [String(secretNumericReceiver), freshOrderId, freshTxId, payerSecretId, apiKey, apiSecret]) {
+          // Verify receiver_validation_completed log specifically contains none of these
+          assert.strictEqual(stageLog!.includes(sensitive), false, `receiver_validation_completed leaked ${sensitive.slice(0, 6)}`);
+        }
+        assert.strictEqual(joinedLogs.includes(freshOrderId), false, 'Logs must never contain full Order ID');
+        assert.strictEqual(joinedLogs.includes(freshTxId), false, 'Logs must never contain full Transaction ID');
+        assert.strictEqual(joinedLogs.includes(payerSecretId), false, 'Logs must never contain payer PII');
+
+        // Step 2: When readiness gate permits credit in isolated mock test, credits 0.3000 ONCE and retry is idempotent
+        binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+        await binanceService.testReadOnlyVerification(true);
+        binanceService.setFetchOverride(async () => ({
+          status: 200,
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              code: '000000',
+              message: 'success',
+              data: [
+                {
+                  transactionId: freshTxId,
+                  orderId: freshOrderId,
+                  transactionTime: Date.now(),
+                  orderType: 'C2C',
+                  amount: '0.3',
+                  currency: 'USDT',
+                  payerInfo: { name: 'Fresh Payer', binanceId: payerSecretId },
+                  receiverInfo: { binanceId: secretNumericReceiver },
+                },
+              ],
+            }),
+        }) as any);
+        config.safety.recoveryMode = false;
+
+        const okRes = await binanceService.verifyDeposit(inv.id, freshOrderId, userId);
+        assert.strictEqual(okRes.verified, true);
+        assert.strictEqual(okRes.classification, 'VERIFIED');
+        assert.strictEqual(okRes.sanitizedDetails?.identifierMatchField, 'MATCHED_ORDER_ID');
+        assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.3000');
+
+        // Retry on same pending->verified invoice is idempotent with zero duplicate credit
+        const retryRes = await binanceService.verifyDeposit(inv.id, freshOrderId, userId);
+        assert.strictEqual(retryRes.verified, true);
+        assert.strictEqual(retryRes.classification, 'ALREADY_VERIFIED');
+        assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.3000');
+      } finally {
+        console.log = origConsoleLog;
+        void origStdoutWrite;
+      }
     });
   });
 

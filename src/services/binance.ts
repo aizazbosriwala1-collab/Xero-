@@ -54,6 +54,11 @@ export interface BinanceTransactionRecord {
   orderId?: string | null;
   orderNo?: string | null;
   counterpartyId?: string | null;
+  receiverBinanceId?: string | null;
+  payerBinanceId?: string | null;
+  hasReceiverInfo?: boolean;
+  hasReceiverBinanceId?: boolean;
+  rawReceiverBinanceIdType?: string;
   transactionTime: number;
   orderType: string;
   amount: string;
@@ -143,9 +148,36 @@ export interface BinanceReadOnlyDiagnosticResult {
 
 export type FetchLike = typeof fetch;
 
-export function maskIdentifier(id?: string | null): string {
-  if (!id) return '';
-  const clean = String(id).trim();
+function getIdentifierRuntimeType(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+export function normalizeBinanceIdentifier(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+    return String(value);
+  }
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  return null;
+}
+
+export function maskIdentifier(id?: unknown): string {
+  const clean = normalizeBinanceIdentifier(id);
+  if (!clean) return '';
   if (clean.length <= 6) return '***';
   return `${clean.substring(0, 3)}...${clean.substring(clean.length - 3)}`;
 }
@@ -165,7 +197,7 @@ export class BinanceService {
     this.baseUrl = config.binance.baseUrl.replace(/\/+$/, '');
     this.apiKey = config.binance.apiKey;
     this.apiSecret = config.binance.apiSecret;
-    this.receiverId = config.binance.receiverId ? config.binance.receiverId.trim() : undefined;
+    this.receiverId = normalizeBinanceIdentifier(config.binance.receiverId) ?? undefined;
     this.recvWindowMs = config.binance.recvWindowMs;
     this.requestTimeoutMs = config.binance.requestTimeoutMs;
   }
@@ -184,7 +216,7 @@ export class BinanceService {
    * Return configured receiving Binance ID (Single Source of Truth)
    */
   public getReceiverId(): string | undefined {
-    return this.receiverId || (config.binance.receiverId ? config.binance.receiverId.trim() : undefined);
+    return normalizeBinanceIdentifier(config.binance.receiverId) ?? undefined;
   }
 
   /**
@@ -509,22 +541,25 @@ export class BinanceService {
 
       const rawRecords = Array.isArray(data.data) ? data.data : (Array.isArray(data.records) ? data.records : []);
       const records: BinanceTransactionRecord[] = rawRecords.map((r: any) => {
-        const rawTxId =
-          r?.transactionId !== undefined && r?.transactionId !== null && String(r.transactionId).trim() !== ''
-            ? String(r.transactionId).trim()
-            : '';
-        const rawOrderId =
-          r?.orderId !== undefined && r?.orderId !== null && String(r.orderId).trim() !== ''
-            ? String(r.orderId).trim()
-            : undefined;
-        const rawOrderNo =
-          r?.orderNo !== undefined && r?.orderNo !== null && String(r.orderNo).trim() !== ''
-            ? String(r.orderNo).trim()
-            : undefined;
-        const rawCounterpartyId =
-          r?.counterpartyId !== undefined && r?.counterpartyId !== null && String(r.counterpartyId).trim() !== ''
-            ? String(r.counterpartyId).trim()
-            : undefined;
+        const rawTxId = normalizeBinanceIdentifier(r?.transactionId) ?? '';
+        const rawOrderId = normalizeBinanceIdentifier(r?.orderId);
+        const rawOrderNo = normalizeBinanceIdentifier(r?.orderNo);
+        const rawCounterpartyId = normalizeBinanceIdentifier(r?.counterpartyId);
+
+        const rawReceiverObj =
+          r?.receiverInfo && typeof r.receiverInfo === 'object' && !Array.isArray(r.receiverInfo)
+            ? r.receiverInfo
+            : null;
+        const rawPayerObj =
+          r?.payerInfo && typeof r.payerInfo === 'object' && !Array.isArray(r.payerInfo)
+            ? r.payerInfo
+            : null;
+
+        const rawReceiverBinanceVal = rawReceiverObj ? rawReceiverObj.binanceId : undefined;
+        const normReceiverBinanceId = normalizeBinanceIdentifier(rawReceiverBinanceVal);
+        const normPayerBinanceId = normalizeBinanceIdentifier(rawPayerObj ? rawPayerObj.binanceId : undefined);
+        const rawReceiverBinanceIdType = getIdentifierRuntimeType(rawReceiverBinanceVal);
+
         const parsedTime =
           r?.transactionTime !== undefined && r?.transactionTime !== null
             ? Number(r.transactionTime)
@@ -539,17 +574,36 @@ export class BinanceService {
           formattedAmount = '0.0000';
         }
 
+        const normalizedReceiverInfo = rawReceiverObj
+          ? {
+              ...(typeof rawReceiverObj.name === 'string' ? { name: rawReceiverObj.name } : {}),
+              ...(normReceiverBinanceId !== null ? { binanceId: normReceiverBinanceId } : {}),
+            }
+          : undefined;
+
+        const normalizedPayerInfo = rawPayerObj
+          ? {
+              ...(typeof rawPayerObj.name === 'string' ? { name: rawPayerObj.name } : {}),
+              ...(normPayerBinanceId !== null ? { binanceId: normPayerBinanceId } : {}),
+            }
+          : undefined;
+
         return {
           transactionId: rawTxId,
-          ...(rawOrderId !== undefined ? { orderId: rawOrderId } : {}),
-          ...(rawOrderNo !== undefined ? { orderNo: rawOrderNo } : {}),
-          ...(rawCounterpartyId !== undefined ? { counterpartyId: rawCounterpartyId } : {}),
+          ...(rawOrderId !== null ? { orderId: rawOrderId } : {}),
+          ...(rawOrderNo !== null ? { orderNo: rawOrderNo } : {}),
+          counterpartyId: rawCounterpartyId,
+          receiverBinanceId: normReceiverBinanceId,
+          payerBinanceId: normPayerBinanceId,
+          hasReceiverInfo: Boolean(rawReceiverObj),
+          hasReceiverBinanceId: normReceiverBinanceId !== null,
+          rawReceiverBinanceIdType,
           transactionTime: parsedTime,
           orderType: String(r?.orderType || 'C2C'),
           amount: formattedAmount,
           currency: String(r?.currency || 'USDT').toUpperCase(),
-          payerInfo: r?.payerInfo,
-          receiverInfo: r?.receiverInfo,
+          ...(normalizedPayerInfo ? { payerInfo: normalizedPayerInfo } : {}),
+          ...(normalizedReceiverInfo ? { receiverInfo: normalizedReceiverInfo } : {}),
         };
       });
 
@@ -710,8 +764,8 @@ export class BinanceService {
       }
 
       const sub = params.submittedId;
-      const ordMatch = priorRes.records.find(r => r.orderId !== undefined && r.orderId !== null && r.orderId.trim() === sub);
-      const txMatch = ordMatch || priorRes.records.find(r => r.transactionId && r.transactionId.trim() === sub);
+      const ordMatch = priorRes.records.find(r => normalizeBinanceIdentifier(r.orderId) === sub);
+      const txMatch = ordMatch || priorRes.records.find(r => normalizeBinanceIdentifier(r.transactionId) === sub);
 
       if (txMatch) {
         const txTime = Number(txMatch.transactionTime);
@@ -723,9 +777,9 @@ export class BinanceService {
 
       const nonProofMatch = priorRes.records.find(
         r =>
-          (r.counterpartyId !== undefined && r.counterpartyId !== null && r.counterpartyId.trim() === sub) ||
-          (r.payerInfo?.binanceId !== undefined && r.payerInfo.binanceId !== null && String(r.payerInfo.binanceId).trim() === sub) ||
-          (r.orderNo !== undefined && r.orderNo !== null && r.orderNo.trim() === sub)
+          normalizeBinanceIdentifier(r.counterpartyId) === sub ||
+          normalizeBinanceIdentifier(r.payerBinanceId ?? r.payerInfo?.binanceId) === sub ||
+          normalizeBinanceIdentifier(r.orderNo) === sub
       );
       if (nonProofMatch) {
         return 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE';
@@ -735,6 +789,72 @@ export class BinanceService {
     } catch {
       return null;
     }
+  }
+
+  private evaluateReceiverValidation(record: BinanceTransactionRecord): {
+    configuredReceiver: string | null;
+    officialReceiver: string | null;
+    officialReceiverType: string;
+    normalizationSucceeded: boolean;
+    receiverMatch: boolean;
+    classification: 'OK' | 'WRONG_RECEIVER' | 'ELIGIBILITY_RESTRICTED';
+    message: string;
+  } {
+    const configuredReceiver = normalizeBinanceIdentifier(this.getReceiverId());
+    const rawFromInfo =
+      record.receiverInfo && typeof record.receiverInfo === 'object' && !Array.isArray(record.receiverInfo)
+        ? (record.receiverInfo as Record<string, unknown>).binanceId
+        : undefined;
+    const rawCandidate = record.receiverBinanceId !== undefined ? record.receiverBinanceId : rawFromInfo;
+    const officialReceiver = normalizeBinanceIdentifier(rawCandidate);
+    const officialReceiverType = record.rawReceiverBinanceIdType ?? getIdentifierRuntimeType(rawFromInfo);
+    const normalizationSucceeded = officialReceiver !== null;
+
+    if (!configuredReceiver) {
+      return {
+        configuredReceiver: null,
+        officialReceiver,
+        officialReceiverType,
+        normalizationSucceeded,
+        receiverMatch: false,
+        classification: 'ELIGIBILITY_RESTRICTED',
+        message: 'Automatic Binance verification is unavailable because BINANCE_RECEIVER_ID is not configured properly.',
+      };
+    }
+
+    if (!officialReceiver) {
+      return {
+        configuredReceiver,
+        officialReceiver: null,
+        officialReceiverType,
+        normalizationSucceeded: false,
+        receiverMatch: false,
+        classification: 'ELIGIBILITY_RESTRICTED',
+        message: 'Binance transaction did not include a verifiable receiver ID.',
+      };
+    }
+
+    if (officialReceiver !== configuredReceiver) {
+      return {
+        configuredReceiver,
+        officialReceiver,
+        officialReceiverType,
+        normalizationSucceeded: true,
+        receiverMatch: false,
+        classification: 'WRONG_RECEIVER',
+        message: 'Transaction receiver does not match the configured Binance receiver ID.',
+      };
+    }
+
+    return {
+      configuredReceiver,
+      officialReceiver,
+      officialReceiverType,
+      normalizationSucceeded: true,
+      receiverMatch: true,
+      classification: 'OK',
+      message: 'Receiver validated',
+    };
   }
 
   private async verifyDepositInternal(
@@ -847,8 +967,8 @@ export class BinanceService {
         };
       }
 
-      const configuredRec = this.getReceiverId() ? this.getReceiverId()!.trim() : '';
-      const recRef = deposit.receiver_ref ? String(deposit.receiver_ref).trim() : '';
+      const configuredRec = normalizeBinanceIdentifier(this.getReceiverId()) ?? '';
+      const recRef = normalizeBinanceIdentifier(deposit.receiver_ref) ?? '';
       const invId = depositId.trim();
       const usrId = String(deposit.user_id).trim();
 
@@ -973,18 +1093,18 @@ export class BinanceService {
       if (row.binance_order_id) consumedIds.add(String(row.binance_order_id).trim());
     }
 
-    const getCanonicalTxId = (r: BinanceTransactionRecord): string => (r.transactionId || r.orderId || '').trim();
+    const getCanonicalTxId = (r: BinanceTransactionRecord): string =>
+      normalizeBinanceIdentifier(r.transactionId) ?? normalizeBinanceIdentifier(r.orderId) ?? '';
     const isConsumedRecord = (r: BinanceTransactionRecord): boolean => {
-      if (r.transactionId && consumedIds.has(r.transactionId.trim())) return true;
-      if (r.orderId && consumedIds.has(r.orderId.trim())) return true;
+      const txId = normalizeBinanceIdentifier(r.transactionId);
+      const ordId = normalizeBinanceIdentifier(r.orderId);
+      if (txId && consumedIds.has(txId)) return true;
+      if (ordId && consumedIds.has(ordId)) return true;
       return false;
     };
 
     // Stage: Matching & strict financial validation
     const matchStart = Date.now();
-    const configuredReceiver = this.getReceiverId();
-    const configuredRecTrimmed = configuredReceiver ? configuredReceiver.trim() : '';
-
     let identifierMatchField: IdentifierMatchField = 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE';
 
     const buildDiagnostics = (candidates: BinanceTransactionRecord[], extra: Record<string, unknown> = {}) => ({
@@ -1009,13 +1129,11 @@ export class BinanceService {
       // Exact string matching priority:
       // 1. Official Binance orderId -> MATCHED_ORDER_ID
       // 2. Official Binance transactionId (compatibility fallback) -> MATCHED_TRANSACTION_ID
-      let rawMatch = fetchedRecords.find(
-        r => r.orderId !== undefined && r.orderId !== null && r.orderId.trim() === normalizedSubmitted
-      );
+      let rawMatch = fetchedRecords.find(r => normalizeBinanceIdentifier(r.orderId) === normalizedSubmitted);
       if (rawMatch) {
         identifierMatchField = 'MATCHED_ORDER_ID';
       } else {
-        rawMatch = fetchedRecords.find(r => r.transactionId && r.transactionId.trim() === normalizedSubmitted);
+        rawMatch = fetchedRecords.find(r => normalizeBinanceIdentifier(r.transactionId) === normalizedSubmitted);
         if (rawMatch) {
           identifierMatchField = 'MATCHED_TRANSACTION_ID';
         }
@@ -1033,11 +1151,9 @@ export class BinanceService {
         // Reject counterpartyId, payerInfo.binanceId, or unrelated orderNo explicitly
         const nonProofMatch = fetchedRecords.find(
           r =>
-            (r.counterpartyId !== undefined && r.counterpartyId !== null && r.counterpartyId.trim() === normalizedSubmitted) ||
-            (r.payerInfo?.binanceId !== undefined &&
-              r.payerInfo.binanceId !== null &&
-              String(r.payerInfo.binanceId).trim() === normalizedSubmitted) ||
-            (r.orderNo !== undefined && r.orderNo !== null && r.orderNo.trim() === normalizedSubmitted)
+            normalizeBinanceIdentifier(r.counterpartyId) === normalizedSubmitted ||
+            normalizeBinanceIdentifier(r.payerBinanceId ?? r.payerInfo?.binanceId) === normalizedSubmitted ||
+            normalizeBinanceIdentifier(r.orderNo) === normalizedSubmitted
         );
         if (nonProofMatch) {
           const totalDurationMs = Date.now() - overallStart;
@@ -1090,20 +1206,17 @@ export class BinanceService {
 
       const checksStart = Date.now();
       const canonicalId = getCanonicalTxId(rawMatch);
+      const receiverPreview = this.evaluateReceiverValidation(rawMatch);
       logger.info('Inspected candidate Binance transaction', {
         depositId,
         identifierMatchField,
         maskedTransactionId: maskIdentifier(canonicalId),
-        hasOrderId: Boolean(rawMatch.orderId),
+        hasOrderId: Boolean(normalizeBinanceIdentifier(rawMatch.orderId)),
         transactionTime: rawMatch.transactionTime,
         amount: rawMatch.amount,
         currency: rawMatch.currency,
         orderType: rawMatch.orderType,
-        receiverMatches: Boolean(
-          configuredRecTrimmed &&
-            rawMatch.receiverInfo?.binanceId &&
-            rawMatch.receiverInfo.binanceId.trim().toLowerCase() === configuredRecTrimmed.toLowerCase()
-        ),
+        receiverMatches: receiverPreview.receiverMatch,
       });
 
       // Exact Validation Precedence Order:
@@ -1183,16 +1296,34 @@ export class BinanceService {
         };
       }
 
-      // 8. Receiver
-      if (
-        configuredRecTrimmed &&
-        rawMatch.receiverInfo?.binanceId &&
-        rawMatch.receiverInfo.binanceId.trim().toLowerCase() !== configuredRecTrimmed.toLowerCase()
-      ) {
+      // 8. Receiver (strict normalized string equality, zero silent bypass)
+      const recCheckStart = Date.now();
+      const receiverEval = this.evaluateReceiverValidation(rawMatch);
+      const recDurationMs = Date.now() - recCheckStart;
+
+      if (!receiverEval.configuredReceiver) {
+        logger.warn('Binance verification blocked: configured BINANCE_RECEIVER_ID is missing or invalid', {
+          depositId,
+          configuredReceiverPresent: false,
+        });
+      }
+
+      logger.info('Binance verification stage: receiver_validation_completed', {
+        depositId,
+        officialReceiverPresent: receiverEval.officialReceiver !== null,
+        configuredReceiverPresent: receiverEval.configuredReceiver !== null,
+        receiverMatch: receiverEval.receiverMatch,
+        officialReceiverType: receiverEval.officialReceiverType,
+        normalizationSucceeded: receiverEval.normalizationSucceeded,
+        classification: receiverEval.classification,
+        durationMs: recDurationMs,
+      });
+
+      if (receiverEval.classification !== 'OK') {
         return {
           verified: false,
-          classification: 'WRONG_RECEIVER',
-          message: 'Transaction receiver does not match the configured Binance receiver ID.',
+          classification: receiverEval.classification,
+          message: receiverEval.message,
           sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: false }),
         };
       }
@@ -1222,18 +1353,10 @@ export class BinanceService {
       const withTxIdRecords = inWindowRecords.filter(r => Boolean(getCanonicalTxId(r)));
       const currencyMatches = withTxIdRecords.filter(r => r.currency.toUpperCase() === expectedCurrency);
       const incomingMatches = currencyMatches.filter(r => !this.isOutgoingOrderType(r.orderType, r.amount));
-      const wrongReceiverMatches = incomingMatches.filter(r => {
-        if (configuredRecTrimmed && r.receiverInfo?.binanceId) {
-          return r.receiverInfo.binanceId.trim().toLowerCase() !== configuredRecTrimmed.toLowerCase();
-        }
-        return false;
-      });
-      const receiverMatches = incomingMatches.filter(r => {
-        if (configuredRecTrimmed && r.receiverInfo?.binanceId) {
-          return r.receiverInfo.binanceId.trim().toLowerCase() === configuredRecTrimmed.toLowerCase();
-        }
-        return true;
-      });
+      const receiverEvalList = incomingMatches.map(r => ({ r, eval: this.evaluateReceiverValidation(r) }));
+      const wrongReceiverMatches = receiverEvalList.filter(x => x.eval.classification === 'WRONG_RECEIVER').map(x => x.r);
+      const missingReceiverProofMatches = receiverEvalList.filter(x => x.eval.classification === 'ELIGIBILITY_RESTRICTED').map(x => x.r);
+      const receiverMatches = receiverEvalList.filter(x => x.eval.classification === 'OK').map(x => x.r);
       const amountMatches = receiverMatches.filter(r => {
         try {
           return new Decimal(r.amount).equals(expectedAmount);
@@ -1252,6 +1375,14 @@ export class BinanceService {
             verified: false,
             classification: 'WRONG_RECEIVER',
             message: 'Transaction receiver ID does not match the configured Binance receiver ID.',
+            sanitizedDetails: diagnostics,
+          };
+        }
+        if (missingReceiverProofMatches.length > 0 && receiverMatches.length === 0) {
+          return {
+            verified: false,
+            classification: 'ELIGIBILITY_RESTRICTED',
+            message: 'Binance transaction receiver confirmation is missing or receiver ID is not configured.',
             sanitizedDetails: diagnostics,
           };
         }
@@ -1289,12 +1420,12 @@ export class BinanceService {
       }
 
       matchedTx = unusedMatches[0];
-      identifierMatchField = matchedTx.orderId ? 'MATCHED_ORDER_ID' : 'MATCHED_TRANSACTION_ID';
+      identifierMatchField = normalizeBinanceIdentifier(matchedTx.orderId) ? 'MATCHED_ORDER_ID' : 'MATCHED_TRANSACTION_ID';
     }
 
     const diagnostics = buildDiagnostics([matchedTx], { totalDurationMs: Date.now() - overallStart });
     const matchedCanonicalId = getCanonicalTxId(matchedTx);
-    const matchedOrderId = matchedTx.orderId ? matchedTx.orderId.trim() : null;
+    const matchedOrderId = normalizeBinanceIdentifier(matchedTx.orderId);
 
     // 9. Financial Readiness Safety Gate: BINANCE_PAY_ENABLED=true alone must NEVER enable automatic wallet credit.
     const readiness = await this.getReadinessState();
@@ -1646,8 +1777,7 @@ export class BinanceService {
         if (direction === 'OUTGOING') continue;
 
         const recBinanceIdRaw = rawItem.receiverInfo?.binanceId;
-        const recBinanceId =
-          recBinanceIdRaw !== undefined && recBinanceIdRaw !== null ? String(recBinanceIdRaw).trim().toLowerCase() : '';
+        const recBinanceId = (normalizeBinanceIdentifier(recBinanceIdRaw) || '').toLowerCase();
         const receiverMatch: 'YES' | 'NO' | 'UNKNOWN' =
           configuredReceiver && recBinanceId ? (recBinanceId === configuredReceiver ? 'YES' : 'NO') : 'UNKNOWN';
 
