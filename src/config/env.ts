@@ -28,6 +28,7 @@ export interface AppConfig {
     maxDepositUsdt: number;
     paymentClockToleranceSeconds: number;
     diagnosticEnabled: boolean;
+    readOnlyLiveVerified: boolean;
   };
   safety: {
     recoveryMode: boolean;
@@ -44,46 +45,58 @@ export function parseBoundedClockToleranceSeconds(raw?: string): number {
   return Math.max(0, Math.min(300, parsed));
 }
 
-const adminIdsRaw = process.env.TELEGRAM_ADMIN_IDS || '';
-const adminIds = adminIdsRaw
-  .split(',')
-  .map(id => id.trim())
-  .filter(Boolean);
+export function parseReadOnlyLiveVerifiedEnv(raw?: string): boolean {
+  if (typeof raw !== 'string') {
+    return false;
+  }
+  return raw.trim() === 'true';
+}
 
-export const config: AppConfig = {
-  nodeEnv: process.env.NODE_ENV || 'development',
-  port: parseInt(process.env.PORT || '3000', 10),
-  databaseUrl: process.env.DATABASE_URL,
-  redisUrl: process.env.REDIS_URL,
-  telegram: {
-    botToken: process.env.TELEGRAM_BOT_TOKEN,
-    webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
-    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
-    adminIds,
-  },
-  supplier: {
-    baseUrl: process.env.AITOOLSHOP_BASE_URL || 'https://aitoolshop.aitoolifystudio.io/api/reseller/v1',
-    apiKey: process.env.AITOOLSHOP_RESELLER_API_KEY,
-  },
-  binance: {
-    enabled: process.env.BINANCE_PAY_ENABLED === 'true',
-    baseUrl: process.env.BINANCE_API_BASE_URL || 'https://bpay.binanceapi.com',
-    apiKey: process.env.BINANCE_API_KEY,
-    apiSecret: process.env.BINANCE_API_SECRET,
-    receiverId: process.env.BINANCE_RECEIVER_ID,
-    recvWindowMs: parseInt(process.env.BINANCE_RECV_WINDOW_MS || '5000', 10),
-    requestTimeoutMs: parseInt(process.env.BINANCE_REQUEST_TIMEOUT_MS || '10000', 10),
-    minDepositUsdt: parseFloat(process.env.BINANCE_MIN_DEPOSIT_USDT || '0.10'),
-    maxDepositUsdt: parseFloat(process.env.BINANCE_MAX_DEPOSIT_USDT || '10000.00'),
-    paymentClockToleranceSeconds: parseBoundedClockToleranceSeconds(process.env.BINANCE_PAYMENT_CLOCK_TOLERANCE_SECONDS),
-    diagnosticEnabled: process.env.BINANCE_DIAGNOSTIC_ENABLED === 'true',
-  },
-  safety: {
-    recoveryMode: process.env.RECOVERY_MODE !== 'false', // Defaults to true
-    liveOrderingEnabled: process.env.LIVE_ORDERING_ENABLED === 'true', // Defaults to false
-    manualPaymentsEnabled: process.env.MANUAL_PAYMENTS_ENABLED !== 'false', // Defaults to true
-  },
-};
+export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const adminIdsRaw = env.TELEGRAM_ADMIN_IDS || '';
+  const adminIds = adminIdsRaw
+    .split(',')
+    .map(id => id.trim())
+    .filter(Boolean);
+
+  return {
+    nodeEnv: env.NODE_ENV || 'development',
+    port: parseInt(env.PORT || '3000', 10),
+    databaseUrl: env.DATABASE_URL,
+    redisUrl: env.REDIS_URL,
+    telegram: {
+      botToken: env.TELEGRAM_BOT_TOKEN,
+      webhookUrl: env.TELEGRAM_WEBHOOK_URL,
+      webhookSecret: env.TELEGRAM_WEBHOOK_SECRET,
+      adminIds,
+    },
+    supplier: {
+      baseUrl: env.AITOOLSHOP_BASE_URL || 'https://aitoolshop.aitoolifystudio.io/api/reseller/v1',
+      apiKey: env.AITOOLSHOP_RESELLER_API_KEY,
+    },
+    binance: {
+      enabled: env.BINANCE_PAY_ENABLED === 'true',
+      baseUrl: env.BINANCE_API_BASE_URL || 'https://bpay.binanceapi.com',
+      apiKey: env.BINANCE_API_KEY,
+      apiSecret: env.BINANCE_API_SECRET,
+      receiverId: env.BINANCE_RECEIVER_ID,
+      recvWindowMs: parseInt(env.BINANCE_RECV_WINDOW_MS || '5000', 10),
+      requestTimeoutMs: parseInt(env.BINANCE_REQUEST_TIMEOUT_MS || '10000', 10),
+      minDepositUsdt: parseFloat(env.BINANCE_MIN_DEPOSIT_USDT || '0.10'),
+      maxDepositUsdt: parseFloat(env.BINANCE_MAX_DEPOSIT_USDT || '10000.00'),
+      paymentClockToleranceSeconds: parseBoundedClockToleranceSeconds(env.BINANCE_PAYMENT_CLOCK_TOLERANCE_SECONDS),
+      diagnosticEnabled: env.BINANCE_DIAGNOSTIC_ENABLED === 'true',
+      readOnlyLiveVerified: parseReadOnlyLiveVerifiedEnv(env.READ_ONLY_LIVE_VERIFIED),
+    },
+    safety: {
+      recoveryMode: env.RECOVERY_MODE !== 'false', // Defaults to true
+      liveOrderingEnabled: env.LIVE_ORDERING_ENABLED === 'true', // Defaults to false
+      manualPaymentsEnabled: env.MANUAL_PAYMENTS_ENABLED !== 'false', // Defaults to true
+    },
+  };
+}
+
+export const config: AppConfig = buildConfig(process.env);
 
 /**
  * Returns a sanitized copy of configuration safe for logging and admin diagnostics.
@@ -122,6 +135,7 @@ export function getSanitizedConfig(): Record<string, unknown> {
       limits: `${config.binance.minDepositUsdt} - ${config.binance.maxDepositUsdt} USDT`,
       paymentClockToleranceSeconds: config.binance.paymentClockToleranceSeconds,
       diagnosticEnabled: config.binance.diagnosticEnabled,
+      readOnlyLiveVerified: config.binance.readOnlyLiveVerified,
     },
     safety: { ...config.safety },
   };

@@ -223,6 +223,11 @@ export class BinanceService {
    * Validate receiver configuration on startup.
    */
   public validateReceiverConfigAtStartup(): void {
+    logger.info('Binance startup verification flags', {
+      readOnlyLiveVerified: Boolean(config.binance.readOnlyLiveVerified),
+      binancePayEnabled: Boolean(config.binance.enabled),
+    });
+
     const receiver = this.getReceiverId();
     if (!receiver) {
       if (config.binance.enabled) {
@@ -260,7 +265,8 @@ export class BinanceService {
       "SELECT is_enabled FROM payment_methods WHERE code = 'BINANCE_USDT'"
     );
     const paymentMethodConfiguredAndEnabled = Boolean(pm && pm.is_enabled);
-    const readOnlyLiveVerified = this.readOnlyLiveVerified && this.isLiveProductionVerified;
+    const runtimeProbeVerified = this.readOnlyLiveVerified && this.isLiveProductionVerified;
+    const readOnlyLiveVerified = Boolean(config.binance.readOnlyLiveVerified) || runtimeProbeVerified;
     const financialSafetyBlock = Boolean(config.safety.recoveryMode);
 
     let reason = 'Readiness criteria satisfied';
@@ -1672,7 +1678,7 @@ export class BinanceService {
         testPaymentDetected: res.records.length > 0,
         durationMs: res.durationMs,
       },
-      readOnlyLiveVerified: this.readOnlyLiveVerified,
+      readOnlyLiveVerified: readiness.readOnlyLiveVerified,
       automaticCreditEnabled: readiness.automaticCreditEnabled,
     };
   }

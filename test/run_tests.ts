@@ -25,7 +25,13 @@ import {
 import { telegramClient } from '../src/telegram/client.js';
 import { encryptionService, EncryptionService } from '../src/services/encryption.js';
 import { sanitizeObject } from '../src/services/logger.js';
-import { config, parseBoundedClockToleranceSeconds, getSanitizedConfig } from '../src/config/env.js';
+import {
+  config,
+  buildConfig,
+  parseBoundedClockToleranceSeconds,
+  parseReadOnlyLiveVerifiedEnv,
+  getSanitizedConfig,
+} from '../src/config/env.js';
 import { adminHandler } from '../src/telegram/handlers/admin.js';
 import { customerHandler } from '../src/telegram/handlers/customer.js';
 import { uiConfigService, CUSTOMER_COMMAND_ORDER } from '../src/services/uiConfig.js';
@@ -2651,6 +2657,7 @@ export async function runComprehensiveTests() {
       apiSecret: config.binance.apiSecret,
       receiverId: config.binance.receiverId,
       timeoutMs: config.binance.requestTimeoutMs,
+      readOnlyLiveVerified: config.binance.readOnlyLiveVerified,
       recoveryMode: config.safety.recoveryMode,
     };
     const receiverId = 'BIN_REC_9001';
@@ -2668,6 +2675,7 @@ export async function runComprehensiveTests() {
       config.binance.apiSecret = orig.apiSecret;
       config.binance.receiverId = orig.receiverId;
       config.binance.requestTimeoutMs = orig.timeoutMs;
+      config.binance.readOnlyLiveVerified = orig.readOnlyLiveVerified;
       config.safety.recoveryMode = orig.recoveryMode;
       binanceService.resetTestState();
       telegramClient.setTransportOverride(null);
@@ -4532,6 +4540,115 @@ export async function runComprehensiveTests() {
       } finally {
         console.log = origConsoleLog;
         void origStdoutWrite;
+      }
+    });
+  });
+
+  // =========================================================================
+  // 17. READ_ONLY_LIVE_VERIFIED ENV MAPPING MICRO-FIX SUITE
+  // =========================================================================
+  currentCategory = 'READ_ONLY_LIVE_VERIFIED Env Mapping';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Env Mapping 1: strict parsing handles missing, false, true, whitespace, and rejects non-true truthy strings', 'unit', async () => {
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv(undefined), false, 'Missing variable must be false');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv(''), false, 'Empty string must be false');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv('   '), false, 'Whitespace-only string must be false');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv('false'), false, '"false" must be false');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv('TRUE'), false, '"TRUE" must not match strict lowercase "true"');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv('1'), false, '"1" must not match arbitrary truthy values');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv('yes'), false, '"yes" must not match arbitrary truthy values');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv('true'), true, '"true" must parse to true');
+    assert.strictEqual(parseReadOnlyLiveVerifiedEnv('  true \t '), true, 'Surrounding whitespace around "true" normalizes safely to true');
+
+    // No unrelated env variables may override READ_ONLY_LIVE_VERIFIED
+    const cfgFalseWithOthers = buildConfig({
+      BINANCE_PAY_ENABLED: 'true',
+      RECOVERY_MODE: 'false',
+      BINANCE_DIAGNOSTIC_ENABLED: 'true',
+      READ_ONLY_VERIFIED: 'true',
+      BINANCE_READ_ONLY_VERIFIED: 'true',
+      IS_LIVE_PRODUCTION_VERIFIED: 'true',
+    });
+    assert.strictEqual(cfgFalseWithOthers.binance.readOnlyLiveVerified, false, 'Unrelated variables must never override READ_ONLY_LIVE_VERIFIED');
+
+    const cfgCanonicalTrue = buildConfig({
+      READ_ONLY_LIVE_VERIFIED: 'true',
+      BINANCE_PAY_ENABLED: 'true',
+    });
+    assert.strictEqual(cfgCanonicalTrue.binance.readOnlyLiveVerified, true);
+    assert.strictEqual(cfgCanonicalTrue.safety.recoveryMode, true);
+    assert.strictEqual(cfgCanonicalTrue.safety.liveOrderingEnabled, false);
+  });
+
+  await it('Env Mapping 2: live process.env READ_ONLY_LIVE_VERIFIED reaches config.binance.readOnlyLiveVerified and readiness gate without prior probe', 'mock_integration', async () => {
+    // Re-import env.ts with cache-busted specifier under real process.env mutation to prove module-load behavior
+    const origEnvVal = process.env.READ_ONLY_LIVE_VERIFIED;
+    const origEnabledEnv = process.env.BINANCE_PAY_ENABLED;
+    try {
+      process.env.READ_ONLY_LIVE_VERIFIED = 'true';
+      process.env.BINANCE_PAY_ENABLED = 'true';
+      const modTrue = await import(`../src/config/env.js?test_rolv_true=${Date.now()}`);
+      assert.strictEqual(modTrue.config.binance.readOnlyLiveVerified, true, 'Canonical READ_ONLY_LIVE_VERIFIED=true must populate config.binance.readOnlyLiveVerified');
+      assert.strictEqual(modTrue.getSanitizedConfig().binance.readOnlyLiveVerified, true);
+
+      process.env.READ_ONLY_LIVE_VERIFIED = 'false';
+      const modFalse = await import(`../src/config/env.js?test_rolv_false=${Date.now()}`);
+      assert.strictEqual(modFalse.config.binance.readOnlyLiveVerified, false);
+
+      delete process.env.READ_ONLY_LIVE_VERIFIED;
+      const modUnset = await import(`../src/config/env.js?test_rolv_unset=${Date.now()}`);
+      assert.strictEqual(modUnset.config.binance.readOnlyLiveVerified, false);
+    } finally {
+      if (origEnvVal === undefined) delete process.env.READ_ONLY_LIVE_VERIFIED;
+      else process.env.READ_ONLY_LIVE_VERIFIED = origEnvVal;
+      if (origEnabledEnv === undefined) delete process.env.BINANCE_PAY_ENABLED;
+      else process.env.BINANCE_PAY_ENABLED = origEnabledEnv;
+    }
+
+    // Verify readiness gate observes config.binance.readOnlyLiveVerified=true immediately without calling testReadOnlyVerification(true)
+    await withMockBinanceEnv(async () => {
+      binanceService.resetTestState(); // Ensure volatile probe flags are false
+      config.binance.readOnlyLiveVerified = false;
+      const rDisabled = await binanceService.getReadinessState();
+      assert.strictEqual(rDisabled.readOnlyLiveVerified, false);
+      assert.strictEqual(rDisabled.automaticCreditEnabled, false);
+
+      config.binance.readOnlyLiveVerified = true;
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      const rEnabled = await binanceService.getReadinessState();
+      assert.strictEqual(rEnabled.readOnlyLiveVerified, true, 'Readiness gate must observe config.binance.readOnlyLiveVerified=true without manual probe');
+      assert.strictEqual(rEnabled.automaticCreditEnabled, true);
+    });
+  });
+
+  await it('Env Mapping 3: startup log outputs only boolean readOnlyLiveVerified and binancePayEnabled with zero secret leakage', 'unit', async () => {
+    await withMockBinanceEnv(async ({ apiKey, apiSecret, receiverId }) => {
+      config.binance.readOnlyLiveVerified = true;
+      config.binance.enabled = true;
+
+      const logs: string[] = [];
+      const origConsoleLog = console.log;
+      console.log = (...args: any[]) => {
+        logs.push(args.map(a => String(a)).join(' '));
+        origConsoleLog(...args);
+      };
+      try {
+        binanceService.validateReceiverConfigAtStartup();
+      } finally {
+        console.log = origConsoleLog;
+      }
+
+      const startupFlagLine = logs.find(l => l.includes('Binance startup verification flags'));
+      assert.ok(startupFlagLine, 'Expected secret-safe startup flag log line');
+      const parsed = JSON.parse(startupFlagLine!);
+      assert.deepStrictEqual(parsed.meta, {
+        readOnlyLiveVerified: true,
+        binancePayEnabled: true,
+      });
+      for (const secret of [apiKey, apiSecret, receiverId]) {
+        assert.strictEqual(startupFlagLine!.includes(secret), false, 'Startup flag log must never contain credentials or receiver ID');
       }
     });
   });
