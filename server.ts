@@ -47,6 +47,8 @@ async function startServer() {
     } else {
       logger.info('Database schema verified from pre-deploy migration');
     }
+    const { uiConfigService } = await import('./src/services/uiConfig.js');
+    await uiConfigService.ensureLoaded();
   } catch (err: any) {
     logger.error('Database migration/verification error', { error: err.message });
   }

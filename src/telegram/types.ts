@@ -1,3 +1,6 @@
+export type ButtonStyle = 'primary' | 'success' | 'danger' | 'default';
+export type TelegramApiButtonStyle = 'primary' | 'success' | 'danger';
+
 export interface TelegramUser {
   id: number;
   is_bot: boolean;
@@ -19,16 +22,25 @@ export interface TelegramInlineKeyboardButton {
   text: string;
   callback_data?: string;
   url?: string;
+  style?: TelegramApiButtonStyle;
+  icon_custom_emoji_id?: string;
 }
 
 export interface TelegramInlineKeyboardMarkup {
   inline_keyboard: TelegramInlineKeyboardButton[][];
 }
 
+export interface TelegramReplyKeyboardButton {
+  text: string;
+  style?: TelegramApiButtonStyle;
+  icon_custom_emoji_id?: string;
+}
+
 export interface TelegramReplyKeyboardMarkup {
-  keyboard: Array<Array<{ text: string }>>;
+  keyboard: Array<Array<TelegramReplyKeyboardButton>>;
   resize_keyboard?: boolean;
   one_time_keyboard?: boolean;
+  is_persistent?: boolean;
 }
 
 export interface TelegramPhotoSize {
@@ -39,6 +51,13 @@ export interface TelegramPhotoSize {
   file_size?: number;
 }
 
+export interface TelegramMessageEntity {
+  type: string;
+  offset: number;
+  length: number;
+  custom_emoji_id?: string;
+}
+
 export interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
@@ -46,6 +65,8 @@ export interface TelegramMessage {
   date: number;
   text?: string;
   caption?: string;
+  entities?: TelegramMessageEntity[];
+  caption_entities?: TelegramMessageEntity[];
   photo?: TelegramPhotoSize[];
   reply_markup?: TelegramInlineKeyboardMarkup;
 }
@@ -74,7 +95,11 @@ export type FsmStep =
   | 'AWAITING_MANUAL_PROOF'
   | 'AWAITING_SUPPORT_MESSAGE'
   | 'ADMIN_AWAITING_PRICE_PRODUCT'
-  | 'ADMIN_AWAITING_PRICE_VALUE';
+  | 'ADMIN_AWAITING_PRICE_VALUE'
+  | 'ADMIN_UI_EDIT_TEXT'
+  | 'ADMIN_UI_EDIT_EMOJI'
+  | 'ADMIN_UI_IMPORT_JSON'
+  | 'ADMIN_UI_CONFIRM_RESET_ALL';
 
 export interface UserFsmState {
   step: FsmStep;

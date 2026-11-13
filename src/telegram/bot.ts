@@ -7,6 +7,85 @@ import { createLogger } from '../services/logger.js';
 
 const logger = createLogger('TelegramBotRouter');
 
+/**
+ * Authoritative registry of all valid Telegram callback_data routes (exact or prefix).
+ * Used by automated Button-Route & Orphan-Button audits to ensure zero dead/orphan buttons.
+ */
+export const REGISTERED_CUSTOMER_CALLBACKS = {
+  exact: new Set<string>([
+    'noop',
+    'm:home',
+    'm:prod',
+    'm:feat',
+    'm:srch',
+    'm:wall',
+    'w:hist',
+    'm:dep',
+    'dep_m:binance',
+    'dep_m:easypaisa',
+    'dep_m:jazzcash',
+    'm:ord',
+    'm:give',
+    'm:ref',
+    'm:supp',
+    'm:prof',
+    'm:lang',
+  ]),
+  prefixes: ['nav:', 'catp:', 'feat:', 'srch:', 'cat:', 'p:', 'qty:', 'buy:', 'buyc:', 'det:', 'bin_tx:', 'gw_cl:', 'lang:'],
+};
+
+export const REGISTERED_ADMIN_CALLBACKS = {
+  exact: new Set<string>([
+    'adm:main',
+    'adm:dash',
+    'adm:price',
+    'adm:cat',
+    'adm:ord',
+    'adm:wal',
+    'adm:gw',
+    'adm:sync',
+    'adm:dep',
+    'adm:hlth',
+    'adm:ui',
+    'adm:ui_exp',
+    'adm:ui_imp',
+    'adm:ui_rst_all',
+    'adm:ui_rst_all_c',
+  ]),
+  prefixes: [
+    'adm:cat_tog:',
+    'adm:gw_tog:',
+    'adm_app:',
+    'adm_rej:',
+    'adm:prod:',
+    'adm_pr:',
+    'adm_set_fm:',
+    'adm_reset_pr:',
+    'adm:uis:',
+    'adm:uie:',
+    'adm:uit:',
+    'adm:uiem:',
+    'adm:uist:',
+    'adm:uiv:',
+    'adm:uir:',
+    'adm:ui_rs:',
+  ],
+};
+
+export function isRegisteredCallbackRoute(data: string): boolean {
+  if (!data) return false;
+  if (data.startsWith('adm')) {
+    return (
+      REGISTERED_ADMIN_CALLBACKS.exact.has(data) ||
+      REGISTERED_ADMIN_CALLBACKS.prefixes.some(p => data.startsWith(p))
+    );
+  }
+  return (
+    REGISTERED_CUSTOMER_CALLBACKS.exact.has(data) ||
+    REGISTERED_CUSTOMER_CALLBACKS.prefixes.some(p => data.startsWith(p))
+  );
+}
+
 export class TelegramBotRouter {
   /**
    * Process incoming Telegram update with duplicate update idempotency.
@@ -63,12 +142,16 @@ export class TelegramBotRouter {
       const text = msg.text?.trim() || '';
 
       try {
-        // Fallback commands
         if (text.startsWith('/start')) {
           const parts = text.split(' ');
           const refCode = parts[1];
           await customerHandler.handleStart(msg, refCode);
           return { ok: true, status: 'START_PROCESSED' };
+        }
+
+        if (text === '/menu') {
+          await customerHandler.handleTextMessage(msg);
+          return { ok: true, status: 'MENU_PROCESSED' };
         }
 
         if (text === '/admin') {
@@ -79,6 +162,16 @@ export class TelegramBotRouter {
         if (text === '/products') {
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:prod' });
           return { ok: true, status: 'PRODUCTS_PROCESSED' };
+        }
+
+        if (text === '/featured') {
+          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:feat' });
+          return { ok: true, status: 'FEATURED_PROCESSED' };
+        }
+
+        if (text === '/search') {
+          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:srch' });
+          return { ok: true, status: 'SEARCH_PROCESSED' };
         }
 
         if (text === '/wallet') {
@@ -116,18 +209,21 @@ export class TelegramBotRouter {
           return { ok: true, status: 'PROFILE_PROCESSED' };
         }
 
+        if (text === '/language') {
+          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:lang' });
+          return { ok: true, status: 'LANGUAGE_PROCESSED' };
+        }
+
         if (text === '/help') {
           await customerHandler.handleStart(msg);
           return { ok: true, status: 'HELP_PROCESSED' };
         }
 
-        // Handle photo attachments
         if (msg.photo && msg.photo.length > 0) {
           await customerHandler.handlePhoto(msg);
           return { ok: true, status: 'PHOTO_PROCESSED' };
         }
 
-        // Handle normal text input with FSM
         if (text) {
           await customerHandler.handleTextMessage(msg);
           return { ok: true, status: 'TEXT_PROCESSED' };

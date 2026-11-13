@@ -9,20 +9,26 @@ import { orderService } from '../../services/order.js';
 import { referralService } from '../../services/referral.js';
 import { giveawayService } from '../../services/giveaway.js';
 import { supportService } from '../../services/support.js';
-import { t, SupportedLanguage } from '../../services/i18n.js';
+import { uiConfigService } from '../../services/uiConfig.js';
+import { navigationService } from '../../services/navigation.js';
+import { t, SupportedLanguage, resolveLanguage, getUserLanguage } from '../../services/i18n.js';
 import { config } from '../../config/env.js';
 import {
   getCustomerMainInlineKeyboard,
   getCustomerMainReplyKeyboard,
   getCategoryKeyboard,
-  getProductCardKeyboard,
   getProductListKeyboard,
   getProductDetailKeyboard,
+  getPurchaseConfirmKeyboard,
   getMoreDetailsKeyboard,
+  getWalletKeyboard,
   getDepositMethodsKeyboard,
   getBinanceInvoiceKeyboard,
+  getLanguageKeyboard,
   getBackHomeKeyboard,
+  getStaleMenuKeyboard,
 } from '../keyboards.js';
+import { ButtonBuilder } from '../buttonBuilder.js';
 import { telegramClient } from '../client.js';
 import { TelegramMessage, TelegramCallbackQuery, UserFsmState } from '../types.js';
 import { createLogger } from '../../services/logger.js';
@@ -33,29 +39,39 @@ export class CustomerHandler {
   /**
    * Ensure user exists in authoritative PostgreSQL database
    */
-  public async ensureUser(from: { id: number; first_name: string; last_name?: string; username?: string; language_code?: string }) {
+  public async ensureUser(from: {
+    id: number;
+    first_name: string;
+    last_name?: string;
+    username?: string;
+    language_code?: string;
+  }) {
     const userId = String(from.id);
     const isAdmin = config.telegram.adminIds.includes(userId);
+    const normLang = resolveLanguage(from.language_code);
 
-    await db.query(`
-      INSERT INTO users (id, telegram_id, username, first_name, last_name, language_code, is_admin, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      ON CONFLICT (id) DO UPDATE SET
-        username = EXCLUDED.username,
-        first_name = EXCLUDED.first_name,
-        last_name = EXCLUDED.last_name,
-        is_admin = $7,
-        updated_at = CURRENT_TIMESTAMP
-    `, [userId, from.id, from.username || null, from.first_name, from.last_name || null, from.language_code || 'en', isAdmin]);
+    await db.query(
+      `INSERT INTO users (id, telegram_id, username, first_name, last_name, language_code, is_admin, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (id) DO UPDATE SET
+         username = EXCLUDED.username,
+         first_name = EXCLUDED.first_name,
+         last_name = EXCLUDED.last_name,
+         is_admin = $7,
+         updated_at = CURRENT_TIMESTAMP`,
+      [userId, from.id, from.username || null, from.first_name, from.last_name || null, normLang, isAdmin]
+    );
 
-    await db.query(`
-      INSERT INTO user_profiles (user_id, preferred_language, created_at, updated_at)
-      VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      ON CONFLICT (user_id) DO NOTHING
-    `, [userId, from.language_code || 'en']);
+    await db.query(
+      `INSERT INTO user_profiles (user_id, preferred_language, created_at, updated_at)
+       VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId, normLang]
+    );
 
     await walletService.getOrCreateWallet(userId);
-    return { userId, isAdmin };
+    const lang = await getUserLanguage(userId);
+    return { userId, isAdmin, lang };
   }
 
   /**
@@ -63,60 +79,166 @@ export class CustomerHandler {
    */
   public async handleStart(msg: TelegramMessage, referrerCode?: string) {
     if (!msg.from) return;
-    const { userId, isAdmin } = await this.ensureUser(msg.from);
+    await uiConfigService.ensureLoaded();
+    const { userId, isAdmin, lang } = await this.ensureUser(msg.from);
 
-    // If referred by another user
     if (referrerCode && referrerCode.startsWith('ref_')) {
       const referrerId = referrerCode.replace('ref_', '').trim();
       await referralService.registerReferral(referrerId, userId);
     }
 
-    const welcomeText = t('welcome', 'en');
+    await redis.clearFsmState(userId);
+    const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
 
-    // Send persistent reply keyboard
-    await telegramClient.sendMessage(msg.chat.id, '⚡ *XERO KHAN MENU READY*', {
-      reply_markup: getCustomerMainReplyKeyboard(),
+    // Send minimal persistent reply keyboard (☰ MENU)
+    await telegramClient.sendMessage(msg.chat.id, t('menu_ready', lang), {
+      reply_markup: getCustomerMainReplyKeyboard(lang),
     });
 
-    // Send colourful interactive inline menu
-    await telegramClient.sendMessage(msg.chat.id, welcomeText, {
-      reply_markup: getCustomerMainInlineKeyboard(isAdmin),
+    // Send styled interactive inline menu
+    const sent = await telegramClient.sendMessage(msg.chat.id, welcomeText, {
+      reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
     });
+
+    await navigationService.saveState(userId, {
+      screen: 'home',
+      activeMessageId: sent?.result?.message_id,
+      rotateToken: true,
+    });
+  }
+
+  /**
+   * Helper: Edit active menu message or send a fresh one if uneditable, updating activeMessageId.
+   */
+  private async renderMenu(
+    chatId: number,
+    messageId: number | undefined,
+    userId: string,
+    text: string,
+    reply_markup: any
+  ) {
+    const res = messageId
+      ? await telegramClient.editMessageText(chatId, messageId, text, { reply_markup })
+      : await telegramClient.sendMessage(chatId, text, { reply_markup });
+
+    const resolvedMsgId = res?.result?.message_id ?? messageId;
+    if (resolvedMsgId) {
+      await navigationService.saveState(userId, { activeMessageId: resolvedMsgId });
+    }
+    return res;
   }
 
   /**
    * Handle Customer Inline Callbacks
    */
   public async handleCallback(cb: TelegramCallbackQuery) {
-    if (!cb.message || !cb.data) return;
-    const chatId = cb.message.chat.id;
-    const messageId = cb.message.message_id;
+    if (!cb.data) return;
+    await uiConfigService.ensureLoaded();
+
+    const chatId = cb.message?.chat.id ?? cb.from.id;
+    const messageId = cb.message?.message_id;
     const userId = String(cb.from.id);
     const data = cb.data;
     const isAdmin = config.telegram.adminIds.includes(userId);
+    const lang = await getUserLanguage(userId);
 
-    await telegramClient.answerCallbackQuery(cb.id);
+    if (cb.id && cb.id !== '0') {
+      await telegramClient.answerCallbackQuery(cb.id);
+    }
+
+    if (data === 'noop') {
+      return;
+    }
+
+    // Stale token validation route
+    if (data.startsWith('nav:')) {
+      const [, token] = data.split(':');
+      const check = await navigationService.validateToken(userId, token);
+      if (!check.valid) {
+        await this.renderMenu(chatId, messageId, userId, t('stale_menu', lang), getStaleMenuKeyboard(lang));
+        return;
+      }
+      data === 'm:home';
+    }
 
     // Navigation: Home
     if (data === 'm:home') {
       await redis.clearFsmState(userId);
-      await telegramClient.editMessageText(chatId, messageId, t('welcome', 'en'), {
-        reply_markup: getCustomerMainInlineKeyboard(isAdmin),
-      });
+      await navigationService.saveState(userId, { screen: 'home', categoryId: 'all', page: 1 });
+      const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
+      await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, lang));
       return;
     }
 
-    // Navigation: Products / Categories
-    if (data === 'm:prod') {
-      const categories = await db.query<any>('SELECT id, name FROM product_categories WHERE is_visible = TRUE ORDER BY display_order ASC');
-      const text = '🛍️ *BROWSE CATEGORIES*\n\nSelect a category below to explore available digital tools:';
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: getCategoryKeyboard(categories.rows),
-      });
+    // Navigation: Categories Grid
+    if (data === 'm:prod' || data.startsWith('catp:')) {
+      const catPage = data.startsWith('catp:') ? Math.max(1, parseInt(data.split(':')[1] || '1', 10)) : 1;
+      const categories = await db.query<any>(
+        'SELECT id, name FROM product_categories WHERE is_visible = TRUE ORDER BY display_order ASC'
+      );
+      await navigationService.saveState(userId, { screen: 'categories', page: catPage });
+      const text = uiConfigService.getText('msg.categories_header', lang) || t('categories_header', lang);
+      await this.renderMenu(chatId, messageId, userId, text, getCategoryKeyboard(categories.rows, lang, catPage));
       return;
     }
 
-    // Category / Products List (Multi-item Paginated List)
+    // Featured Products List (Paginated)
+    if (data === 'm:feat' || data.startsWith('feat:')) {
+      const page = data.startsWith('feat:') ? Math.max(1, parseInt(data.split(':')[1] || '1', 10)) : 1;
+      const pageSize = 6;
+      const catalog = await pricingService.getCatalog({ featuredOnly: true, page, pageSize });
+
+      if (catalog.items.length === 0) {
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          t('featured_empty', lang),
+          {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ settingKey: 'btn.cat.all', lang, callbackData: 'cat:all:1', forceVisible: true }),
+              ]),
+              ButtonBuilder.buildNavigationRow('m:prod', lang),
+            ],
+          }
+        );
+        return;
+      }
+
+      const totalPages = Math.max(1, Math.ceil(catalog.total / pageSize));
+      await navigationService.saveState(userId, { screen: 'featured', categoryId: 'all', page });
+      await this.renderMenu(
+        chatId,
+        messageId,
+        userId,
+        t('featured_header', lang, { page, totalPages }),
+        getProductListKeyboard({
+          products: catalog.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
+          page,
+          totalPages,
+          catId: 'all',
+          lang,
+          paginationPrefix: 'feat',
+        })
+      );
+      return;
+    }
+
+    // Search Pagination (using stored searchQuery)
+    if (data.startsWith('srch:')) {
+      const page = Math.max(1, parseInt(data.split(':')[1] || '1', 10));
+      const navState = await navigationService.getState(userId);
+      const query = navState?.searchQuery || '';
+      if (!query) {
+        await this.renderMenu(chatId, messageId, userId, t('stale_menu', lang), getStaleMenuKeyboard(lang));
+        return;
+      }
+      await this.showSearchResults(chatId, messageId, userId, query, page, lang);
+      return;
+    }
+
+    // Category / All Products Paginated List
     if (data.startsWith('cat:')) {
       const [, catId = 'all', pageStr = '1'] = data.split(':');
       const page = Math.max(1, parseInt(pageStr || '1', 10));
@@ -130,30 +252,37 @@ export class CustomerHandler {
       });
 
       if (catalog.items.length === 0) {
-        await telegramClient.editMessageText(chatId, messageId, '⚠️ Live catalogue temporarily unavailable. Please check back shortly.', {
-          reply_markup: getBackHomeKeyboard('m:prod'),
-        });
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          '⚠️ No in-stock products are currently available in this category. Check all products or try another category.',
+          getBackHomeKeyboard('m:prod', lang)
+        );
         return;
       }
 
       const totalPages = Math.max(1, Math.ceil(catalog.total / pageSize));
-      const categoryTitle = isAll ? 'ALL PRODUCTS' : (catalog.items[0]?.category.name || 'PRODUCTS');
-      const listHeader = `⚡ *${categoryTitle.toUpperCase()}*\n\n` +
-        `Browse our live inventory below. Tap any product to view full details and purchase:\n` +
-        `_Showing ${catalog.items.length} items (Page ${page} of ${totalPages})_`;
+      const categoryTitle = isAll ? 'ALL PRODUCTS' : catalog.items[0]?.category.name || 'PRODUCTS';
+      const listHeader =
+        `⚡ *${categoryTitle.toUpperCase()}*\n\n` +
+        `Browse our live inventory below. Tap any product to view details and purchase:\n` +
+        `_Showing ${catalog.items.length} of ${catalog.total} items (Page ${page} of ${totalPages})_`;
 
-      await telegramClient.editMessageText(chatId, messageId, listHeader, {
-        reply_markup: getProductListKeyboard({
-          products: catalog.items.map(p => ({
-            id: p.id,
-            name: p.name,
-            sellingPrice: p.sellingPrice,
-          })),
+      await navigationService.saveState(userId, { screen: 'catalog', categoryId: catId, page });
+      await this.renderMenu(
+        chatId,
+        messageId,
+        userId,
+        listHeader,
+        getProductListKeyboard({
+          products: catalog.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
           page,
           totalPages,
           catId,
-        }),
-      });
+          lang,
+        })
+      );
       return;
     }
 
@@ -161,39 +290,111 @@ export class CustomerHandler {
     if (data.startsWith('p:')) {
       const [, productId, catId = 'all', pageStr = '1'] = data.split(':');
       const page = Math.max(1, parseInt(pageStr || '1', 10));
-      await this.showProductDetail(chatId, messageId, productId, 1, catId, page);
+      await navigationService.saveState(userId, { screen: 'product', productId, categoryId: catId, page, quantity: 1 });
+      await this.showProductDetail(chatId, messageId, productId, 1, catId, page, lang);
       return;
     }
 
     // Quantity selector in Product Detail Screen
     if (data.startsWith('qty:')) {
       const [, productId, qtyStr, backCatId = 'all', pageStr = '1'] = data.split(':');
-      const qty = Math.max(1, parseInt(qtyStr || '1', 10));
+      const qty = Math.max(1, Math.min(50, parseInt(qtyStr || '1', 10)));
       const page = Math.max(1, parseInt(pageStr || '1', 10));
-      await this.showProductDetail(chatId, messageId, productId, qty, backCatId, page);
+      await navigationService.saveState(userId, { productId, categoryId: backCatId, page, quantity: qty });
+      await this.showProductDetail(chatId, messageId, productId, qty, backCatId, page, lang);
       return;
     }
 
-    // Buy Now
+    // Buy Now -> Confirmation or Email Prompt
     if (data.startsWith('buy:')) {
+      const allowed = await navigationService.acquireActionLock(userId, `buy:${data}`, 2);
+      if (!allowed) return;
+
       const [, productId, qtyStr] = data.split(':');
-      const qty = parseInt(qtyStr || '1', 10);
+      const qty = Math.max(1, parseInt(qtyStr || '1', 10));
       const product = await db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]);
-      if (!product) return;
+      if (!product || !product.is_available) {
+        await this.renderMenu(chatId, messageId, userId, '⚠️ This product is currently unavailable.', getBackHomeKeyboard('m:prod', lang));
+        return;
+      }
+
+      if (!product.is_unlimited && product.latest_stock < qty) {
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          `⚠️ Only *${product.latest_stock}* units are currently in stock.`,
+          getBackHomeKeyboard(`p:${productId}:all:1`, lang)
+        );
+        return;
+      }
 
       if (product.requires_email) {
         await redis.setFsmState(userId, {
           step: 'AWAITING_EMAIL_FOR_ORDER',
           data: { productId, quantity: qty },
         });
-        await telegramClient.editMessageText(chatId, messageId, `📧 *EMAIL REQUIRED*\n\nPlease type your delivery email address for *${product.original_name}* (Qty: ${qty}):`, {
-          reply_markup: getBackHomeKeyboard('m:prod'),
-        });
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          `📧 *EMAIL REQUIRED*\n\nPlease type your delivery email address for *${product.original_name}* (Qty: ${qty}):`,
+          getBackHomeKeyboard('m:prod', lang)
+        );
         return;
       }
 
-      // Execute order directly if email not required
-      await this.executePurchase(chatId, messageId, userId, productId, qty);
+      const priceInfo = await pricingService.calculatePrice(productId);
+      const totalDec = priceInfo.customerUnitPrice.times(qty);
+      const { balance } = await walletService.getBalance(userId);
+      const navState = await navigationService.getState(userId);
+      const catId = navState?.categoryId || 'all';
+      const page = navState?.page || 1;
+
+      if (balance.lessThan(totalDec)) {
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          t('insufficient_funds', lang, {
+            required: totalDec.toFixed(2),
+            available: balance.toFixed(2),
+          }),
+          {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ settingKey: 'btn.wall.add_funds', lang, callbackData: 'm:dep', forceVisible: true }),
+              ]),
+              ButtonBuilder.buildNavigationRow(`p:${productId}:${catId}:${page}`, lang),
+            ],
+          }
+        );
+        return;
+      }
+
+      await this.renderMenu(
+        chatId,
+        messageId,
+        userId,
+        t('confirm_purchase', lang, {
+          name: product.original_name,
+          qty,
+          unitPrice: priceInfo.customerUnitPrice.toFixed(2),
+          totalPrice: totalDec.toFixed(2),
+          balance: balance.toFixed(2),
+        }),
+        getPurchaseConfirmKeyboard(productId, qty, catId, page, lang)
+      );
+      return;
+    }
+
+    // Confirmed Purchase Execution
+    if (data.startsWith('buyc:')) {
+      const allowed = await navigationService.acquireActionLock(userId, `buyc:${data}`, 3);
+      if (!allowed) return;
+      const [, productId, qtyStr] = data.split(':');
+      const qty = Math.max(1, parseInt(qtyStr || '1', 10));
+      await this.executePurchase(chatId, messageId, userId, productId, qty, undefined, lang);
       return;
     }
 
@@ -204,53 +405,63 @@ export class CustomerHandler {
       const product = await db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]);
       if (!product) return;
 
-      const detailsText = `📋 *PRODUCT DETAILS*\n\n` +
+      const detailsText =
+        `📋 *PRODUCT DETAILS*\n\n` +
         `*${product.original_name}*\n\n` +
         `${product.original_description || 'No additional description provided.'}\n\n` +
         `⏱️ *Duration:* ${product.duration || '1 Month'}\n` +
         `🛡️ *Warranty:* ${product.warranty_summary || 'Standard replacement guarantee'}\n` +
         `🔑 *Delivery:* ${product.requires_email ? 'Manual invite / access via email' : 'Instant credentials via bot ledger'}`;
 
-      await telegramClient.editMessageText(chatId, messageId, detailsText, {
-        reply_markup: getMoreDetailsKeyboard(productId, catId, page),
-      });
+      await this.renderMenu(chatId, messageId, userId, detailsText, getMoreDetailsKeyboard(productId, catId, page, lang));
       return;
     }
 
     // Wallet
     if (data === 'm:wall') {
       const { balance, locked } = await walletService.getBalance(userId);
-      const text = t('wallet_info', 'en', {
-        balance: balance.toFixed(2),
-        locked: locked.toFixed(2),
-      });
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '➕ ADD FUNDS', callback_data: 'm:dep' }],
-            [{ text: '📜 TRANSACTION HISTORY', callback_data: 'w:hist' }],
-            [{ text: '🏠 HOME', callback_data: 'm:home' }]
-          ]
-        }
-      });
+      const template = uiConfigService.getText('msg.wallet_info', lang) || t('wallet_info', lang);
+      const text = template
+        .replace(/\{balance\}/g, balance.toFixed(2))
+        .replace(/\{locked\}/g, locked.toFixed(2));
+      await navigationService.saveState(userId, { screen: 'wallet' });
+      await this.renderMenu(chatId, messageId, userId, text, getWalletKeyboard(lang));
+      return;
+    }
+
+    // Wallet Transaction History
+    if (data === 'w:hist') {
+      const entries = await walletService.getHistory(userId, 10);
+      if (entries.length === 0) {
+        await this.renderMenu(chatId, messageId, userId, t('wallet_history_empty', lang), getBackHomeKeyboard('m:wall', lang));
+        return;
+      }
+
+      let text = t('wallet_history_header', lang);
+      for (const e of entries) {
+        const sign = new Decimal(e.amount).greaterThanOrEqualTo(0) ? '+' : '';
+        text += `• *${e.entryType}* \`${sign}${e.amount} USDT\` — _${e.reason}_\n  Balance: \`${e.balanceAfter} USDT\`\n`;
+      }
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:wall', lang));
       return;
     }
 
     // Add Funds / Payment Methods
     if (data === 'm:dep') {
-      await telegramClient.editMessageText(chatId, messageId, t('choose_payment', 'en'), {
-        reply_markup: getDepositMethodsKeyboard(),
-      });
+      const text = uiConfigService.getText('msg.choose_payment', lang) || t('choose_payment', lang);
+      await navigationService.saveState(userId, { screen: 'deposit' });
+      await this.renderMenu(chatId, messageId, userId, text, getDepositMethodsKeyboard(lang));
       return;
     }
 
     // Method: Binance Pay USDT
     if (data === 'dep_m:binance') {
       await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_AMOUNT' });
-      const prompt = `⚡ *BINANCE PAY USDT DEPOSIT*\n\nPlease enter the USDT amount you wish to deposit (Min: ${config.binance.minDepositUsdt} USDT, Max: ${config.binance.maxDepositUsdt} USDT):\n\n_Example: 5.00_`;
-      await telegramClient.editMessageText(chatId, messageId, prompt, {
-        reply_markup: getBackHomeKeyboard('m:dep'),
-      });
+      const prompt =
+        `⚡ *BINANCE PAY USDT DEPOSIT*\n\n` +
+        `Please enter the USDT amount you wish to deposit (Min: ${config.binance.minDepositUsdt} USDT, Max: ${config.binance.maxDepositUsdt} USDT):\n\n` +
+        `_Example: 5.00_`;
+      await this.renderMenu(chatId, messageId, userId, prompt, getBackHomeKeyboard('m:dep', lang));
       return;
     }
 
@@ -261,50 +472,32 @@ export class CustomerHandler {
       if (!method) return;
 
       await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_AMOUNT', data: { methodCode: code } });
-      const prompt = `📱 *${method.name}*\n\n` +
+      const prompt =
+        `📱 *${method.name}*\n\n` +
         `Account Title: \`${method.accountTitle}\`\n` +
         `Account Number: \`${method.accountNumber}\`\n\n` +
         `Instructions: ${method.instructions}\n\n` +
         `Please enter the amount you wish to deposit in USDT equivalent (Min: ${method.minAmount}, Max: ${method.maxAmount}):`;
 
-      await telegramClient.editMessageText(chatId, messageId, prompt, {
-        reply_markup: getBackHomeKeyboard('m:dep'),
-      });
+      await this.renderMenu(chatId, messageId, userId, prompt, getBackHomeKeyboard('m:dep', lang));
       return;
     }
 
-    // Binance: Verify payment button (Primary Flow: Create Invoice -> Pay -> I HAVE PAID)
-    if (data.startsWith('bin_v:')) {
-      const [, depositId] = data.split(':');
-      await telegramClient.sendMessage(chatId, '🔍 Checking Binance transaction history for matching incoming transfer...');
-      const verifyResult = await binanceService.verifyDeposit(depositId, undefined, userId);
-
-      if (verifyResult.verified) {
-        await telegramClient.sendMessage(chatId, `✅ *PAYMENT VERIFIED!*\n\n${verifyResult.message}`, {
-          reply_markup: getBackHomeKeyboard('m:wall'),
-        });
-      } else {
-        await telegramClient.sendMessage(chatId, `⚠️ *VERIFICATION RESULT: ${verifyResult.classification}*\n\n${verifyResult.message}\n\n_If you completed the payment in Binance, you can also tap below to verify with your Transaction ID:_`, {
-          reply_markup: getBinanceInvoiceKeyboard(depositId, true),
-        });
-      }
-      return;
-    }
-
-    // Binance: Enter Transaction ID fallback
+    // Binance: Submit Transaction ID
     if (data.startsWith('bin_tx:')) {
       const [, depositId] = data.split(':');
       await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } });
-      const prompt = `🔎 *VERIFY WITH BINANCE TRANSACTION ID*\n\n` +
-        `Please enter the official Binance Pay *Transaction ID* for this payment.\n\n` +
-        `Where to find it:\n` +
+      const prompt =
+        `🔎 *SUBMIT BINANCE TRANSACTION ID*\n\n` +
+        `Please paste the Binance *Transaction ID* for your payment.\n\n` +
+        `Where to find it in Binance:\n` +
         `1. Open Binance App → Pay → Transaction History\n` +
-        `2. Tap on the sent transaction\n` +
-        `3. Copy the *Transaction ID*\n\n` +
-        `_Note: Enter only the official Transaction ID. Do not enter the invoice ID, Binance receiver ID, or your personal ID._`;
+        `2. Tap the transfer you just sent\n` +
+        `3. Copy the *Transaction ID* (or Order ID)\n\n` +
+        `_Note: Do not submit the invoice ID or Binance Pay receiver ID._`;
 
       await telegramClient.sendMessage(chatId, prompt, {
-        reply_markup: getBackHomeKeyboard('m:dep'),
+        reply_markup: getBackHomeKeyboard('m:dep', lang),
       });
       return;
     }
@@ -313,15 +506,14 @@ export class CustomerHandler {
     if (data === 'm:ord') {
       const orders = await orderService.getCustomerOrders(userId, 5);
       if (orders.length === 0) {
-        await telegramClient.editMessageText(chatId, messageId, '📦 *MY ORDERS*\n\nYou have not placed any orders yet. Tap 🛍️ PRODUCTS to start shopping!', {
-          reply_markup: getBackHomeKeyboard('m:home'),
-        });
+        await this.renderMenu(chatId, messageId, userId, t('orders_empty', lang), getBackHomeKeyboard('m:home', lang));
         return;
       }
 
-      let text = '📦 *YOUR RECENT ORDERS*\n\n';
+      let text = t('orders_header', lang);
       for (const ord of orders) {
-        text += `🔹 *Order:* \`${ord.id}\`\n` +
+        text +=
+          `🔹 *Order:* \`${ord.id}\`\n` +
           `• Item: ${ord.productName} (x${ord.quantity})\n` +
           `• Total: \`${ord.totalPrice} USDT\`\n` +
           `• Status: *${ord.status}*\n`;
@@ -331,9 +523,7 @@ export class CustomerHandler {
         text += '\n';
       }
 
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: getBackHomeKeyboard('m:home'),
-      });
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
       return;
     }
 
@@ -341,47 +531,57 @@ export class CustomerHandler {
     if (data === 'm:give') {
       const giveaways = await giveawayService.getActiveGiveaways(userId);
       if (giveaways.length === 0) {
-        await telegramClient.editMessageText(chatId, messageId, '🎁 *GIVEAWAYS*\n\nNo dynamic giveaways are active at this moment. Check back soon!', {
-          reply_markup: getBackHomeKeyboard('m:home'),
-        });
+        await this.renderMenu(chatId, messageId, userId, t('giveaways_empty', lang), getBackHomeKeyboard('m:home', lang));
         return;
       }
 
-      let text = '🎁 *DYNAMIC GIVEAWAYS*\n\n';
+      let text = t('giveaways_header', lang);
       const rows: any[][] = [];
       for (const gw of giveaways) {
         const prog = gw.userProgress;
-        text += `🏆 *${gw.title}*\n` +
+        text +=
+          `🏆 *${gw.title}*\n` +
           `• Reward: ${gw.rewardProductName} (x${gw.rewardQuantity})\n` +
           `• Requirement: ${gw.requiredQualifiedReferrals} Qualified Referrals\n`;
         if (prog) {
-          text += `• Your Progress: *${prog.currentQualified} / ${prog.required}*\n` +
-            `• Status: ${prog.hasClaimed ? '✅ CLAIMED' : (prog.isEligible ? '🌟 ELIGIBLE TO CLAIM' : '⏳ In Progress')}\n\n`;
+          text +=
+            `• Your Progress: *${prog.currentQualified} / ${prog.required}*\n` +
+            `• Status: ${prog.hasClaimed ? '✅ CLAIMED' : prog.isEligible ? '🌟 ELIGIBLE TO CLAIM' : '⏳ In Progress'}\n\n`;
 
           if (prog.isEligible && !prog.hasClaimed) {
-            rows.push([{ text: `🎁 CLAIM: ${gw.title}`, callback_data: `gw_cl:${gw.id}` }]);
+            rows.push(
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({
+                  settingKey: 'btn.give.claim',
+                  lang,
+                  suffix: `: ${gw.title.slice(0, 20)}`,
+                  callbackData: `gw_cl:${gw.id}`,
+                  forceVisible: true,
+                }),
+              ])
+            );
           }
         }
       }
 
-      rows.push([{ text: '🏠 HOME', callback_data: 'm:home' }]);
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: { inline_keyboard: rows },
-      });
+      rows.push(ButtonBuilder.buildNavigationRow('m:home', lang));
+      await this.renderMenu(chatId, messageId, userId, text, { inline_keyboard: rows.filter(r => r.length > 0) });
       return;
     }
 
     // Claim Giveaway
     if (data.startsWith('gw_cl:')) {
+      const allowed = await navigationService.acquireActionLock(userId, `gw:${data}`, 3);
+      if (!allowed) return;
       const [, giveawayId] = data.split(':');
       try {
         const res = await giveawayService.claimGiveaway(giveawayId, userId);
         await telegramClient.sendMessage(chatId, `🎉 ${res.message}`, {
-          reply_markup: getBackHomeKeyboard('m:give'),
+          reply_markup: getBackHomeKeyboard('m:give', lang),
         });
       } catch (err: any) {
         await telegramClient.sendMessage(chatId, `⚠️ ${err.message}`, {
-          reply_markup: getBackHomeKeyboard('m:give'),
+          reply_markup: getBackHomeKeyboard('m:give', lang),
         });
       }
       return;
@@ -390,33 +590,28 @@ export class CustomerHandler {
     // Refer & Earn
     if (data === 'm:ref') {
       const stats = await referralService.getStats(userId);
-      const text = t('referral_title', 'en', {
-        link: stats.referralLink,
-        total: stats.totalReferred,
-        qualified: stats.qualifiedCount,
-        pending: stats.pendingCount,
-      });
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: getBackHomeKeyboard('m:home'),
-      });
+      const template = uiConfigService.getText('msg.referral_title', lang) || t('referral_title', lang);
+      const text = template
+        .replace(/\{link\}/g, stats.referralLink)
+        .replace(/\{total\}/g, String(stats.totalReferred))
+        .replace(/\{qualified\}/g, String(stats.qualifiedCount))
+        .replace(/\{pending\}/g, String(stats.pendingCount));
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
       return;
     }
 
     // Search
     if (data === 'm:srch') {
       await redis.setFsmState(userId, { step: 'AWAITING_SEARCH_QUERY' });
-      await telegramClient.editMessageText(chatId, messageId, '🔎 *SEARCH CATALOGUE*\n\nPlease type the name or keywords of the tool you are looking for (e.g., Netflix, ChatGPT, Canva):', {
-        reply_markup: getBackHomeKeyboard('m:home'),
-      });
+      await this.renderMenu(chatId, messageId, userId, t('search_prompt', lang), getBackHomeKeyboard('m:home', lang));
       return;
     }
 
     // Support
     if (data === 'm:supp') {
       await redis.setFsmState(userId, { step: 'AWAITING_SUPPORT_MESSAGE' });
-      await telegramClient.editMessageText(chatId, messageId, '🛟 *CUSTOMER SUPPORT TICKET*\n\nPlease describe your question or issue, including your Order ID if applicable. Our team will assist you promptly:', {
-        reply_markup: getBackHomeKeyboard('m:home'),
-      });
+      const text = uiConfigService.getText('msg.support_prompt', lang) || t('support_prompt', lang);
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
       return;
     }
 
@@ -424,58 +619,107 @@ export class CustomerHandler {
     if (data === 'm:prof') {
       const { balance } = await walletService.getBalance(userId);
       const stats = await referralService.getStats(userId);
-      const text = `👤 *CUSTOMER PROFILE*\n\n` +
-        `• Telegram ID: \`${userId}\`\n` +
-        `• Wallet Balance: \`${balance.toFixed(2)} USDT\`\n` +
-        `• Qualified Referrals: \`${stats.qualifiedCount}\`\n` +
-        `• Language: English\n\n` +
-        `_Protected by XERO KHAN Ledger Security._`;
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: getBackHomeKeyboard('m:home'),
-      });
+      const langLabel = lang === 'ur' ? 'اردو' : lang === 'ur-ro' ? 'Roman Urdu' : 'English';
+      const template = uiConfigService.getText('msg.profile_header', lang) || t('profile_header', lang);
+      const text = template
+        .replace(/\{userId\}/g, userId)
+        .replace(/\{balance\}/g, balance.toFixed(2))
+        .replace(/\{qualified\}/g, String(stats.qualifiedCount))
+        .replace(/\{langLabel\}/g, langLabel);
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
       return;
     }
+
+    // Language Selection Menu
+    if (data === 'm:lang') {
+      const text = uiConfigService.getText('msg.language_select', lang) || t('language_select', lang);
+      await this.renderMenu(chatId, messageId, userId, text, getLanguageKeyboard(lang));
+      return;
+    }
+
+    // Apply Language Selection & Immediately Refresh Menu
+    if (data.startsWith('lang:')) {
+      const selected = resolveLanguage(data.split(':')[1]);
+      await db.query('UPDATE users SET language_code = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [selected, userId]);
+      await db.query(
+        `INSERT INTO user_profiles (user_id, preferred_language, created_at, updated_at)
+         VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT (user_id) DO UPDATE SET preferred_language = $2, updated_at = CURRENT_TIMESTAMP`,
+        [userId, selected]
+      );
+      await telegramClient.sendMessage(chatId, t('language_updated', selected), {
+        reply_markup: getCustomerMainReplyKeyboard(selected),
+      });
+      const welcomeText = uiConfigService.getText('msg.welcome', selected) || t('welcome', selected);
+      await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, selected));
+      return;
+    }
+
+    // Unrecognized / expired callback safe recovery
+    await this.renderMenu(chatId, messageId, userId, t('stale_menu', lang), getStaleMenuKeyboard(lang));
   }
 
   /**
-   * Handle text messages according to active FSM State
+   * Handle text messages according to active FSM State and persistent reply keyboard
    */
   public async handleTextMessage(msg: TelegramMessage) {
     if (!msg.from || !msg.text) return;
+    await uiConfigService.ensureLoaded();
+
     const userId = String(msg.from.id);
     const chatId = msg.chat.id;
     const text = msg.text.trim();
+    const isAdmin = config.telegram.adminIds.includes(userId);
+    const lang = await getUserLanguage(userId);
 
-    // Check menu button clicks from Reply Keyboard
+    // Persistent minimal reply keyboard (☰ MENU / localized / /menu)
+    const configuredMenuLabel = ButtonBuilder.buildReplyButton({ settingKey: 'btn.reply.menu', lang }).text;
+    if (
+      text === '☰ MENU' ||
+      text === configuredMenuLabel ||
+      text === '☰ مینو' ||
+      text === '/menu'
+    ) {
+      await redis.clearFsmState(userId);
+      const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
+      const sent = await telegramClient.sendMessage(chatId, welcomeText, {
+        reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
+      });
+      await navigationService.saveState(userId, {
+        screen: 'home',
+        activeMessageId: sent?.result?.message_id,
+      });
+      return;
+    }
+
+    // Backward-compatible legacy reply keyboard button triggers
     if (text === '🛍️ PRODUCTS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:prod' });
-    if (text === '🔥 FEATURED') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'cat:all:1' });
+    if (text === '🔥 FEATURED') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:feat' });
     if (text === '🔎 SEARCH') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:srch' });
-    if (text === '💰 WALLET') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:wall' });
+    if (text === '💰 WALLET' || text === '💳 WALLET') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:wall' });
     if (text === '➕ ADD FUNDS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:dep' });
     if (text === '📦 MY ORDERS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:ord' });
     if (text === '🎁 GIVEAWAYS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:give' });
     if (text === '👥 REFER & EARN') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:ref' });
-    if (text === '🛟 SUPPORT') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:supp' });
+    if (text === '🛟 SUPPORT' || text === '🎧 SUPPORT') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:supp' });
     if (text === '👤 PROFILE') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:prof' });
+    if (text === '🌐 LANGUAGE') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:lang' });
 
     const fsm = await redis.getFsmState<UserFsmState>(userId);
     if (!fsm) return;
 
+    // Delegate Admin FSM steps securely to AdminHandler
+    if (fsm.step.startsWith('ADMIN_')) {
+      const { adminHandler } = await import('./admin.js');
+      await adminHandler.handleAdminTextInput(msg, fsm);
+      return;
+    }
+
     // FSM: Search Query
     if (fsm.step === 'AWAITING_SEARCH_QUERY') {
       await redis.clearFsmState(userId);
-      const results = await pricingService.getCatalog({ search: text, pageSize: 5 });
-      if (results.items.length === 0) {
-        await telegramClient.sendMessage(chatId, `🔍 No products matched "${text}". Try another search term!`, {
-          reply_markup: getBackHomeKeyboard('m:prod'),
-        });
-        return;
-      }
-
-      const first = results.items[0];
-      await telegramClient.sendMessage(chatId, `🔍 *SEARCH RESULTS (${results.total} found)*\n\n` + this.formatProductCard(first), {
-        reply_markup: getProductCardKeyboard(first.id, 1, 'all'),
-      });
+      await navigationService.saveState(userId, { screen: 'search', searchQuery: text, page: 1 });
+      await this.showSearchResults(chatId, undefined, userId, text, 1, lang);
       return;
     }
 
@@ -487,15 +731,24 @@ export class CustomerHandler {
         return;
       }
       await redis.clearFsmState(userId);
-      await this.executePurchase(chatId, undefined, userId, productId, quantity, text);
+      await this.executePurchase(chatId, undefined, userId, productId, quantity, text, lang);
       return;
     }
 
     // FSM: Binance Deposit Amount
     if (fsm.step === 'AWAITING_BINANCE_AMOUNT') {
-      const amountDec = new Decimal(text);
+      let amountDec: Decimal;
+      try {
+        amountDec = new Decimal(text);
+      } catch {
+        await telegramClient.sendMessage(chatId, '⚠️ Please enter a valid numeric USDT amount (e.g. 5.00):');
+        return;
+      }
       if (amountDec.isNaN() || amountDec.lessThan(config.binance.minDepositUsdt)) {
-        await telegramClient.sendMessage(chatId, `⚠️ Minimum Binance deposit is ${config.binance.minDepositUsdt} USDT. Please enter a valid number:`);
+        await telegramClient.sendMessage(
+          chatId,
+          `⚠️ Minimum Binance deposit is ${config.binance.minDepositUsdt} USDT. Please enter a valid number:`
+        );
         return;
       }
 
@@ -503,7 +756,8 @@ export class CustomerHandler {
       const invoice = await binanceService.createInvoice(userId, amountDec);
       const receiverId = invoice.receiverRef || config.binance.receiverId || '';
 
-      const invoiceMsg = `⚡ *BINANCE PAY INVOICE*\n\n` +
+      const invoiceMsg =
+        `⚡ *BINANCE PAY INVOICE*\n\n` +
         `💵 *Exact Amount:*\n\`${invoice.amount} USDT\`\n\n` +
         `📋 *Send To Binance ID:*\n\`${receiverId}\`\n\n` +
         `_Long-press the Binance ID above to copy it._\n\n` +
@@ -512,10 +766,10 @@ export class CustomerHandler {
         `2. Copy the Binance ID above\n` +
         `3. Send exactly the displayed USDT amount\n` +
         `4. Return here\n` +
-        `5. Tap *✅ I HAVE PAID — VERIFY NOW*`;
+        `5. Tap *🔎 SUBMIT TRANSACTION ID* below`;
 
       await telegramClient.sendMessage(chatId, invoiceMsg, {
-        reply_markup: getBinanceInvoiceKeyboard(invoice.id),
+        reply_markup: getBinanceInvoiceKeyboard(invoice.id, lang),
       });
       return;
     }
@@ -528,11 +782,11 @@ export class CustomerHandler {
       const res = await binanceService.verifyDeposit(depositId, text, userId);
       if (res.verified) {
         await telegramClient.sendMessage(chatId, `✅ *PAYMENT VERIFIED!*\n\n${res.message}`, {
-          reply_markup: getBackHomeKeyboard('m:wall'),
+          reply_markup: getBackHomeKeyboard('m:wall', lang),
         });
       } else {
         await telegramClient.sendMessage(chatId, `⚠️ *VERIFICATION FAILED (${res.classification})*\n\n${res.message}`, {
-          reply_markup: getBinanceInvoiceKeyboard(depositId, true),
+          reply_markup: getBinanceInvoiceKeyboard(depositId, lang),
         });
       }
       return;
@@ -541,8 +795,14 @@ export class CustomerHandler {
     // FSM: Manual Payment Amount
     if (fsm.step === 'AWAITING_MANUAL_AMOUNT') {
       const methodCode = fsm.data?.methodCode;
-      const amountDec = new Decimal(text);
-      if (amountDec.isNaN() || amountDec.lessThan(0.50)) {
+      let amountDec: Decimal;
+      try {
+        amountDec = new Decimal(text);
+      } catch {
+        await telegramClient.sendMessage(chatId, '⚠️ Please enter a valid numeric amount (e.g. 5.00):');
+        return;
+      }
+      if (amountDec.isNaN() || amountDec.lessThan(0.5)) {
         await telegramClient.sendMessage(chatId, '⚠️ Please enter a valid amount (e.g. 5.00):');
         return;
       }
@@ -552,7 +812,10 @@ export class CustomerHandler {
         data: { methodCode, amount: amountDec.toFixed(4) },
       });
 
-      await telegramClient.sendMessage(chatId, `📱 Amount: *${amountDec.toFixed(2)} USDT*\n\nPlease enter the Transaction ID (TRX ID / TID) of your completed payment:`);
+      await telegramClient.sendMessage(
+        chatId,
+        `📱 Amount: *${amountDec.toFixed(2)} USDT*\n\nPlease enter the Transaction ID (TRX ID / TID) of your completed payment:`
+      );
       return;
     }
 
@@ -577,11 +840,49 @@ export class CustomerHandler {
         message: text,
       });
 
-      await telegramClient.sendMessage(chatId, `✅ *TICKET CREATED (#${ticketId})*\n\nOur support team has received your inquiry. You will be notified when an admin replies!`, {
-        reply_markup: getBackHomeKeyboard('m:home'),
+      await telegramClient.sendMessage(chatId, t('support_created', lang, { ticketId }), {
+        reply_markup: getBackHomeKeyboard('m:home', lang),
       });
       return;
     }
+  }
+
+  private async showSearchResults(
+    chatId: number,
+    messageId: number | undefined,
+    userId: string,
+    query: string,
+    page: number,
+    lang: SupportedLanguage
+  ) {
+    const pageSize = 6;
+    const results = await pricingService.getCatalog({ search: query, page, pageSize });
+    if (results.items.length === 0) {
+      await this.renderMenu(
+        chatId,
+        messageId,
+        userId,
+        t('search_empty', lang, { query }),
+        getBackHomeKeyboard('m:prod', lang)
+      );
+      return;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(results.total / pageSize));
+    await this.renderMenu(
+      chatId,
+      messageId,
+      userId,
+      t('search_results', lang, { query, total: results.total, page, totalPages }),
+      getProductListKeyboard({
+        products: results.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
+        page,
+        totalPages,
+        catId: 'all',
+        lang,
+        paginationPrefix: 'srch',
+      })
+    );
   }
 
   /**
@@ -591,6 +892,7 @@ export class CustomerHandler {
     if (!msg.from || !msg.photo || msg.photo.length === 0) return;
     const userId = String(msg.from.id);
     const chatId = msg.chat.id;
+    const lang = await getUserLanguage(userId);
 
     const fsm = await redis.getFsmState<UserFsmState>(userId);
     if (fsm?.step === 'AWAITING_MANUAL_PROOF') {
@@ -606,7 +908,8 @@ export class CustomerHandler {
         proofFileId: largestPhoto.file_id,
       });
 
-      const confirmMsg = `✅ *PAYMENT SUBMITTED FOR REVIEW*\n\n` +
+      const confirmMsg =
+        `✅ *PAYMENT SUBMITTED FOR REVIEW*\n\n` +
         `• Deposit ID: \`${sub.depositId}\`\n` +
         `• Method: *${methodCode}*\n` +
         `• Amount: \`${amount} USDT\`\n` +
@@ -615,7 +918,7 @@ export class CustomerHandler {
         `Our admins will review your receipt and credit your wallet shortly.`;
 
       await telegramClient.sendMessage(chatId, confirmMsg, {
-        reply_markup: getBackHomeKeyboard('m:wall'),
+        reply_markup: getBackHomeKeyboard('m:wall', lang),
       });
     }
   }
@@ -623,7 +926,15 @@ export class CustomerHandler {
   /**
    * Execute purchase helper
    */
-  private async executePurchase(chatId: number, messageId: number | undefined, userId: string, productId: string, quantity: number, customerEmail?: string) {
+  private async executePurchase(
+    chatId: number,
+    messageId: number | undefined,
+    userId: string,
+    productId: string,
+    quantity: number,
+    customerEmail?: string,
+    lang: SupportedLanguage = 'en'
+  ) {
     try {
       if (messageId) {
         await telegramClient.editMessageText(chatId, messageId, '🔄 Processing purchase securely with wallet ledger...');
@@ -639,23 +950,23 @@ export class CustomerHandler {
       });
 
       if (res.success) {
-        let msg = `${t('order_success', 'en', { orderId: res.orderId })}\n\n`;
+        let msg = `${t('order_success', lang, { orderId: res.orderId })}\n\n`;
         if (res.deliveredItems.length > 0) {
           msg += `\`\`\`\n${res.deliveredItems.join('\n')}\n\`\`\``;
         } else {
           msg += `_Status: ${res.status}. Your access invite has been scheduled and will be delivered shortly._`;
         }
         await telegramClient.sendMessage(chatId, msg, {
-          reply_markup: getBackHomeKeyboard('m:ord'),
+          reply_markup: getBackHomeKeyboard('m:ord', lang),
         });
       } else {
         await telegramClient.sendMessage(chatId, `⚠️ *ORDER STATUS: ${res.status}*\n\n${res.message}`, {
-          reply_markup: getBackHomeKeyboard('m:prod'),
+          reply_markup: getBackHomeKeyboard('m:prod', lang),
         });
       }
     } catch (err: any) {
       await telegramClient.sendMessage(chatId, `❌ *PURCHASE FAILED*\n\n${err.message}`, {
-        reply_markup: getBackHomeKeyboard('m:prod'),
+        reply_markup: getBackHomeKeyboard('m:prod', lang),
       });
     }
   }
@@ -742,19 +1053,20 @@ export class CustomerHandler {
     productId: string,
     quantity = 1,
     catId = 'all',
-    page = 1
+    page = 1,
+    lang: SupportedLanguage = 'en'
   ): Promise<void> {
     const isAll = catId === 'all';
     const catalog = await pricingService.getCatalog({
       categoryId: isAll ? undefined : catId,
       page: 1,
-      pageSize: 50,
+      pageSize: 250,
       includeHidden: true,
     });
 
     let product = catalog.items.find(item => item.id === productId);
     if (!product) {
-      const searchRes = await pricingService.getCatalog({ includeHidden: true });
+      const searchRes = await pricingService.getCatalog({ includeHidden: true, pageSize: 250 });
       product = searchRes.items.find(item => item.id === productId);
     }
 
@@ -762,18 +1074,18 @@ export class CustomerHandler {
       const notFoundMsg = '⚠️ Product is no longer available in the catalogue.';
       if (messageId) {
         await telegramClient.editMessageText(chatId, messageId, notFoundMsg, {
-          reply_markup: getBackHomeKeyboard(`cat:${catId}:${page}`),
+          reply_markup: getBackHomeKeyboard(`cat:${catId}:${page}`, lang),
         });
       } else {
         await telegramClient.sendMessage(chatId, notFoundMsg, {
-          reply_markup: getBackHomeKeyboard(`cat:${catId}:${page}`),
+          reply_markup: getBackHomeKeyboard(`cat:${catId}:${page}`, lang),
         });
       }
       return;
     }
 
     const adj = await this.getAdjacentProducts(productId, catId, 6);
-    const text = this.formatProductCard(product);
+    const text = this.formatProductCard(product, quantity);
 
     const keyboard = getProductDetailKeyboard({
       productId: product.id,
@@ -784,6 +1096,7 @@ export class CustomerHandler {
       prevProductPage: adj.prevPage,
       nextProductId: adj.nextProductId,
       nextProductPage: adj.nextPage,
+      lang,
     });
 
     if (messageId) {
@@ -800,17 +1113,21 @@ export class CustomerHandler {
   /**
    * Format product card text
    */
-  private formatProductCard(p: any): string {
-    const stockStr = p.isUnlimited ? '♾️ Unlimited' : (p.stock > 0 ? `${p.stock} in stock` : '❌ Out of stock');
+  private formatProductCard(p: any, quantity = 1): string {
+    const stockStr = p.isUnlimited ? '♾️ Unlimited' : p.stock > 0 ? `${p.stock} in stock` : '❌ Out of stock';
     const emailStr = p.requiresEmail ? '⚠️ Email Required' : '⚡ Instant Key/Account';
+    const totalStr = new Decimal(p.sellingPrice).times(quantity).toFixed(2);
 
-    return `🛍️ *${p.name}*\n\n` +
-      `💰 *Price:* \`${p.sellingPrice} USDT\`\n` +
+    return (
+      `🛍️ *${p.name}*\n\n` +
+      `💰 *Unit Price:* \`${p.sellingPrice} USDT\`\n` +
+      (quantity > 1 ? `🧮 *Total (${quantity}x):* \`${totalStr} USDT\`\n` : '') +
       `📦 *Availability:* ${stockStr}\n` +
       `⏱️ *Duration:* ${p.duration}\n` +
       `🔑 *Type:* ${emailStr}\n\n` +
       `📝 *Description:*\n_${p.description.substring(0, 160)}${p.description.length > 160 ? '...' : ''}_\n\n` +
-      `🛡️ *Warranty:* ${p.warrantySummary}`;
+      `🛡️ *Warranty:* ${p.warrantySummary}`
+    );
   }
 }
 

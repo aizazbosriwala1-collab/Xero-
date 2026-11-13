@@ -11,16 +11,34 @@ import { binanceService, BinanceTransactionRecord } from '../src/services/binanc
 import { orderService } from '../src/services/order.js';
 import { referralService } from '../src/services/referral.js';
 import { giveawayService } from '../src/services/giveaway.js';
-import { telegramBotRouter } from '../src/telegram/bot.js';
+import { telegramBotRouter, isRegisteredCallbackRoute } from '../src/telegram/bot.js';
+import { telegramClient } from '../src/telegram/client.js';
 import { encryptionService, EncryptionService } from '../src/services/encryption.js';
 import { sanitizeObject } from '../src/services/logger.js';
 import { config } from '../src/config/env.js';
 import { adminHandler } from '../src/telegram/handlers/admin.js';
 import { customerHandler } from '../src/telegram/handlers/customer.js';
+import { uiConfigService } from '../src/services/uiConfig.js';
+import { navigationService } from '../src/services/navigation.js';
+import { ButtonBuilder } from '../src/telegram/buttonBuilder.js';
+import { redis } from '../src/services/redis.js';
 import {
+  getCustomerMainReplyKeyboard,
+  getCustomerMainInlineKeyboard,
+  getCategoryKeyboard,
   getProductListKeyboard,
   getProductDetailKeyboard,
+  getPurchaseConfirmKeyboard,
   getMoreDetailsKeyboard,
+  getWalletKeyboard,
+  getDepositMethodsKeyboard,
+  getBinanceInvoiceKeyboard,
+  getLanguageKeyboard,
+  getStaleMenuKeyboard,
+  getAdminMainMenuKeyboard,
+  getAdminUiCenterKeyboard,
+  getAdminUiSectionKeyboard,
+  getAdminUiItemEditorKeyboard,
 } from '../src/telegram/keyboards.js';
 
 interface TestResult {
@@ -1066,12 +1084,12 @@ export async function runComprehensiveTests() {
       // Customer mistakenly pastes the deposit/invoice ID as the transaction ID
       const resInv = await binanceService.verifyDeposit(inv.id, inv.id, 'usr_tx_guard');
       assert.strictEqual(resInv.verified, false);
-      assert.strictEqual(resInv.classification, 'ZERO_RECORDS_FOUND');
+      assert.strictEqual(resInv.classification, 'TXID_NOT_FOUND');
 
       // Customer mistakenly pastes the receiver ID as the transaction ID
       const resRec = await binanceService.verifyDeposit(inv.id, 'BINANCE_TEST_REC_777', 'usr_tx_guard');
       assert.strictEqual(resRec.verified, false);
-      assert.strictEqual(resRec.classification, 'ZERO_RECORDS_FOUND');
+      assert.strictEqual(resRec.classification, 'TXID_NOT_FOUND');
     } finally {
       config.binance.receiverId = origReceiver;
     }
@@ -1090,12 +1108,25 @@ export async function runComprehensiveTests() {
     const res = await binanceService.verifyDeposit(inv.id, wrongTxId, 'usr_not_found');
     assert.strictEqual(res.verified, false, 'Wrong TXID must never verify');
     assert.ok(
-      res.classification === 'ZERO_RECORDS_FOUND' || res.classification === 'AUTH_REJECTION',
-      `Expected ZERO_RECORDS_FOUND or AUTH_REJECTION, got ${res.classification}`
+      res.classification === 'TXID_NOT_FOUND' || res.classification === 'ZERO_RECORDS_FOUND' || res.classification === 'AUTH_REJECTION',
+      `Expected TXID_NOT_FOUND, ZERO_RECORDS_FOUND or AUTH_REJECTION, got ${res.classification}`
     );
 
     const d = await db.queryRow<any>('SELECT status FROM deposits WHERE id = $1', [inv.id]);
     assert.strictEqual(d.status, 'PENDING', 'Deposit status must remain PENDING with zero credit');
+  });
+
+  await it('Binance TXID-only UX: invoice displays exactly two buttons and removes automatic verify button', 'unit', async () => {
+    const kb = getBinanceInvoiceKeyboard('dep_test_two_buttons');
+    assert.strictEqual(kb.inline_keyboard.length, 2, 'Must have exactly two button rows');
+    assert.strictEqual(kb.inline_keyboard[0][0].text, '🔎 SUBMIT TRANSACTION ID');
+    assert.strictEqual(kb.inline_keyboard[0][0].callback_data, 'bin_tx:dep_test_two_buttons');
+    assert.strictEqual(kb.inline_keyboard[1][0].text, '❌ CANCEL');
+    assert.strictEqual(kb.inline_keyboard[1][0].callback_data, 'm:dep');
+
+    // Confirm automatic verification button is completely absent
+    const hasAutoVerify = kb.inline_keyboard.some((row: any[]) => row.some((b: any) => b.text.includes('I HAVE PAID')));
+    assert.strictEqual(hasAutoVerify, false, 'I HAVE PAID button must be completely removed');
   });
 
   await it('Binance: valid C2C record classification confirmed', 'unit', async () => {
@@ -1878,6 +1909,377 @@ export async function runComprehensiveTests() {
       const byteLen = Buffer.byteLength(cb, 'utf8');
       assert.ok(byteLen <= 64, `Callback data "${cb}" (${byteLen} bytes) exceeds Telegram 64-byte limit!`);
     }
+  });
+
+  // 11. XERO KHAN V2 UI, BUTTON STYLING, CUSTOM EMOJI & ADMIN EDITOR SUITE
+  currentCategory = 'XERO KHAN V2 UI & Button Styling';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('V2 ButtonBuilder: maps primary, success, danger, and omits default style', 'unit', async () => {
+    await uiConfigService.ensureLoaded();
+    const bPrimary = ButtonBuilder.buildButton({ text: 'Catalog', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'm:prod' });
+    const bSuccess = ButtonBuilder.buildButton({ text: 'Confirm', fallbackEmoji: '✅', style: 'success', callbackData: 'm:dep' });
+    const bDanger = ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'm:home' });
+    const bDefault = ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'm:home' });
+
+    assert.strictEqual(bPrimary?.style, 'primary');
+    assert.strictEqual(bSuccess?.style, 'success');
+    assert.strictEqual(bDanger?.style, 'danger');
+    assert.strictEqual(bDefault?.style, undefined);
+  });
+
+  await it('V2 ButtonBuilder: rejects invalid button style & malformed URLs & oversized callbacks', 'unit', async () => {
+    assert.throws(() => uiConfigService.validateButtonStyle('purple'), /Invalid button style/);
+    assert.throws(() => uiConfigService.validateSafeUrl('javascript:alert(1)'), /https:\/\//);
+    assert.throws(() => uiConfigService.validateSafeUrl('data:text/html,<script>'), /https:\/\//);
+    assert.throws(() => ButtonBuilder.assertCallbackLength('x'.repeat(65)), /64-byte limit/);
+  });
+
+  await it('V2 Custom Emoji: validates exact numeric string ID without number coercion & avoids duplicate emoji', 'unit', async () => {
+    const bigEmojiId = '542385311234567890';
+    const validated = uiConfigService.validateCustomEmojiId(bigEmojiId);
+    assert.strictEqual(validated, bigEmojiId);
+    assert.strictEqual(typeof validated, 'string');
+    assert.throws(() => uiConfigService.validateCustomEmojiId('not_an_id'), /5–30 digit/);
+
+    const btn = ButtonBuilder.buildButton({
+      text: 'PRODUCTS',
+      fallbackEmoji: '🛍️',
+      customEmojiId: bigEmojiId,
+      style: 'primary',
+      callbackData: 'm:prod',
+    });
+    assert.strictEqual(btn?.icon_custom_emoji_id, bigEmojiId);
+    assert.strictEqual(btn?.text, 'PRODUCTS', 'Fallback emoji must not stack when icon_custom_emoji_id is active');
+  });
+
+  await it('V2 TelegramClient: degrades gracefully when Telegram API rejects icon_custom_emoji_id and restores Unicode fallback', 'unit', async () => {
+    const calls: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      calls.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      const firstBtn = body.reply_markup?.inline_keyboard?.[0]?.[0];
+      if (firstBtn?.icon_custom_emoji_id) {
+        return { ok: false, error_code: 400, description: 'Bad Request: DOCUMENT_INVALID custom_emoji' };
+      }
+      return { ok: true, result: { message_id: 555 } };
+    });
+
+    try {
+      const btn = ButtonBuilder.buildButton({
+        text: 'PRODUCTS',
+        fallbackEmoji: '🛍️',
+        customEmojiId: '542385311234567890',
+        style: 'primary',
+        callbackData: 'm:prod',
+      })!;
+      const res = await telegramClient.sendMessage(70001, 'Test Menu', {
+        reply_markup: { inline_keyboard: [[btn]] },
+      });
+
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(calls.length, 2, 'Should retry automatically after stripping rejected custom emoji');
+      const retryBtn = calls[1].body.reply_markup.inline_keyboard[0][0];
+      assert.strictEqual(retryBtn.icon_custom_emoji_id, undefined);
+      assert.strictEqual(retryBtn.text, '🛍️ PRODUCTS', 'Unicode fallback emoji must be restored on retry');
+      assert.strictEqual(retryBtn.style, 'primary', 'Valid style should remain preserved');
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('V2 TelegramClient: degrades gracefully when Telegram API rejects button style', 'unit', async () => {
+    const calls: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      calls.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      const firstBtn = body.reply_markup?.inline_keyboard?.[0]?.[0];
+      if (firstBtn?.style) {
+        return { ok: false, error_code: 400, description: 'Bad Request: BUTTON_TYPE_INVALID style' };
+      }
+      return { ok: true, result: { message_id: 556 } };
+    });
+
+    try {
+      const btn = ButtonBuilder.buildButton({
+        text: 'BUY NOW',
+        fallbackEmoji: '🛒',
+        style: 'success',
+        callbackData: 'm:prod',
+      })!;
+      const res = await telegramClient.sendMessage(70001, 'Style Fallback', {
+        reply_markup: { inline_keyboard: [[btn]] },
+      });
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(calls.length, 2);
+      assert.strictEqual(calls[1].body.reply_markup.inline_keyboard[0][0].style, undefined);
+      assert.strictEqual(calls[1].body.reply_markup.inline_keyboard[0][0].text, '🛒 BUY NOW');
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('V2 Keyboards: minimal reply keyboard has ☰ MENU and inline main menu hides Admin button for customers', 'unit', async () => {
+    const replyKb = getCustomerMainReplyKeyboard('en');
+    assert.strictEqual(replyKb.keyboard.length, 1);
+    assert.strictEqual(replyKb.keyboard[0].length, 1);
+    assert.strictEqual(replyKb.keyboard[0][0].text, '☰ MENU');
+
+    const custInline = getCustomerMainInlineKeyboard(false, 'en');
+    const hasAdmin = custInline.inline_keyboard.some(r => r.some(b => b.callback_data === 'adm:main'));
+    assert.strictEqual(hasAdmin, false);
+
+    const adminInline = getCustomerMainInlineKeyboard(true, 'en');
+    const adminBtn = adminInline.inline_keyboard.flat().find(b => b.callback_data === 'adm:main');
+    assert.ok(adminBtn);
+    assert.strictEqual(adminBtn?.style, 'danger');
+  });
+
+  await it('V2 Keyboards: 3-column category grid renders cleanly with blue primary buttons', 'unit', async () => {
+    const cats = await db.query<any>('SELECT id, name FROM product_categories WHERE is_visible = TRUE ORDER BY display_order ASC');
+    const kb = getCategoryKeyboard(cats.rows, 'en', 1);
+    assert.ok(kb.inline_keyboard[0].length <= 3 && kb.inline_keyboard[0].length >= 1);
+    assert.strictEqual(kb.inline_keyboard[0][0].style, 'primary');
+    const hasAll = kb.inline_keyboard.flat().some(b => b.callback_data === 'cat:all:1');
+    const hasFeatured = kb.inline_keyboard.flat().some(b => b.callback_data === 'm:feat');
+    const hasSearch = kb.inline_keyboard.flat().some(b => b.callback_data === 'm:srch');
+    assert.ok(hasAll && hasFeatured && hasSearch);
+  });
+
+  currentCategory = 'XERO KHAN V2 Admin Customization & Reliability';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('V2 Admin UI: editing button text, style, custom emoji, and visibility updates customer menu immediately', 'mock_integration', async () => {
+    const adminId = '123456789';
+    if (!config.telegram.adminIds.includes(adminId)) config.telegram.adminIds.push(adminId);
+
+    // 1. Admin edits btn.menu.featured via service + simulated custom_emoji entity FSM capture
+    await redis.setFsmState(adminId, {
+      step: 'ADMIN_UI_EDIT_EMOJI',
+      data: { settingKey: 'btn.menu.featured', lang: 'en' },
+    });
+
+    await adminHandler.handleAdminTextInput(
+      {
+        message_id: 901,
+        chat: { id: 123456789, type: 'private' },
+        from: { id: 123456789, is_bot: false, first_name: 'Admin' },
+        date: Math.floor(Date.now() / 1000),
+        text: '🔥',
+        entities: [{ type: 'custom_emoji', offset: 0, length: 2, custom_emoji_id: '599999999999999999' }],
+      },
+      { step: 'ADMIN_UI_EDIT_EMOJI', data: { settingKey: 'btn.menu.featured', lang: 'en' } }
+    );
+
+    await uiConfigService.upsertSetting({
+      settingKey: 'btn.menu.featured',
+      languageCode: 'en',
+      textValue: 'HOT DEALS',
+      buttonStyle: 'success',
+      adminId,
+    });
+
+    const menuAfter = getCustomerMainInlineKeyboard(false, 'en');
+    const featBtn = menuAfter.inline_keyboard.flat().find(b => b.callback_data === 'm:feat');
+    assert.strictEqual(featBtn?.text, 'HOT DEALS');
+    assert.strictEqual(featBtn?.style, 'success');
+    assert.strictEqual(featBtn?.icon_custom_emoji_id, '599999999999999999');
+
+    // 2. Hide btn.menu.giveaways and verify it is omitted cleanly
+    await uiConfigService.upsertSetting({
+      settingKey: 'btn.menu.giveaways',
+      languageCode: 'en',
+      isVisible: false,
+      adminId,
+    });
+    const menuHidden = getCustomerMainInlineKeyboard(false, 'en');
+    assert.strictEqual(menuHidden.inline_keyboard.flat().some(b => b.callback_data === 'm:give'), false);
+
+    // 3. Reset item restores factory default
+    await uiConfigService.resetSetting('btn.menu.featured', 'en', adminId);
+    await uiConfigService.resetSetting('btn.menu.giveaways', 'en', adminId);
+    const menuReset = getCustomerMainInlineKeyboard(false, 'en');
+    const featRestored = menuReset.inline_keyboard.flat().find(b => b.callback_data === 'm:feat');
+    assert.strictEqual(featRestored?.text, '🔥 FEATURED');
+    assert.strictEqual(featRestored?.style, 'primary');
+    assert.strictEqual(featRestored?.icon_custom_emoji_id, undefined);
+  });
+
+  await it('V2 Admin Security: unauthorized user blocked from Admin UI callbacks and FSM text edits', 'mock_integration', async () => {
+    const intruderId = 999888777;
+    await redis.setFsmState(intruderId, {
+      step: 'ADMIN_UI_EDIT_TEXT',
+      data: { settingKey: 'btn.menu.products', lang: 'en' },
+    });
+
+    await adminHandler.handleAdminTextInput(
+      {
+        message_id: 902,
+        chat: { id: intruderId, type: 'private' },
+        from: { id: intruderId, is_bot: false, first_name: 'Intruder' },
+        date: Math.floor(Date.now() / 1000),
+        text: 'HACKED',
+      },
+      { step: 'ADMIN_UI_EDIT_TEXT', data: { settingKey: 'btn.menu.products', lang: 'en' } }
+    );
+
+    const setting = uiConfigService.getCachedSetting('btn.menu.products', 'en');
+    assert.strictEqual(setting?.textValue, 'PRODUCTS');
+  });
+
+  await it('V2 Export/Import: exports UI JSON without secrets and validates import payloads strictly', 'unit', async () => {
+    const exported = await uiConfigService.exportSettingsJson();
+    assert.ok(exported.includes('xero-khan-ui-v2'));
+    assert.ok(!exported.includes('TELEGRAM_BOT_TOKEN'));
+    assert.ok(!exported.includes('BINANCE_API_SECRET'));
+
+    // Valid round-trip import
+    const res = await uiConfigService.importSettingsJson(exported, '123456789');
+    assert.ok(res.imported > 10);
+
+    // Malicious import rejected
+    await assert.rejects(
+      () =>
+        uiConfigService.importSettingsJson(
+          JSON.stringify({
+            settings: [
+              {
+                settingKey: 'btn.menu.products',
+                section: 'main_menu',
+                languageCode: 'en',
+                textValue: 'Products',
+                buttonStyle: 'rainbow_hack',
+              },
+            ],
+          }),
+          '123456789'
+        ),
+      /Invalid button style/
+    );
+  });
+
+  await it('V2 Language Switcher: updates user preference and renders localized menu immediately', 'mock_integration', async () => {
+    const update = {
+      update_id: 30050,
+      callback_query: {
+        id: 'cb_lang_ur',
+        from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+        data: 'lang:ur',
+        message: {
+          message_id: 21,
+          chat: { id: 70001, type: 'private' as const },
+          date: Math.floor(Date.now() / 1000),
+          text: 'Lang',
+        },
+      },
+    };
+    const res = await telegramBotRouter.handleUpdate(update);
+    assert.strictEqual(res.status, 'CALLBACK_PROCESSED');
+    const prof = await db.queryRow<any>('SELECT preferred_language FROM user_profiles WHERE user_id = $1', ['70001']);
+    assert.strictEqual(prof?.preferred_language, 'ur');
+
+    const urMenu = getCustomerMainInlineKeyboard(false, 'ur');
+    const prodBtn = urMenu.inline_keyboard.flat().find(b => b.callback_data === 'm:prod');
+    assert.strictEqual(prodBtn?.text, '🛍️ پروڈکٹس');
+
+    // Switch back to en cleanly
+    await telegramBotRouter.handleUpdate({
+      ...update,
+      update_id: 30051,
+      callback_query: { ...update.callback_query, id: 'cb_lang_en', data: 'lang:en' },
+    });
+  });
+
+  await it('V2 Navigation Reliability: deleted/uneditable message recovers cleanly and stale token renders recovery', 'mock_integration', async () => {
+    const calls: string[] = [];
+    telegramClient.setTransportOverride(async (method) => {
+      calls.push(method);
+      if (method === 'editMessageText') {
+        return { ok: false, error_code: 400, description: 'Bad Request: message to edit not found' };
+      }
+      return { ok: true, result: { message_id: 888 } };
+    });
+
+    try {
+      const res = await telegramClient.editMessageText(70001, 99999, 'Recovered Menu', {
+        reply_markup: getStaleMenuKeyboard('en'),
+      });
+      assert.strictEqual(res.ok, true);
+      assert.deepStrictEqual(calls, ['editMessageText', 'sendMessage']);
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+
+    // Stale token check
+    const stale = await navigationService.validateToken('70001', 'deadbeef');
+    assert.strictEqual(stale.valid, false);
+
+    // Double-tap lock check
+    const lock1 = await navigationService.acquireActionLock('70001', 'buy:sp_1:1', 5);
+    const lock2 = await navigationService.acquireActionLock('70001', 'buy:sp_1:1', 5);
+    assert.strictEqual(lock1, true);
+    assert.strictEqual(lock2, false);
+  });
+
+  await it('V2 Button-Route & Orphan-Button Audit: 100% of rendered buttons across all keyboards map to registered handlers', 'unit', async () => {
+    const sampleCategories = [
+      { id: 'cat_ai-tools', name: '🤖 AI & Assistants' },
+      { id: 'cat_streaming', name: '🎬 Streaming' },
+    ];
+    const sampleProducts = [{ id: 'sp_audit_1', name: 'Audit Tool', sellingPrice: '1.99' }];
+    const sampleSettings = await uiConfigService.listBySection('main_menu', 'en');
+
+    const allMarkups = [
+      getCustomerMainInlineKeyboard(false, 'en'),
+      getCustomerMainInlineKeyboard(true, 'en'),
+      getCategoryKeyboard(sampleCategories, 'en', 1),
+      getProductListKeyboard({ products: sampleProducts, page: 1, totalPages: 3, catId: 'all', paginationPrefix: 'cat' }),
+      getProductListKeyboard({ products: sampleProducts, page: 2, totalPages: 3, catId: 'all', paginationPrefix: 'feat' }),
+      getProductListKeyboard({ products: sampleProducts, page: 1, totalPages: 2, catId: 'all', paginationPrefix: 'srch' }),
+      getProductDetailKeyboard({
+        productId: 'sp_audit_1',
+        quantity: 2,
+        catId: 'all',
+        page: 1,
+        prevProductId: 'sp_0',
+        nextProductId: 'sp_2',
+      }),
+      getPurchaseConfirmKeyboard('sp_audit_1', 2, 'all', 1, 'en'),
+      getMoreDetailsKeyboard('sp_audit_1', 'all', 1, 'en'),
+      getWalletKeyboard('en'),
+      getDepositMethodsKeyboard('en'),
+      getBinanceInvoiceKeyboard('dep_audit_1', 'en'),
+      getLanguageKeyboard('en'),
+      getStaleMenuKeyboard('en'),
+      getAdminMainMenuKeyboard('en'),
+      getAdminUiCenterKeyboard(),
+      getAdminUiSectionKeyboard('main_menu', sampleSettings.slice(0, 4), 1, 2, 'en'),
+      getAdminUiItemEditorKeyboard(sampleSettings[0]),
+    ];
+
+    let inspectedButtons = 0;
+    for (const markup of allMarkups) {
+      for (const row of markup.inline_keyboard) {
+        assert.ok(row.length > 0, 'Keyboard must never contain empty rows');
+        for (const btn of row) {
+          inspectedButtons++;
+          assert.ok(btn.text && btn.text.trim().length > 0, 'Button text must not be empty');
+          if (btn.url) {
+            assert.ok(btn.url.startsWith('https://'), `Button URL must use https://, got ${btn.url}`);
+          } else {
+            assert.ok(btn.callback_data, `Button "${btn.text}" missing callback_data`);
+            assert.ok(
+              Buffer.byteLength(btn.callback_data, 'utf8') <= 64,
+              `Callback "${btn.callback_data}" exceeds 64 bytes`
+            );
+            assert.strictEqual(
+              isRegisteredCallbackRoute(btn.callback_data),
+              true,
+              `Orphan button detected! Unregistered callback_data "${btn.callback_data}" on button "${btn.text}"`
+            );
+          }
+        }
+      }
+    }
+    assert.ok(inspectedButtons >= 75, `Expected at least 75 inspected buttons, got ${inspectedButtons}`);
   });
 
   // SUMMARY & STATS DYNAMIC COMPUTATION

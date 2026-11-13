@@ -3,9 +3,28 @@ import path from 'path';
 import { db } from './index.js';
 import { createLogger } from '../services/logger.js';
 import { seedInitialData } from './seed.js';
+import { uiConfigService } from '../services/uiConfig.js';
 
 const logger = createLogger('Migrations');
 const MIGRATION_LOCK_ID = 987654321;
+
+const MIGRATIONS: Array<{ version: number; name: string; filename: string }> = [
+  { version: 1, name: '001_initial_schema', filename: '001_initial_schema.sql' },
+  { version: 2, name: '002_ui_customization', filename: '002_ui_customization.sql' },
+];
+
+function readMigrationSql(filename: string): string {
+  const candidates = [
+    path.resolve(process.cwd(), 'src/db/migrations', filename),
+    path.join(path.dirname(new URL(import.meta.url).pathname), 'migrations', filename),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return fs.readFileSync(candidate, 'utf8');
+    }
+  }
+  throw new Error(`Migration file ${filename} not found`);
+}
 
 export async function runMigrations(): Promise<void> {
   logger.info('Starting database migration checks with advisory lock protection...');
@@ -14,7 +33,6 @@ export async function runMigrations(): Promise<void> {
   let lockAcquired = false;
 
   try {
-    // Acquire PostgreSQL advisory lock to ensure only one migration runs at a time
     if (!db.getIsInMemory()) {
       try {
         const lockRes = await client.queryRow<{ locked: boolean }>(
@@ -31,7 +49,6 @@ export async function runMigrations(): Promise<void> {
       }
     }
 
-    // Ensure migration tracker table exists
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INT PRIMARY KEY,
@@ -40,55 +57,46 @@ export async function runMigrations(): Promise<void> {
       );
     `);
 
-    // Migration 1: Initial schema
     const applied = await client.query<{ version: number }>('SELECT version FROM schema_migrations');
     const appliedVersions = new Set(applied.rows.map(r => r.version));
 
-    if (!appliedVersions.has(1)) {
-      logger.info('Applying migration 001_initial_schema.sql...');
-      
-      const sqlPath = path.resolve(process.cwd(), 'src/db/migrations/001_initial_schema.sql');
-      let sqlContent = '';
-      if (fs.existsSync(sqlPath)) {
-        sqlContent = fs.readFileSync(sqlPath, 'utf8');
-      } else {
-        const fallbackPath = path.join(__dirname, 'migrations/001_initial_schema.sql');
-        if (fs.existsSync(fallbackPath)) {
-          sqlContent = fs.readFileSync(fallbackPath, 'utf8');
-        }
-      }
+    for (const mig of MIGRATIONS) {
+      if (!appliedVersions.has(mig.version)) {
+        logger.info(`Applying migration ${mig.filename}...`);
+        const sqlContent = readMigrationSql(mig.filename);
 
-      if (!sqlContent) {
-        throw new Error('Migration file 001_initial_schema.sql not found');
-      }
+        const statements = sqlContent
+          .split(';')
+          .map(s => s.trim())
+          .filter(s => s.length > 0 && !s.split('\n').every(line => line.trim() === '' || line.trim().startsWith('--')));
 
-      const statements = sqlContent
-        .split(';')
-        .map(s => s.trim())
-        .filter(s => s.length > 0);
-
-      for (const statement of statements) {
-        try {
-          await client.query(statement);
-        } catch (err: any) {
-          if (!err.message?.includes('already exists')) {
-            logger.error('Error executing migration statement', { error: err.message, statement: statement.substring(0, 100) });
-            throw err;
+        for (const statement of statements) {
+          try {
+            await client.query(statement);
+          } catch (err: any) {
+            if (!err.message?.includes('already exists')) {
+              logger.error('Error executing migration statement', {
+                error: err.message,
+                statement: statement.substring(0, 100),
+              });
+              throw err;
+            }
           }
         }
-      }
 
-      await client.query(
-        'INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, now())',
-        [1, '001_initial_schema']
-      );
-      logger.info('Migration 001_initial_schema.sql applied successfully');
-    } else {
-      logger.info('Migration 001_initial_schema is already applied');
+        await client.query(
+          'INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, now())',
+          [mig.version, mig.name]
+        );
+        logger.info(`Migration ${mig.filename} applied successfully`);
+      } else {
+        logger.info(`Migration ${mig.name} is already applied`);
+      }
     }
 
-    // Seed baseline data safely (payment methods, default categories, default settings)
+    // Seed baseline data and UI customization defaults idempotently
     await seedInitialData();
+    await uiConfigService.seedDefaults();
 
     logger.info('Database migrations and baseline configuration completed successfully');
   } finally {
@@ -104,18 +112,21 @@ export async function runMigrations(): Promise<void> {
 }
 
 /**
- * Fast check for server startup: confirms schema is present without running DDL.
+ * Fast check for server startup: confirms latest schema version is present.
  */
 export async function verifySchemaVersion(): Promise<boolean> {
   try {
-    const res = await db.queryRow<{ version: number }>('SELECT version FROM schema_migrations WHERE version = 1');
+    const latestVersion = MIGRATIONS[MIGRATIONS.length - 1].version;
+    const res = await db.queryRow<{ version: number }>(
+      'SELECT version FROM schema_migrations WHERE version = $1',
+      [latestVersion]
+    );
     return Boolean(res?.version);
   } catch {
     return false;
   }
 }
 
-// Standalone CLI execution
 if (process.argv[1]?.endsWith('migrate.ts') || process.argv[1]?.endsWith('migrate.js')) {
   runMigrations()
     .then(() => {

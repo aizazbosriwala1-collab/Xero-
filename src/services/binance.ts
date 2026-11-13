@@ -23,12 +23,17 @@ export type BinanceErrorClassification =
   | 'RATE_LIMIT'
   | 'ELIGIBILITY_RESTRICTED'
   | 'ZERO_RECORDS_FOUND'
+  | 'TXID_NOT_FOUND'
   | 'WRONG_AMOUNT'
   | 'WRONG_CURRENCY'
   | 'WRONG_DIRECTION'
   | 'WRONG_RECEIVER'
+  | 'OUTSIDE_INVOICE_WINDOW'
   | 'DUPLICATE_TRANSACTION'
+  | 'EXPIRED_INVOICE'
+  | 'BINANCE_API_ERROR'
   | 'AMBIGUOUS_TRANSACTION'
+  | 'VERIFIED'
   | 'EXACT_VALID_MATCH';
 
 export interface BinanceTransactionRecord {
@@ -445,7 +450,7 @@ export class BinanceService {
       if (cleanSub === invId || (configuredRec && cleanSub === configuredRec) || (recRef && cleanSub === recRef) || cleanSub === usrId) {
         return {
           verified: false,
-          classification: 'ZERO_RECORDS_FOUND',
+          classification: 'TXID_NOT_FOUND',
           message: 'The submitted value is not a Binance Transaction ID. Please enter the official Transaction ID found in your Binance Pay history.',
         };
       }
@@ -568,8 +573,7 @@ export class BinanceService {
       maskedCandidateIds: candidates.map(c => maskId(c.transactionId)),
     });
 
-    // If manual submittedTxId is provided, also validate against official Binance Pay transactionId
-    // Never treat invoice ID, Binance receiver ID, Telegram ID, or unrelated numeric reference as transactionId!
+    // If manual submittedTxId is provided, perform deep inspection on fetched records
     let eligibleCandidates = unusedMatches;
     if (submittedTxId && submittedTxId.trim()) {
       const cleanSub = submittedTxId.trim().toLowerCase();
@@ -581,17 +585,78 @@ export class BinanceService {
       if (cleanSub === invId || (configuredRec && cleanSub === configuredRec) || cleanSub === usrId) {
         return {
           verified: false,
-          classification: 'ZERO_RECORDS_FOUND',
+          classification: 'TXID_NOT_FOUND',
           message: 'The submitted value is not a Binance Transaction ID. Please enter the official Transaction ID found in your Binance Pay history.',
           sanitizedDetails: buildDiagnostics([]),
         };
+      }
+
+      // Check if this transaction exists anywhere in fetched Binance records (even if out of window or different amount)
+      const rawMatch = fetchedRecords.find(r => r.transactionId.toLowerCase() === cleanSub);
+      if (rawMatch) {
+        // Log sanitized details of found transaction
+        logger.info('Inspected candidate Binance transaction', {
+          depositId,
+          maskedTransactionId: maskId(rawMatch.transactionId),
+          transactionTime: rawMatch.transactionTime,
+          amount: rawMatch.amount,
+          currency: rawMatch.currency,
+          orderType: rawMatch.orderType,
+          receiverMatches: Boolean(configuredRec && rawMatch.receiverInfo?.binanceId && rawMatch.receiverInfo.binanceId.trim().toLowerCase() === configuredRec),
+        });
+
+        const txTime = Number(rawMatch.transactionTime);
+        if (txTime < windowStartMs || txTime > windowEndMs) {
+          return {
+            verified: false,
+            classification: 'OUTSIDE_INVOICE_WINDOW',
+            message: 'This Binance transaction timestamp is outside the invoice validity window.',
+            sanitizedDetails: buildDiagnostics([]),
+          };
+        }
+
+        if (rawMatch.currency.toUpperCase() !== expectedCurrency) {
+          return {
+            verified: false,
+            classification: 'WRONG_CURRENCY',
+            message: `Transaction found but currency does not match. Expected ${expectedCurrency}.`,
+            sanitizedDetails: buildDiagnostics([]),
+          };
+        }
+
+        if (!new Decimal(rawMatch.amount).equals(expectedAmount)) {
+          return {
+            verified: false,
+            classification: 'WRONG_AMOUNT',
+            message: `Transaction amount (${rawMatch.amount} ${rawMatch.currency}) does not match expected invoice amount (${expectedAmount.toFixed(4)} USDT).`,
+            sanitizedDetails: buildDiagnostics([]),
+          };
+        }
+
+        if (configuredRec && rawMatch.receiverInfo?.binanceId && rawMatch.receiverInfo.binanceId.trim().toLowerCase() !== configuredRec) {
+          return {
+            verified: false,
+            classification: 'WRONG_RECEIVER',
+            message: 'Transaction receiver does not match the configured Binance receiver ID.',
+            sanitizedDetails: buildDiagnostics([]),
+          };
+        }
+
+        if (consumedTxIds.has(cleanSub)) {
+          return {
+            verified: false,
+            classification: 'DUPLICATE_TRANSACTION',
+            message: 'This Binance Transaction ID has already been credited to an account.',
+            sanitizedDetails: buildDiagnostics([]),
+          };
+        }
       }
 
       eligibleCandidates = unusedMatches.filter(c => c.transactionId.toLowerCase() === cleanSub);
       if (eligibleCandidates.length === 0) {
         return {
           verified: false,
-          classification: 'ZERO_RECORDS_FOUND',
+          classification: 'TXID_NOT_FOUND',
           message: 'The submitted Binance Transaction ID was not found in your recent matching incoming transactions.',
           sanitizedDetails: buildDiagnostics([]),
         };
@@ -606,7 +671,7 @@ export class BinanceService {
     });
 
     // Evaluation outcomes:
-    // 0 candidates -> PAYMENT_NOT_FOUND (classified as ZERO_RECORDS_FOUND or specific mismatch)
+    // 0 candidates -> classified according to specific failure reason
     if (eligibleCandidates.length === 0) {
       if (wrongReceiverMatches.length > 0 && receiverMatches.length === 0) {
         return {
