@@ -171,11 +171,17 @@ export class WalletService {
         );
 
         const currentBalance = new Decimal(lockedWallet.balance);
+        const lockedBalance = new Decimal(lockedWallet.locked_balance || 0);
+        const availableBalance = Decimal.max(0, currentBalance.minus(lockedBalance));
         const newBalance = currentBalance.plus(amountDec);
 
-        // Debits cannot drop below 0
-        if (newBalance.isNegative()) {
-          throw new Error(`Insufficient wallet funds. Current: ${currentBalance.toFixed(4)} USDT, Requested: ${amountDec.abs().toFixed(4)} USDT`);
+        // Debits cannot spend locked funds or drop total balance below 0
+        if (amountDec.isNegative()) {
+          if (newBalance.isNegative() || availableBalance.plus(amountDec).isNegative()) {
+            throw new Error(
+              `Insufficient wallet funds. Available: ${availableBalance.toFixed(4)} USDT (Balance: ${currentBalance.toFixed(4)}, Locked: ${lockedBalance.toFixed(4)}), Requested: ${amountDec.abs().toFixed(4)} USDT`
+            );
+          }
         }
 
         const balanceAfterStr = newBalance.toFixed(4);

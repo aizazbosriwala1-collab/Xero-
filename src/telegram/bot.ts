@@ -55,6 +55,10 @@ export const REGISTERED_ADMIN_CALLBACKS = {
     'adm:bin_diag',
     'adm:bin_diag_run',
     'adm:bin_diag_clr',
+    'adm:sup_diag',
+    'adm:sup_diag_run',
+    'adm:sup_diag_ord',
+    'adm:sup_diag_clr',
   ]),
   prefixes: [
     'adm:cat_tog:',
@@ -121,6 +125,8 @@ export function isRegisteredCallbackRoute(data: string): boolean {
 }
 
 export class TelegramBotRouter {
+  private inFlightUpdates = new Set<number>();
+
   /**
    * Process incoming Telegram update with duplicate update idempotency & sanitized phase timing.
    */
@@ -137,147 +143,152 @@ export class TelegramBotRouter {
       return { ok: false, status: 'INVALID_UPDATE' };
     }
 
-    // 2. Duplicate update protection (idempotency)
-    const dedupStartedAt = Date.now();
+    if (this.inFlightUpdates.has(update.update_id)) {
+      logger.info('Concurrent duplicate Telegram update ignored', { updateId: update.update_id });
+      return { ok: true, status: 'DUPLICATE_IGNORED' };
+    }
+    this.inFlightUpdates.add(update.update_id);
+
     try {
-      const existing = await db.queryRow<any>(
-        'SELECT update_id FROM telegram_processed_updates WHERE update_id = $1',
-        [update.update_id]
-      );
-
-      if (existing) {
-        logger.info('Duplicate Telegram update ignored', { updateId: update.update_id });
-        return { ok: true, status: 'DUPLICATE_IGNORED' };
-      }
-
-      await db.query(
-        'INSERT INTO telegram_processed_updates (update_id, processed_at) VALUES ($1, CURRENT_TIMESTAMP)',
-        [update.update_id]
-      );
-    } catch (err: any) {
-      logger.error('Error recording processed update', { error: err.message, updateId: update.update_id });
-    }
-    const dedupMs = Date.now() - dedupStartedAt;
-
-    let route = 'unknown';
-    let status = 'IGNORED';
-    const handlerStartedAt = Date.now();
-
-    // 3. Route Callback Query
-    if (update.callback_query) {
-      const cb = update.callback_query;
-      route = cb.data ? cb.data.split(':').slice(0, 2).join(':') : 'callback:empty';
+      // 2. Duplicate update protection (atomic DB insert + unique PK enforcement)
+      const dedupStartedAt = Date.now();
       try {
-        if (cb.data?.startsWith('adm')) {
-          await adminHandler.handleCallback(cb);
-        } else {
-          await customerHandler.handleCallback(cb);
-        }
+        await db.query(
+          'INSERT INTO telegram_processed_updates (update_id, processed_at) VALUES ($1, CURRENT_TIMESTAMP)',
+          [update.update_id]
+        );
       } catch (err: any) {
-        logger.error('Error handling callback query', { error: err.message, route });
-      }
-      status = 'CALLBACK_PROCESSED';
-    } else if (update.message) {
-      // 4. Route Message
-      const msg = update.message;
-      const text = msg.text?.trim() || '';
-      const cmdMatch = text.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+(.*))?$/);
-      const command = cmdMatch ? cmdMatch[1].toLowerCase() : null;
-      const commandArg = cmdMatch?.[2]?.trim();
-
-      try {
-        if (command === 'start') {
-          route = '/start';
-          await customerHandler.handleStart(msg, commandArg);
-          status = 'START_PROCESSED';
-        } else if (command === 'menu') {
-          route = '/menu';
-          await customerHandler.handleTextMessage(msg);
-          status = 'MENU_PROCESSED';
-        } else if (command === 'admin') {
-          route = '/admin';
-          await adminHandler.handleAdminCommand(msg);
-          status = 'ADMIN_PROCESSED';
-        } else if (command === 'shop' || command === 'products') {
-          route = `/${command}`;
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:prod' });
-          status = 'PRODUCTS_PROCESSED';
-        } else if (command === 'featured') {
-          route = '/featured';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:feat' });
-          status = 'FEATURED_PROCESSED';
-        } else if (command === 'search') {
-          route = '/search';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:srch' });
-          status = 'SEARCH_PROCESSED';
-        } else if (command === 'wallet') {
-          route = '/wallet';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:wall' });
-          status = 'WALLET_PROCESSED';
-        } else if (command === 'deposit') {
-          route = '/deposit';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:dep' });
-          status = 'DEPOSIT_PROCESSED';
-        } else if (command === 'orders') {
-          route = '/orders';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:ord' });
-          status = 'ORDERS_PROCESSED';
-        } else if (command === 'giveaways') {
-          route = '/giveaways';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:give' });
-          status = 'GIVEAWAYS_PROCESSED';
-        } else if (command === 'refer' || command === 'referral') {
-          route = `/${command}`;
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:ref' });
-          status = 'REFERRAL_PROCESSED';
-        } else if (command === 'support') {
-          route = '/support';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:supp' });
-          status = 'SUPPORT_PROCESSED';
-        } else if (command === 'profile') {
-          route = '/profile';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:prof' });
-          status = 'PROFILE_PROCESSED';
-        } else if (command === 'language') {
-          route = '/language';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:lang' });
-          status = 'LANGUAGE_PROCESSED';
-        } else if (command === 'api') {
-          route = '/api';
-          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:api' });
-          status = 'API_PROCESSED';
-        } else if (command === 'help') {
-          route = '/help';
-          await customerHandler.handleStart(msg);
-          status = 'HELP_PROCESSED';
-        } else if (msg.photo && msg.photo.length > 0) {
-          route = 'photo';
-          await customerHandler.handlePhoto(msg);
-          status = 'PHOTO_PROCESSED';
-        } else if (text) {
-          route = 'text_or_reply_button';
-          await customerHandler.handleTextMessage(msg);
-          status = 'TEXT_PROCESSED';
+        const msg = String(err?.message || '').toLowerCase();
+        if (err?.code === '23505' || msg.includes('duplicate') || msg.includes('unique') || msg.includes('primary')) {
+          logger.info('Duplicate Telegram update ignored', { updateId: update.update_id });
+          return { ok: true, status: 'DUPLICATE_IGNORED' };
         }
-      } catch (err: any) {
-        logger.error('Error processing message update', { error: err.message, route });
+        logger.error('Error recording processed update', { error: err.message, updateId: update.update_id });
       }
-    }
+      const dedupMs = Date.now() - dedupStartedAt;
 
-    const handlerMs = Date.now() - handlerStartedAt;
-    const totalMs = Date.now() - updateStartedAt;
-    if (status !== 'IGNORED') {
-      logger.debug('Telegram update timing', {
-        updateId: update.update_id,
-        route,
-        status,
-        dedupMs,
-        handlerMs,
-        totalMs,
-      });
-    }
+      let route = 'unknown';
+      let status = 'IGNORED';
+      const handlerStartedAt = Date.now();
 
-    return { ok: true, status };
+      // 3. Route Callback Query
+      if (update.callback_query) {
+        const cb = update.callback_query;
+        route = cb.data ? cb.data.split(':').slice(0, 2).join(':') : 'callback:empty';
+        try {
+          if (cb.data?.startsWith('adm')) {
+            await adminHandler.handleCallback(cb);
+          } else {
+            await customerHandler.handleCallback(cb);
+          }
+        } catch (err: any) {
+          logger.error('Error handling callback query', { error: err.message, route });
+        }
+        status = 'CALLBACK_PROCESSED';
+      } else if (update.message) {
+        // 4. Route Message
+        const msg = update.message;
+        const text = msg.text?.trim() || '';
+        const cmdMatch = text.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+(.*))?$/);
+        const command = cmdMatch ? cmdMatch[1].toLowerCase() : null;
+        const commandArg = cmdMatch?.[2]?.trim();
+
+        try {
+          if (command === 'start') {
+            route = '/start';
+            await customerHandler.handleStart(msg, commandArg);
+            status = 'START_PROCESSED';
+          } else if (command === 'menu') {
+            route = '/menu';
+            await customerHandler.handleTextMessage(msg);
+            status = 'MENU_PROCESSED';
+          } else if (command === 'admin') {
+            route = '/admin';
+            await adminHandler.handleAdminCommand(msg);
+            status = 'ADMIN_PROCESSED';
+          } else if (command === 'shop' || command === 'products') {
+            route = `/${command}`;
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:prod' });
+            status = 'PRODUCTS_PROCESSED';
+          } else if (command === 'featured') {
+            route = '/featured';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:feat' });
+            status = 'FEATURED_PROCESSED';
+          } else if (command === 'search') {
+            route = '/search';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:srch' });
+            status = 'SEARCH_PROCESSED';
+          } else if (command === 'wallet') {
+            route = '/wallet';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:wall' });
+            status = 'WALLET_PROCESSED';
+          } else if (command === 'deposit') {
+            route = '/deposit';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:dep' });
+            status = 'DEPOSIT_PROCESSED';
+          } else if (command === 'orders') {
+            route = '/orders';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:ord' });
+            status = 'ORDERS_PROCESSED';
+          } else if (command === 'giveaways') {
+            route = '/giveaways';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:give' });
+            status = 'GIVEAWAYS_PROCESSED';
+          } else if (command === 'refer' || command === 'referral') {
+            route = `/${command}`;
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:ref' });
+            status = 'REFERRAL_PROCESSED';
+          } else if (command === 'support') {
+            route = '/support';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:supp' });
+            status = 'SUPPORT_PROCESSED';
+          } else if (command === 'profile') {
+            route = '/profile';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:prof' });
+            status = 'PROFILE_PROCESSED';
+          } else if (command === 'language') {
+            route = '/language';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:lang' });
+            status = 'LANGUAGE_PROCESSED';
+          } else if (command === 'api') {
+            route = '/api';
+            await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:api' });
+            status = 'API_PROCESSED';
+          } else if (command === 'help') {
+            route = '/help';
+            await customerHandler.handleStart(msg);
+            status = 'HELP_PROCESSED';
+          } else if (msg.photo && msg.photo.length > 0) {
+            route = 'photo';
+            await customerHandler.handlePhoto(msg);
+            status = 'PHOTO_PROCESSED';
+          } else if (text) {
+            route = 'text_or_reply_button';
+            await customerHandler.handleTextMessage(msg);
+            status = 'TEXT_PROCESSED';
+          }
+        } catch (err: any) {
+          logger.error('Error processing message update', { error: err.message, route });
+        }
+      }
+
+      const handlerMs = Date.now() - handlerStartedAt;
+      const totalMs = Date.now() - updateStartedAt;
+      if (status !== 'IGNORED') {
+        logger.debug('Telegram update timing', {
+          updateId: update.update_id,
+          route,
+          status,
+          dedupMs,
+          handlerMs,
+          totalMs,
+        });
+      }
+
+      return { ok: true, status };
+    } finally {
+      this.inFlightUpdates.delete(update.update_id);
+    }
   }
 }
 

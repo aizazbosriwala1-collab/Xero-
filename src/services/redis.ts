@@ -78,6 +78,26 @@ export class RedisService {
     this.memoryCache.set(key, { value, expiresAt });
   }
 
+  public async setIfNotExists(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+    if (this.isConnected && this.client) {
+      try {
+        const res = await this.client.set(key, value, 'EX', ttlSeconds, 'NX');
+        return res === 'OK';
+      } catch (err) {
+        // Fall back to memory
+      }
+    }
+
+    const existing = this.memoryCache.get(key);
+    if (existing && (!existing.expiresAt || Date.now() <= existing.expiresAt)) {
+      return false;
+    }
+
+    const expiresAt = Date.now() + ttlSeconds * 1000;
+    this.memoryCache.set(key, { value, expiresAt });
+    return true;
+  }
+
   public async del(key: string): Promise<void> {
     if (this.isConnected && this.client) {
       try {

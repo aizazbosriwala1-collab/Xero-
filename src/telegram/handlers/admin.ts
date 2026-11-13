@@ -1,7 +1,11 @@
 import { db } from '../../db/index.js';
 import { redis } from '../../services/redis.js';
 import { config, getSanitizedConfig } from '../../config/env.js';
-import { supplierService } from '../../services/supplier.js';
+import {
+  supplierService,
+  SupplierReadOnlyDiagnosticResult,
+  maskSupplierRef,
+} from '../../services/supplier.js';
 import { pricingService } from '../../services/pricing.js';
 import { manualPaymentService } from '../../services/manualPayment.js';
 import {
@@ -538,7 +542,9 @@ export class AdminHandler {
         `• Node Env: *${sanitized.nodeEnv}*\n` +
         `• Database Pool: *CONNECTED (PostgreSQL)*\n` +
         `• Redis: *${sanitized.redisConfigured ? 'CONNECTED' : 'IN-MEMORY FALLBACK'}*\n` +
-        `• Supplier API: *${sanitized.supplier.baseUrl}*\n\n` +
+        `• Supplier API: \`${sanitized.supplier.baseUrl}\`\n` +
+        `• Supplier URL Source: \`${sanitized.supplier.baseUrlSource}\`\n` +
+        `• Official Doc URL: \`${sanitized.supplier.officialDocBaseUrl}\`\n\n` +
         `⚡ *Binance Pay Status:*\n` +
         `• Configured Receiver: *${receiverConfigured ? 'YES' : 'NO'}*\n` +
         `• Receiver Match Capability: *${receiverConfigured ? 'AVAILABLE' : 'UNAVAILABLE'}*\n` +
@@ -552,11 +558,94 @@ export class AdminHandler {
         reply_markup: {
           inline_keyboard: [
             ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'SUPPLIER READ-ONLY DIAG', fallbackEmoji: '🔬', style: 'primary', callbackData: 'adm:sup_diag' }),
+            ]),
+            ButtonBuilder.buildActionRow([
               ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main' }),
             ]),
           ],
         },
       });
+      return;
+    }
+
+    // =========================================================================
+    // ADMIN-ONLY READ-ONLY SUPPLIER DIAGNOSTIC (ZERO PURCHASING CAPABILITY)
+    // =========================================================================
+
+    if (data === 'adm:sup_diag') {
+      await redis.clearFsmState(userId);
+      const sanitized: any = getSanitizedConfig();
+      const intro =
+        `🔬 *SUPPLIER READ-ONLY DIAGNOSTIC*\n\n` +
+        `• Mode: \`READ-ONLY\`\n` +
+        `• Purchasing Capability: \`ZERO (No POST /order)\`\n` +
+        `• Wallet Mutation: \`IMPOSSIBLE\`\n` +
+        `• LIVE\\_ORDERING\\_ENABLED: \`${config.safety.liveOrderingEnabled}\`\n\n` +
+        `🌐 *Endpoint Resolution:*\n` +
+        `• Active Base URL: \`${sanitized.supplier.baseUrl}\`\n` +
+        `• Source: \`${sanitized.supplier.baseUrlSource}\`\n` +
+        `• Official Doc URL: \`${sanitized.supplier.officialDocBaseUrl}\`\n` +
+        `• Reseller Key Configured: \`${sanitized.supplier.apiKeyConfigured ? 'YES (MASKED)' : 'NO'}\`\n\n` +
+        `Checks executed read-only: \`GET /balance\`, \`GET /products\`, \`GET /orders\`, and \`GET /order/:ref\`.`;
+
+      await telegramClient.editMessageText(chatId, messageId, intro, {
+        reply_markup: this.getSupplierDiagnosticActionKeyboard(),
+      });
+      return;
+    }
+
+    if (data === 'adm:sup_diag_run') {
+      await redis.clearFsmState(userId);
+      const cachedRef = (await redis.get(`adm_sup_diag_ref:${userId}`).catch(() => null)) || undefined;
+      await this.executeAdminSupplierDiagnostic(chatId, userId, cachedRef);
+      return;
+    }
+
+    if (data === 'adm:sup_diag_ord') {
+      await redis.setFsmState(userId, { step: 'ADMIN_SUPPLIER_DIAG_ORDER_REF', data: { readOnly: true } }, 300);
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `🔎 *SUPPLIER ORDER LOOKUP (READ-ONLY)*\n\n` +
+          `Enter the \`supplier_order_ref\` (or order reference) to inspect via \`GET /order/:ref\`.\n\n` +
+          `_Strictly read-only. Zero POST /order calls. Held in short-TTL Redis state only._`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'CLEAR DIAGNOSTIC STATE', fallbackEmoji: '🧹', style: 'default', callbackData: 'adm:sup_diag_clr', forceVisible: true }),
+              ]),
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'BACK TO SUPPLIER DIAG', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup_diag', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data === 'adm:sup_diag_clr') {
+      await redis.clearFsmState(userId);
+      await redis.del(`adm_sup_diag_ref:${userId}`).catch(() => {});
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        '🧹 *SUPPLIER DIAGNOSTIC STATE CLEARED*\n\nTemporary order reference and FSM state removed.',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'SUPPLIER READ-ONLY DIAG', fallbackEmoji: '🔬', style: 'primary', callbackData: 'adm:sup_diag', forceVisible: true }),
+              ]),
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'ADMIN MENU', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
       return;
     }
 
@@ -1018,6 +1107,16 @@ export class AdminHandler {
       await this.executeAdminBinanceDiagnostic(chatId, userId, normalizedOrderId);
       return;
     }
+
+    if (fsm.step === 'ADMIN_SUPPLIER_DIAG_ORDER_REF') {
+      await redis.clearFsmState(userId);
+      const submittedRef = text.trim();
+      if (submittedRef) {
+        await redis.set(`adm_sup_diag_ref:${userId}`, submittedRef, 300).catch(() => {});
+      }
+      await this.executeAdminSupplierDiagnostic(chatId, userId, submittedRef || undefined);
+      return;
+    }
   }
 
   private escapeDiagMarkdown(val: string): string {
@@ -1199,6 +1298,179 @@ export class AdminHandler {
 
     await telegramClient.sendMessage(chatId, report, {
       reply_markup: this.getDiagnosticActionKeyboard(),
+    });
+
+    return diag;
+  }
+
+  private getSupplierDiagnosticActionKeyboard() {
+    return {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'RUN READ-ONLY PROBE',
+            fallbackEmoji: '▶️',
+            style: 'primary',
+            callbackData: 'adm:sup_diag_run',
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'LOOKUP ORDER REF (READ-ONLY)',
+            fallbackEmoji: '🔎',
+            style: 'default',
+            callbackData: 'adm:sup_diag_ord',
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'CLEAR DIAGNOSTIC STATE',
+            fallbackEmoji: '🧹',
+            style: 'default',
+            callbackData: 'adm:sup_diag_clr',
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'ADMIN MENU',
+            fallbackEmoji: '⬅️',
+            style: 'default',
+            callbackData: 'adm:main',
+            forceVisible: true,
+          }),
+        ]),
+      ],
+    };
+  }
+
+  /**
+   * Execute admin-only, strictly read-only AiToolShop Supplier Diagnostic.
+   * Queries GET /balance, GET /products, GET /orders, and GET /order/:ref.
+   * Zero POST /order capability, zero wallet mutation, masked output only.
+   */
+  public async executeAdminSupplierDiagnostic(
+    chatId: number,
+    userId: string,
+    submittedOrderRef?: string
+  ): Promise<SupplierReadOnlyDiagnosticResult> {
+    if (!this.checkAuthorization(userId)) {
+      await telegramClient.sendMessage(chatId, '⛔ *ACCESS DENIED*');
+      throw new Error('Unauthorized admin supplier diagnostic execution');
+    }
+
+    await telegramClient.sendMessage(chatId, '🔬 Running read-only AiToolShop supplier diagnostic...').catch(() => {});
+
+    const diag = await supplierService.runReadOnlyDiagnostic(submittedOrderRef);
+    const maskedAdmin = maskIdentifier(userId);
+    const auditPayload = {
+      adminUserId: maskedAdmin,
+      activeBaseUrl: diag.activeBaseUrl,
+      baseUrlSource: diag.baseUrlSource,
+      balanceOk: diag.balanceCheck.ok,
+      balanceHttpStatus: diag.balanceCheck.httpStatus,
+      productsOk: diag.productsCheck.ok,
+      productsHttpStatus: diag.productsCheck.httpStatus,
+      productsCount: diag.productsCheck.totalCount,
+      cheapestCandidateId: diag.productsCheck.cheapestActiveInStock?.supplierProductId || null,
+      ordersListOk: diag.ordersListCheck.ok,
+      ordersListHttpStatus: diag.ordersListCheck.httpStatus,
+      orderRefTested: diag.orderRefCheck.tested,
+      orderRefMasked: diag.orderRefCheck.testedRefMasked || null,
+      orderRefHttpStatus: diag.orderRefCheck.httpStatus,
+      durationMs: diag.durationMs,
+    };
+
+    logger.info('SUPPLIER_READ_ONLY_DIAGNOSTIC_EXECUTED', auditPayload);
+    try {
+      await db.query(
+        `INSERT INTO admin_audit_logs (id, admin_id, action, target_entity, target_id, details)
+         VALUES ($1, $2, 'SUPPLIER_READ_ONLY_DIAGNOSTIC_EXECUTED', 'supplier_reseller_api', $3, $4)`,
+        [
+          `aud_sup_diag_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          maskedAdmin,
+          submittedOrderRef ? maskSupplierRef(submittedOrderRef) : 'probe',
+          JSON.stringify(auditPayload),
+        ]
+      );
+    } catch (auditErr: any) {
+      logger.warn('Failed to persist sanitized supplier diagnostic audit row (non-fatal)', {
+        error: auditErr?.message,
+      });
+    }
+
+    const cheapest = diag.productsCheck.cheapestActiveInStock;
+    const cheapestInstant = diag.productsCheck.cheapestInstantInStock;
+
+    let report =
+      `🔬 *SUPPLIER READ-ONLY DIAGNOSTIC REPORT*\n\n` +
+      `Mode: \`${diag.mode}\`\n` +
+      `Purchasing Capability: \`${diag.purchasingCapability}\`\n` +
+      `Wallet Mutation: \`${diag.walletMutation}\`\n` +
+      `LIVE\\_ORDERING\\_ENABLED: \`${diag.liveOrderingEnabled}\`\n\n` +
+      `🌐 *Base URL Configuration:*\n` +
+      `• Active URL: \`${diag.activeBaseUrl}\`\n` +
+      `• Source: \`${diag.baseUrlSource}\`\n` +
+      `• Official Doc URL: \`${diag.officialDocBaseUrl}\`\n` +
+      `• API Key Present: \`${diag.apiKeyConfigured ? 'YES (MASKED)' : 'NO'}\`\n\n` +
+      `💳 *GET /balance:*\n` +
+      `• HTTP Status: \`${diag.balanceCheck.httpStatus}\`\n` +
+      `• OK: \`${diag.balanceCheck.ok}\`\n` +
+      (diag.balanceCheck.ok
+        ? `• Reseller Balance: \`${diag.balanceCheck.balanceUsdt} ${diag.balanceCheck.currency || 'USDT'}\`\n`
+        : `• Error: ${this.escapeDiagMarkdown(diag.balanceCheck.error || 'UNKNOWN')}\n`) +
+      `\n🛍️ *GET /products:*\n` +
+      `• HTTP Status: \`${diag.productsCheck.httpStatus}\`\n` +
+      `• Total Returned: \`${diag.productsCheck.totalCount}\`\n` +
+      `• Active In-Stock: \`${diag.productsCheck.activeInStockCount}\`\n`;
+
+    if (cheapest) {
+      report +=
+        `• Cheapest Active SKU: ID \`${cheapest.supplierProductId}\` | ` +
+        `\`${cheapest.costUsdt} USDT\` | ` +
+        `Stock: \`${cheapest.isUnlimited ? 'UNLIMITED' : cheapest.stock}\` | ` +
+        `Requires Email: \`${cheapest.requiresEmail}\`\n` +
+        `  Name: ${this.escapeDiagMarkdown(cheapest.name)}\n`;
+    }
+    if (cheapestInstant && cheapestInstant.supplierProductId !== cheapest?.supplierProductId) {
+      report +=
+        `• Cheapest Instant SKU: ID \`${cheapestInstant.supplierProductId}\` | ` +
+        `\`${cheapestInstant.costUsdt} USDT\` | Requires Email: \`false\`\n` +
+        `  Name: ${this.escapeDiagMarkdown(cheapestInstant.name)}\n`;
+    }
+    if (!diag.productsCheck.ok && diag.productsCheck.error) {
+      report += `• Error: ${this.escapeDiagMarkdown(diag.productsCheck.error)}\n`;
+    }
+
+    report +=
+      `\n📦 *GET /orders:*\n` +
+      `• HTTP Status: \`${diag.ordersListCheck.httpStatus}\`\n` +
+      `• OK: \`${diag.ordersListCheck.ok}\`\n` +
+      `• Orders Returned: \`${diag.ordersListCheck.count}\`\n` +
+      (diag.ordersListCheck.latestMaskedRef
+        ? `• Latest Order Ref (Masked): \`${diag.ordersListCheck.latestMaskedRef}\`\n`
+        : '') +
+      (diag.ordersListCheck.error
+        ? `• Error: ${this.escapeDiagMarkdown(diag.ordersListCheck.error)}\n`
+        : '') +
+      `\n🔎 *GET /order/:ref:*\n` +
+      `• Tested: \`${diag.orderRefCheck.tested}\`\n` +
+      (diag.orderRefCheck.tested
+        ? `• Probe Target (Masked): \`${diag.orderRefCheck.testedRefMasked || 'NONE'}\`\n` +
+          `• HTTP Status: \`${diag.orderRefCheck.httpStatus}\`\n` +
+          `• Found: \`${diag.orderRefCheck.found}\`\n` +
+          `• Normalized Status: \`${diag.orderRefCheck.status}\`\n` +
+          (diag.orderRefCheck.error
+            ? `• Error: ${this.escapeDiagMarkdown(diag.orderRefCheck.error)}\n`
+            : '')
+        : `• Reason: ${this.escapeDiagMarkdown(diag.orderRefCheck.error || 'SKIPPED')}\n`) +
+      `\n⏱️ Duration: \`${diag.durationMs}ms\`\n` +
+      `_No order was placed. No wallet was modified. All keys/refs masked._`;
+
+    await telegramClient.sendMessage(chatId, report, {
+      reply_markup: this.getSupplierDiagnosticActionKeyboard(),
     });
 
     return diag;

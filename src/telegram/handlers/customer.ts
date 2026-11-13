@@ -348,36 +348,43 @@ export class CustomerHandler {
         return;
       }
 
+      const priceInfo = await pricingService.calculatePrice(productId);
+      const totalDec = priceInfo.customerUnitPrice.times(qty);
+      const checkoutIdempotencyKey = `SUPPLIER_ORD_CHK_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
       if (product.requires_email) {
         await redis.setFsmState(userId, {
           step: 'AWAITING_EMAIL_FOR_ORDER',
-          data: { productId, quantity: qty },
+          data: {
+            productId,
+            quantity: qty,
+            expectedUnitPrice: priceInfo.customerUnitPrice.toFixed(4),
+            idempotencyKey: checkoutIdempotencyKey,
+          },
         });
         await this.renderMenu(
           chatId,
           messageId,
           userId,
-          `📧 *EMAIL REQUIRED*\n\nPlease type your delivery email address for *${product.original_name}* (Qty: ${qty}):`,
+          `📧 *EMAIL REQUIRED*\n\nPlease type your delivery email address for *${product.original_name}* (Qty: ${qty}, Total: ${totalDec.toFixed(2)} USDT):`,
           getBackHomeKeyboard('m:prod', lang)
         );
         return;
       }
 
-      const priceInfo = await pricingService.calculatePrice(productId);
-      const totalDec = priceInfo.customerUnitPrice.times(qty);
-      const { balance } = await walletService.getBalance(userId);
+      const { available } = await walletService.getBalance(userId);
       const navState = await navigationService.getState(userId);
       const catId = navState?.categoryId || 'all';
       const page = navState?.page || 1;
 
-      if (balance.lessThan(totalDec)) {
+      if (available.lessThan(totalDec)) {
         await this.renderMenu(
           chatId,
           messageId,
           userId,
           t('insufficient_funds', lang, {
             required: totalDec.toFixed(2),
-            available: balance.toFixed(2),
+            available: available.toFixed(2),
           }),
           {
             inline_keyboard: [
@@ -391,6 +398,15 @@ export class CustomerHandler {
         return;
       }
 
+      await redis.set(
+        `pending_checkout:${userId}:${productId}:${qty}`,
+        JSON.stringify({
+          idempotencyKey: checkoutIdempotencyKey,
+          expectedUnitPrice: priceInfo.customerUnitPrice.toFixed(4),
+        }),
+        900
+      );
+
       await this.renderMenu(
         chatId,
         messageId,
@@ -400,7 +416,7 @@ export class CustomerHandler {
           qty,
           unitPrice: priceInfo.customerUnitPrice.toFixed(2),
           totalPrice: totalDec.toFixed(2),
-          balance: balance.toFixed(2),
+          balance: available.toFixed(2),
         }),
         getPurchaseConfirmKeyboard(productId, qty, catId, page, lang)
       );
@@ -409,11 +425,33 @@ export class CustomerHandler {
 
     // Confirmed Purchase Execution
     if (data.startsWith('buyc:')) {
-      const allowed = await navigationService.acquireActionLock(userId, `buyc:${data}`, 3);
-      if (!allowed) return;
+      const allowed = await navigationService.acquireActionLock(userId, `buyc:${data}`, 15);
+      if (!allowed) {
+        await ackPromise;
+        return;
+      }
       const [, productId, qtyStr] = data.split(':');
       const qty = Math.max(1, parseInt(qtyStr || '1', 10));
-      await this.executePurchase(chatId, messageId, userId, productId, qty, undefined, lang);
+
+      let pending: { idempotencyKey?: string; expectedUnitPrice?: string } = {};
+      try {
+        const rawPending = await redis.get(`pending_checkout:${userId}:${productId}:${qty}`);
+        if (rawPending) {
+          pending = JSON.parse(rawPending);
+        }
+      } catch {
+        pending = {};
+      }
+
+      const effectiveIdempotencyKey =
+        pending.idempotencyKey ||
+        (messageId ? `SUPPLIER_ORD_MSG_${userId}_${messageId}_${productId}_${qty}` : undefined);
+
+      await this.executePurchase(chatId, messageId, userId, productId, qty, undefined, lang, {
+        idempotencyKey: effectiveIdempotencyKey,
+        expectedUnitPrice: pending.expectedUnitPrice,
+      });
+      await ackPromise;
       return;
     }
 
@@ -584,7 +622,7 @@ export class CustomerHandler {
           `• Total: \`${ord.totalPrice} USDT\`\n` +
           `• Status: *${ord.status}*\n`;
         if (ord.deliveredItems.length > 0) {
-          text += `• Credentials: \`${ord.deliveredItems[0]}\`\n`;
+          text += `• Credentials:\n\`\`\`\n${ord.deliveredItems.join('\n')}\n\`\`\`\n`;
         }
         text += '\n';
       }
@@ -833,13 +871,16 @@ export class CustomerHandler {
 
     // FSM: Awaiting Email for Order
     if (fsm.step === 'AWAITING_EMAIL_FOR_ORDER') {
-      const { productId, quantity } = fsm.data || {};
+      const { productId, quantity, expectedUnitPrice, idempotencyKey } = fsm.data || {};
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
         await telegramClient.sendMessage(chatId, '⚠️ Please provide a valid email format (e.g. name@example.com):');
         return;
       }
       await redis.clearFsmState(userId);
-      await this.executePurchase(chatId, undefined, userId, productId, quantity, text, lang);
+      await this.executePurchase(chatId, undefined, userId, productId, quantity, text, lang, {
+        idempotencyKey,
+        expectedUnitPrice,
+      });
       return;
     }
 
@@ -1035,7 +1076,8 @@ export class CustomerHandler {
     productId: string,
     quantity: number,
     customerEmail?: string,
-    lang: SupportedLanguage = 'en'
+    lang: SupportedLanguage = 'en',
+    options?: { idempotencyKey?: string; expectedUnitPrice?: string }
   ) {
     try {
       if (messageId) {
@@ -1049,6 +1091,8 @@ export class CustomerHandler {
         productId,
         quantity,
         customerEmail,
+        idempotencyKey: options?.idempotencyKey,
+        expectedUnitPrice: options?.expectedUnitPrice,
       });
 
       if (res.success) {
@@ -1058,9 +1102,27 @@ export class CustomerHandler {
         } else {
           msg += `_Status: ${res.status}. Your access invite has been scheduled and will be delivered shortly._`;
         }
-        await telegramClient.sendMessage(chatId, msg, {
-          reply_markup: getBackHomeKeyboard('m:ord', lang),
-        });
+
+        // Confidentiality guard: never leak delivered credentials into a group/third-party chatId
+        const isGroupChat = String(chatId) !== String(userId);
+        const deliveryChatId = isGroupChat && res.deliveredItems.length > 0 ? Number(userId) : chatId;
+        try {
+          await telegramClient.sendMessage(deliveryChatId, msg, {
+            reply_markup: getBackHomeKeyboard('m:ord', lang),
+          });
+          if (isGroupChat && res.deliveredItems.length > 0) {
+            await telegramClient.sendMessage(
+              chatId,
+              `✅ Order \`${res.orderId}\` completed! Delivered credentials were sent securely to your private DM.`,
+              { reply_markup: getBackHomeKeyboard('m:ord', lang) }
+            );
+          }
+        } catch (sendErr: any) {
+          logger.error('Failed to send Telegram order delivery message (no retry triggered)', {
+            orderId: res.orderId,
+            error: sendErr?.message || 'Telegram delivery error',
+          });
+        }
       } else {
         await telegramClient.sendMessage(chatId, `⚠️ *ORDER STATUS: ${res.status}*\n\n${res.message}`, {
           reply_markup: getBackHomeKeyboard('m:prod', lang),

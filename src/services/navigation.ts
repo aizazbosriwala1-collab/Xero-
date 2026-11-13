@@ -21,6 +21,7 @@ export interface NavigationState {
 
 export class NavigationService {
   private readonly defaultTtlMs = 24 * 60 * 60 * 1000; // 24 hours
+  private localActionLocks = new Map<string, number>();
 
   public generateToken(): string {
     return crypto.randomBytes(4).toString('hex');
@@ -148,15 +149,29 @@ export class NavigationService {
   }
 
   /**
-   * Prevent double-tap / duplicate callback processing for sensitive actions.
+   * Prevent double-tap / duplicate callback processing for sensitive actions atomically.
    */
   public async acquireActionLock(userId: string, actionKey: string, ttlSeconds = 2): Promise<boolean> {
     const lockKey = `actlock:${userId}:${actionKey}`;
-    const existing = await redis.get(lockKey);
-    if (existing) {
+    const now = Date.now();
+    const localExp = this.localActionLocks.get(lockKey);
+    if (localExp && localExp > now) {
       return false;
     }
-    await redis.set(lockKey, String(Date.now()), ttlSeconds);
+
+    const expiresAt = now + ttlSeconds * 1000;
+    this.localActionLocks.set(lockKey, expiresAt);
+
+    const acquired = await redis.setIfNotExists(lockKey, String(now), ttlSeconds);
+    if (!acquired) {
+      return false;
+    }
+
+    if (this.localActionLocks.size > 500) {
+      for (const [k, exp] of this.localActionLocks.entries()) {
+        if (exp <= now) this.localActionLocks.delete(k);
+      }
+    }
     return true;
   }
 }

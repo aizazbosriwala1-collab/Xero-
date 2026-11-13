@@ -28,6 +28,8 @@ import { sanitizeObject } from '../src/services/logger.js';
 import {
   config,
   buildConfig,
+  OFFICIAL_AITOOLSHOP_DOC_BASE_URL,
+  DEFAULT_AITOOLSHOP_BASE_URL,
   parseBoundedClockToleranceSeconds,
   parseReadOnlyLiveVerifiedEnv,
   getSanitizedConfig,
@@ -4651,6 +4653,1037 @@ export async function runComprehensiveTests() {
         assert.strictEqual(startupFlagLine!.includes(secret), false, 'Startup flag log must never contain credentials or receiver ID');
       }
     });
+  });
+
+  // =========================================================================
+  // 19. PRE-LIVE ORDERING SAFETY AUDIT SUITE (MOCKED, ZERO REAL ORDERING)
+  // =========================================================================
+  currentCategory = 'Pre-Live Ordering Safety Audit';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  const ensureAuditUser = async (uid: string, depositAmount?: string) => {
+    await db.query(
+      `INSERT INTO users (id, telegram_id, username, first_name, is_admin, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (id) DO NOTHING`,
+      [uid, Number(uid) || Math.floor(Math.random() * 1000000), `u_${uid}`, `Audit ${uid}`]
+    );
+    await walletService.getOrCreateWallet(uid);
+    if (depositAmount) {
+      await walletService.executeMutation({
+        userId: uid,
+        amount: depositAmount,
+        operationRef: `AUDIT_FUND_${uid}_${Date.now()}_${Math.random()}`,
+        entryType: 'DEPOSIT',
+        reason: 'Audit test deposit',
+        source: 'AUDIT_TEST',
+        actor: 'TEST',
+      });
+    }
+  };
+
+  await it('Pre-Live Safety 1: LIVE_ORDERING_ENABLED=false blocks placeOrder, checkout (zero debit/order row), and Telegram buyc', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = false;
+    let supplierCalled = false;
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () => {
+      supplierCalled = true;
+      return new Response(JSON.stringify({ status: 'completed', order_ref: 'SHOULD_NOT_HAPPEN' }), { status: 200 });
+    });
+    telegramClient.setTransportOverride(async () => ({ ok: true, result: { message_id: 9910 } }));
+
+    try {
+      const prodId = await insertTestProduct({ id: 'audit_safe_1', name: 'Audit Safe Product', your_cost: 1.00, stock: 10 });
+      await pricingService.setFixedRetailPrice(prodId, '1.50', '123456789');
+
+      const directRes = await supplierService.placeOrder({
+        product_id: 'audit_safe_1',
+        quantity: 1,
+        idempotency_key: 'AUDIT_KEY_DIRECT_1',
+      });
+      assert.strictEqual(directRes.success, false);
+      assert.strictEqual(directRes.error_code, 'LIVE_ORDERING_DISABLED');
+      assert.strictEqual(supplierCalled, false);
+
+      const uid = '81001';
+      await ensureAuditUser(uid, '10.0000');
+      const ordersBefore = await db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM local_orders WHERE user_id = $1', [uid]);
+      const ledgerBefore = await db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM ledger_entries WHERE user_id = $1', [uid]);
+
+      const checkoutRes = await orderService.checkout({
+        userId: uid,
+        productId: prodId,
+        quantity: 1,
+      });
+      assert.strictEqual(checkoutRes.success, false);
+      assert.strictEqual(checkoutRes.orderId, '');
+      assert.strictEqual(checkoutRes.totalCharged, '0.00');
+      assert.strictEqual(supplierCalled, false);
+
+      // Verify Telegram buyc: also leaves balance intact
+      await telegramBotRouter.handleUpdate({
+        update_id: 91001,
+        callback_query: {
+          id: 'cb_safe_1',
+          from: { id: Number(uid), is_bot: false, first_name: 'Safe1' },
+          data: `buyc:${prodId}:1`,
+          message: { message_id: 501, chat: { id: Number(uid), type: 'private' }, date: 1, text: 'confirm' },
+        },
+      });
+
+      const ordersAfter = await db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM local_orders WHERE user_id = $1', [uid]);
+      const ledgerAfter = await db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM ledger_entries WHERE user_id = $1', [uid]);
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(ordersAfter?.c, ordersBefore?.c, 'No local_orders row may be inserted when LIVE_ORDERING_ENABLED=false');
+      assert.strictEqual(ledgerAfter?.c, ledgerBefore?.c, 'No ledger mutation may occur when LIVE_ORDERING_ENABLED=false');
+      assert.strictEqual(bal.balance.toFixed(4), '10.0000');
+      assert.strictEqual(supplierCalled, false);
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('Pre-Live Safety 2: RECOVERY_MODE independence truth table verified against checkout', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    const origRecovery = config.safety.recoveryMode;
+    let supplierCalls = 0;
+
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () => {
+      supplierCalls++;
+      return new Response(
+        JSON.stringify({ status: 'completed', order_ref: `REF_REC_${supplierCalls}`, items: ['acct:pass1'] }),
+        { status: 200 }
+      );
+    });
+
+    try {
+      const prodId = await insertTestProduct({ id: 'audit_rec_1', name: 'Audit Recovery Product', your_cost: 0.50, stock: 10 });
+      await pricingService.setFixedRetailPrice(prodId, '1.00', '123456789');
+      const uid = '81002';
+      await ensureAuditUser(uid, '10.0000');
+
+      // RECOVERY_MODE=false + LIVE_ORDERING_ENABLED=false -> BLOCKED
+      config.safety.recoveryMode = false;
+      config.safety.liveOrderingEnabled = false;
+      const blocked = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(blocked.success, false);
+      assert.strictEqual(supplierCalls, 0);
+
+      // RECOVERY_MODE=true + LIVE_ORDERING_ENABLED=true -> PERMITTED (orders do NOT check recoveryMode!)
+      config.safety.recoveryMode = true;
+      config.safety.liveOrderingEnabled = true;
+      const permitted = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(permitted.success, true);
+      assert.strictEqual(permitted.status, 'COMPLETED');
+      assert.strictEqual(supplierCalls, 1);
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      config.safety.recoveryMode = origRecovery;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Pre-Live Safety 3: Locked wallet funds cannot be spent by purchase debit', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let supplierCalled = false;
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () => {
+      supplierCalled = true;
+      return new Response(JSON.stringify({ status: 'completed', order_ref: 'NOPE', items: ['x'] }), { status: 200 });
+    });
+
+    try {
+      const uid = '81003';
+      await ensureAuditUser(uid, '5.0000');
+      await db.query('UPDATE wallets SET locked_balance = 4.0000 WHERE user_id = $1', [uid]); // available = 1.0000
+
+      const prodId = await insertTestProduct({ id: 'audit_lock_1', name: 'Audit Lock Check', your_cost: 1.00, stock: 5 });
+      await pricingService.setFixedRetailPrice(prodId, '2.00', '123456789');
+
+      // 1) OrderService checkout must reject (available 1.00 < 2.00)
+      await assert.rejects(
+        async () => orderService.checkout({ userId: uid, productId: prodId, quantity: 1 }),
+        /Insufficient wallet balance/
+      );
+
+      // 2) Direct WalletService debit must ALSO enforce locked_balance protection
+      await assert.rejects(
+        async () =>
+          walletService.executeMutation({
+            userId: uid,
+            amount: '-2.0000',
+            operationRef: `LOCK_DEB_${Date.now()}`,
+            entryType: 'PURCHASE_DEBIT',
+            reason: 'Attempted spend of locked funds',
+            source: 'TEST',
+            actor: uid,
+          }),
+        /Insufficient wallet funds/
+      );
+
+      assert.strictEqual(supplierCalled, false);
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '5.0000');
+      assert.strictEqual(bal.available.toFixed(4), '1.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Pre-Live Safety 4: Exact balance purchase succeeds once leaving 0.0000 and balanced ledger', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () =>
+      new Response(JSON.stringify({ status: 'completed', order_ref: 'REF_EXACT_1', items: ['exact_user:pass'] }), { status: 200 })
+    );
+
+    try {
+      const uid = '81004';
+      await ensureAuditUser(uid, '1.5000');
+      const prodId = await insertTestProduct({ id: 'audit_exact_1', name: 'Audit Exact Bal', your_cost: 1.00, stock: 5 });
+      await pricingService.setFixedRetailPrice(prodId, '1.50', '123456789');
+
+      const res = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(res.success, true);
+      assert.strictEqual(res.status, 'COMPLETED');
+
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '0.0000');
+      const rec = await walletService.reconcile(uid);
+      assert.strictEqual(rec.isBalanced, true);
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Pre-Live Safety 5: Stale displayed price on Telegram confirmation rejected before debit/supplier call', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let supplierCalled = false;
+    const sentMsgs: string[] = [];
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () => {
+      supplierCalled = true;
+      return new Response(JSON.stringify({ status: 'completed', order_ref: 'STALE_FAIL', items: ['x'] }), { status: 200 });
+    });
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (body?.text) sentMsgs.push(String(body.text));
+      return { ok: true, result: { message_id: 9920 } };
+    });
+
+    try {
+      const uid = '81005';
+      await ensureAuditUser(uid, '10.0000');
+      const prodId = await insertTestProduct({ id: 'audit_stale_1', name: 'Audit Stale Price', your_cost: 1.00, stock: 5 });
+      await pricingService.setFixedRetailPrice(prodId, '1.50', '123456789');
+
+      // Step 1: User opens buy: screen (snapshots 1.50)
+      await telegramBotRouter.handleUpdate({
+        update_id: 91010,
+        callback_query: {
+          id: 'cb_stale_buy',
+          from: { id: Number(uid), is_bot: false, first_name: 'StaleUser' },
+          data: `buy:${prodId}:1`,
+          message: { message_id: 510, chat: { id: Number(uid), type: 'private' }, date: 1, text: 'detail' },
+        },
+      });
+
+      // Step 2: Admin increases price from 1.50 -> 2.25 before user taps buyc:
+      await pricingService.setFixedRetailPrice(prodId, '2.25', '123456789');
+
+      // Step 3: User confirms buyc:
+      await telegramBotRouter.handleUpdate({
+        update_id: 91011,
+        callback_query: {
+          id: 'cb_stale_confirm',
+          from: { id: Number(uid), is_bot: false, first_name: 'StaleUser' },
+          data: `buyc:${prodId}:1`,
+          message: { message_id: 510, chat: { id: Number(uid), type: 'private' }, date: 1, text: 'confirm' },
+        },
+      });
+
+      assert.strictEqual(supplierCalled, false);
+      assert.ok(sentMsgs.some(m => m.includes('PURCHASE FAILED') && m.includes('1.50') && m.includes('2.25')));
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '10.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('Pre-Live Safety 6: Duplicate & concurrent confirmations produce at most 1 order, 1 debit, 1 supplier POST /order', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let supplierCallCount = 0;
+    const seenHeaders: string[] = [];
+
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async (_url, init) => {
+      supplierCallCount++;
+      await new Promise(r => setTimeout(r, 40)); // Simulate network flight time
+      const hdrs = (init?.headers || {}) as Record<string, string>;
+      seenHeaders.push(hdrs['Idempotency-Key'] || '');
+      const parsedBody = JSON.parse(String(init?.body || '{}'));
+      assert.strictEqual(hdrs['Idempotency-Key'], parsedBody.idempotency_key, 'Header & body idempotency keys must match');
+      return new Response(
+        JSON.stringify({ status: 'completed', order_ref: `REF_CONC_${supplierCallCount}`, items: ['dup:cred1'] }),
+        { status: 200 }
+      );
+    });
+    telegramClient.setTransportOverride(async () => ({ ok: true, result: { message_id: 9930 } }));
+
+    try {
+      const uid = '81006';
+      await ensureAuditUser(uid, '20.0000');
+      const prodId = await insertTestProduct({ id: 'audit_dup_1', name: 'Audit Dup Tool', your_cost: 1.00, stock: 20 });
+      await pricingService.setFixedRetailPrice(prodId, '2.00', '123456789');
+
+      // A) Direct concurrent checkout calls sharing the same idempotencyKey
+      const sharedKey = `SUPPLIER_ORD_SHARED_${Date.now()}`;
+      const [c1, c2] = await Promise.all([
+        orderService.checkout({ userId: uid, productId: prodId, quantity: 1, idempotencyKey: sharedKey }),
+        orderService.checkout({ userId: uid, productId: prodId, quantity: 1, idempotencyKey: sharedKey }),
+      ]);
+      assert.strictEqual(c1.orderId, c2.orderId);
+      assert.strictEqual(c1.status, 'COMPLETED');
+      assert.strictEqual(c2.status, 'COMPLETED');
+      assert.strictEqual(supplierCallCount, 1);
+
+      // B) Concurrent Telegram buyc: taps + duplicate update_id on same confirmation
+      await telegramBotRouter.handleUpdate({
+        update_id: 91020,
+        callback_query: {
+          id: 'cb_buy_setup',
+          from: { id: Number(uid), is_bot: false, first_name: 'DupUser' },
+          data: `buy:${prodId}:1`,
+          message: { message_id: 520, chat: { id: Number(uid), type: 'private' }, date: 1, text: 'detail' },
+        },
+      });
+
+      const makeConfirmUpdate = (updateId: number) => ({
+        update_id: updateId,
+        callback_query: {
+          id: `cb_${updateId}`,
+          from: { id: Number(uid), is_bot: false, first_name: 'DupUser' },
+          data: `buyc:${prodId}:1`,
+          message: { message_id: 520, chat: { id: Number(uid), type: 'private' as const }, date: 1, text: 'confirm' },
+        },
+      });
+
+      await Promise.all([
+        telegramBotRouter.handleUpdate(makeConfirmUpdate(91021)),
+        telegramBotRouter.handleUpdate(makeConfirmUpdate(91022)), // simultaneous second update_id on same buyc:
+        telegramBotRouter.handleUpdate(makeConfirmUpdate(91021)), // exact duplicate update_id
+      ]);
+
+      // Exactly 2 total orders: 1 from (A) and 1 from (B)
+      const ordCount = await db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM local_orders WHERE user_id = $1', [uid]);
+      const debCount = await db.queryRow<{ c: string }>(
+        "SELECT COUNT(*) as c FROM ledger_entries WHERE user_id = $1 AND entry_type = 'PURCHASE_DEBIT'",
+        [uid]
+      );
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(parseInt(ordCount?.c || '0', 10), 2);
+      assert.strictEqual(parseInt(debCount?.c || '0', 10), 2);
+      assert.strictEqual(supplierCallCount, 2);
+      assert.strictEqual(bal.balance.toFixed(4), '16.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('Pre-Live Safety 7: Supplier deterministic rejection (OUT_OF_STOCK) refunds once and blocks post-refund retry', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let supplierCallCount = 0;
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () => {
+      supplierCallCount++;
+      return new Response(
+        JSON.stringify({ success: false, error_code: 'OUT_OF_STOCK', message: 'Supplier stock depleted' }),
+        { status: 400 }
+      );
+    });
+
+    try {
+      const uid = '81007';
+      await ensureAuditUser(uid, '10.0000');
+      const prodId = await insertTestProduct({ id: 'audit_oos_1', name: 'Audit OOS Tool', your_cost: 2.00, stock: 5 });
+      await pricingService.setFixedRetailPrice(prodId, '3.00', '123456789');
+
+      const res = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(res.success, false);
+      assert.strictEqual(res.status, 'FAILED');
+      assert.strictEqual(supplierCallCount, 1);
+
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '10.0000');
+      const rec = await walletService.reconcile(uid);
+      assert.strictEqual(rec.isBalanced, true);
+
+      // Post-refund retry must be blocked cleanly (never fulfill for free!)
+      const retryRes = await orderService.retryOrder(res.orderId);
+      assert.strictEqual(retryRes.success, false);
+      assert.strictEqual(retryRes.status, 'FAILED');
+      assert.strictEqual(supplierCallCount, 1);
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Pre-Live Safety 8: Timeout / 500 / malformed JSON / fake-200 enter UNCERTAIN without premature refund or blind POST /order retry', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let mode: 'timeout' | 'http500' | 'nonjson' | 'fake200' | 'empty200' = 'timeout';
+    let postOrderCalls = 0;
+    let getLookupCalls = 0;
+
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.endsWith('/order')) {
+        postOrderCalls++;
+      } else {
+        getLookupCalls++;
+      }
+      if (mode === 'timeout') throw new Error('network timeout');
+      if (mode === 'http500') return new Response(JSON.stringify({ message: 'Internal Error' }), { status: 500 });
+      if (mode === 'nonjson') return new Response('<html>502 Bad Gateway</html>', { status: 200 });
+      if (mode === 'fake200') {
+        if (method === 'GET') {
+          return new Response(JSON.stringify({ status: 'completed', order_ref: 'REF_NO_DEL', items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ success: true, status: 'completed', order_ref: 'REF_NO_DEL', items: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ foo: 'bar' }), { status: 200 });
+    });
+
+    try {
+      const uid = '81008';
+      await ensureAuditUser(uid, '20.0000');
+      const prodId = await insertTestProduct({ id: 'audit_unc_1', name: 'Audit Uncertain Tool', your_cost: 1.00, stock: 20 });
+      await pricingService.setFixedRetailPrice(prodId, '2.00', '123456789');
+
+      assert.strictEqual(supplierService.hasOrderStatusLookup(), true);
+
+      for (const m of ['timeout', 'http500', 'nonjson', 'fake200', 'empty200'] as const) {
+        mode = m;
+        const beforePosts = postOrderCalls;
+        const beforeGets = getLookupCalls;
+        const r = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+        assert.strictEqual(r.status, 'UNCERTAIN', `Expected UNCERTAIN for mode=${m}, got ${r.status}`);
+        assert.strictEqual(r.success, false);
+        assert.strictEqual(postOrderCalls, beforePosts + 1);
+
+        // Reconciliation MUST run read-only GET lookup(s) and NEVER trigger another POST /order
+        const recon = await orderService.reconcileUncertainOrder(r.orderId);
+        assert.strictEqual(recon.status, 'UNCERTAIN');
+        assert.strictEqual(postOrderCalls, beforePosts + 1, 'Blind POST /order must NEVER fire during UNCERTAIN reconciliation');
+        assert.ok(getLookupCalls > beforeGets, 'Reconciliation should perform read-only GET lookup(s)');
+      }
+
+      // No premature refunds for any of the 5 uncertain orders (20.00 - 5*2.00 = 10.00)
+      const refunds = await db.queryRow<{ c: string }>(
+        "SELECT COUNT(*) as c FROM ledger_entries WHERE user_id = $1 AND entry_type = 'REFUND'",
+        [uid]
+      );
+      assert.strictEqual(parseInt(refunds?.c || '0', 10), 0);
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '10.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Pre-Live Safety 9: Fake-200 explicit failure (success:false/error_code in HTTP 200) triggers single atomic refund', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () =>
+      new Response(JSON.stringify({ success: false, status: 'failed', error_code: 'OUT_OF_STOCK', message: 'Rejected inside 200' }), {
+        status: 200,
+      })
+    );
+
+    try {
+      const uid = '81009';
+      await ensureAuditUser(uid, '5.0000');
+      const prodId = await insertTestProduct({ id: 'audit_fake200_fail', name: 'Audit Fake200 Fail', your_cost: 1.00, stock: 5 });
+      await pricingService.setFixedRetailPrice(prodId, '2.00', '123456789');
+
+      const res = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(res.success, false);
+      assert.strictEqual(res.status, 'FAILED');
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '5.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Pre-Live Safety 10: Encryption at rest, supplier_orders redaction, multi-qty display, owner-only access & DM isolation', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    const secretCred1 = 'SECRET_USER_1:TOP_SECRET_PASS_1';
+    const secretCred2 = 'SECRET_USER_2:TOP_SECRET_PASS_2';
+
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () =>
+      new Response(
+        JSON.stringify({
+          status: 'completed',
+          order_ref: 'REF_SEC_1',
+          items: [secretCred1, secretCred2],
+          password: 'RAW_FIELD_MUST_REDACT',
+        }),
+        { status: 200 }
+      )
+    );
+
+    const dmDeliveries: Array<{ chatId: number; text: string }> = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (method === 'sendMessage' || method === 'editMessageText') {
+        dmDeliveries.push({ chatId: Number(body.chat_id), text: String(body.text || '') });
+      }
+      return { ok: true, result: { message_id: 9950 } };
+    });
+
+    try {
+      const ownerId = '81010';
+      const attackerId = '81011';
+      await ensureAuditUser(ownerId, '20.0000');
+      await ensureAuditUser(attackerId, '20.0000');
+
+      const prodId = await insertTestProduct({ id: 'audit_sec_1', name: 'Audit Secret Multi', your_cost: 1.00, stock: 10 });
+      await pricingService.setFixedRetailPrice(prodId, '1.50', '123456789');
+
+      // Group chat simulation (chat.id != from.id): credentials must route ONLY to DM userId
+      await telegramBotRouter.handleUpdate({
+        update_id: 91050,
+        callback_query: {
+          id: 'cb_grp_buyc',
+          from: { id: Number(ownerId), is_bot: false, first_name: 'Owner' },
+          data: `buyc:${prodId}:2`,
+          message: { message_id: 550, chat: { id: -100999888, type: 'group' }, date: 1, text: 'confirm' },
+        },
+      });
+
+      // Verify credentials delivered strictly to private owner DM, NEVER to group chat -100999888
+      const groupMsgsWithCred = dmDeliveries.filter(
+        m => m.chatId === -100999888 && (m.text.includes(secretCred1) || m.text.includes(secretCred2))
+      );
+      const dmMsgsWithCred = dmDeliveries.filter(
+        m => m.chatId === Number(ownerId) && m.text.includes(secretCred1) && m.text.includes(secretCred2)
+      );
+      assert.strictEqual(groupMsgsWithCred.length, 0, 'Plaintext credentials must NEVER be sent to non-owner/group chat');
+      assert.strictEqual(dmMsgsWithCred.length, 1, 'All delivered items for qty=2 must be sent privately to purchaser');
+
+      const ordRow = await db.queryRow<any>('SELECT id FROM local_orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1', [ownerId]);
+      assert.ok(ordRow?.id);
+
+      // Verify DB ciphertext & redacted supplier_orders.response_payload
+      const delRows = await db.query<{ content: string }>('SELECT content FROM delivered_items WHERE local_order_id = $1', [ordRow.id]);
+      assert.strictEqual(delRows.rows.length, 2);
+      for (const r of delRows.rows) {
+        assert.ok(r.content.startsWith('v1:'), 'Delivered items must use v1 AES-256-GCM encryption');
+        assert.strictEqual(r.content.includes('TOP_SECRET_PASS'), false);
+      }
+
+      const soRow = await db.queryRow<any>('SELECT response_payload FROM supplier_orders WHERE local_order_id = $1', [ordRow.id]);
+      assert.ok(soRow);
+      assert.strictEqual(String(soRow.response_payload).includes('TOP_SECRET_PASS'), false, 'supplier_orders.response_payload must redact credentials');
+      assert.strictEqual(String(soRow.response_payload).includes('RAW_FIELD_MUST_REDACT'), false);
+
+      // Owner vs non-owner authorization check
+      const ownerCreds = await orderService.getOrderCredentials(ordRow.id, ownerId, false);
+      assert.deepStrictEqual(ownerCreds, [secretCred1, secretCred2]);
+      await assert.rejects(
+        async () => orderService.getOrderCredentials(ordRow.id, attackerId, false),
+        /Access denied/
+      );
+      await assert.rejects(
+        async () => orderService.getCustomerOrders(ownerId, attackerId, false),
+        /Access denied/
+      );
+
+      // Verify My Orders displays BOTH items for qty=2
+      dmDeliveries.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 91051,
+        callback_query: {
+          id: 'cb_m_ord_sec',
+          from: { id: Number(ownerId), is_bot: false, first_name: 'Owner' },
+          data: 'm:ord',
+          message: { message_id: 551, chat: { id: Number(ownerId), type: 'private' }, date: 1, text: 'home' },
+        },
+      });
+      const ordHistoryMsg = dmDeliveries.find(m => m.text.includes(ordRow.id));
+      assert.ok(ordHistoryMsg?.text.includes(secretCred1) && ordHistoryMsg?.text.includes(secretCred2));
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('Pre-Live Safety 11: Telegram delivery failure after fulfillment does NOT trigger duplicate supplier purchase', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let supplierCallCount = 0;
+    supplierService.setTestApiKey('mock_audit_reseller_key');
+    supplierService.setFetchOverride(async () => {
+      supplierCallCount++;
+      return new Response(
+        JSON.stringify({ status: 'completed', order_ref: 'REF_TG_FAIL_1', items: ['safe_saved:cred99'] }),
+        { status: 200 }
+      );
+    });
+
+    telegramClient.setTransportOverride(async (method) => {
+      if (method === 'sendMessage') {
+        throw new Error('Telegram 500 during delivery send');
+      }
+      return { ok: true, result: { message_id: 9960 } };
+    });
+
+    try {
+      const uid = '81012';
+      await ensureAuditUser(uid, '10.0000');
+      const prodId = await insertTestProduct({ id: 'audit_tgfail_1', name: 'Audit TG Fail', your_cost: 1.00, stock: 5 });
+      await pricingService.setFixedRetailPrice(prodId, '2.00', '123456789');
+
+      await telegramBotRouter.handleUpdate({
+        update_id: 91060,
+        callback_query: {
+          id: 'cb_tg_fail',
+          from: { id: Number(uid), is_bot: false, first_name: 'TgFailUser' },
+          data: `buyc:${prodId}:1`,
+          message: { message_id: 560, chat: { id: Number(uid), type: 'private' }, date: 1, text: 'confirm' },
+        },
+      });
+
+      assert.strictEqual(supplierCallCount, 1, 'Telegram delivery failure must NEVER trigger a second supplier purchase');
+      const creds = await orderService.getCustomerOrders(uid, 1);
+      assert.strictEqual(creds[0]?.status, 'COMPLETED');
+      assert.deepStrictEqual(creds[0]?.deliveredItems, ['safe_saved:cred99']);
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  // 20. AITOOLSHOP OFFICIAL CONTRACT RECONCILIATION & READ-ONLY DIAGNOSTIC
+  currentCategory = 'AiToolShop Official Contract Reconciliation';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 1: Base URL preserves working default and supports AITOOLSHOP_BASE_URL override without exposing keys', 'unit', async () => {
+    const defaultCfg = buildConfig({} as NodeJS.ProcessEnv);
+    assert.strictEqual(defaultCfg.supplier.baseUrl, DEFAULT_AITOOLSHOP_BASE_URL);
+    assert.strictEqual(defaultCfg.supplier.baseUrlSource, 'CODE_DEFAULT');
+    assert.strictEqual(defaultCfg.supplier.officialDocBaseUrl, OFFICIAL_AITOOLSHOP_DOC_BASE_URL);
+
+    const overrideCfg = buildConfig({
+      AITOOLSHOP_BASE_URL: `${OFFICIAL_AITOOLSHOP_DOC_BASE_URL}/`,
+      AITOOLSHOP_RESELLER_API_KEY: 'super_secret_reseller_token_value',
+    } as unknown as NodeJS.ProcessEnv);
+    assert.strictEqual(overrideCfg.supplier.baseUrl, OFFICIAL_AITOOLSHOP_DOC_BASE_URL);
+    assert.strictEqual(overrideCfg.supplier.baseUrlSource, 'ENV_OVERRIDE');
+    assert.strictEqual(overrideCfg.safety.liveOrderingEnabled, false);
+
+    const sanitized = JSON.stringify(getSanitizedConfig());
+    assert.strictEqual(sanitized.includes('super_secret_reseller_token_value'), false);
+  });
+
+  await it('Contract 2: Read-only GET /orders and GET /order/:ref parse wrapped, flat, 404, and malformed responses', 'mock_integration', async () => {
+    supplierService.setTestApiKey('mock_contract_key');
+    supplierService.setTestBaseUrl(OFFICIAL_AITOOLSHOP_DOC_BASE_URL);
+    const seenUrls: string[] = [];
+
+    supplierService.setFetchOverride(async (url, init) => {
+      seenUrls.push(`${init?.method || 'GET'} ${url}`);
+      if (url.endsWith('/orders')) {
+        return new Response(
+          JSON.stringify({
+            orders: [
+              {
+                order_ref: 'SUP_REF_101',
+                idempotency_key: 'IDEM_101',
+                status: 'completed',
+                items: ['u1:p1'],
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/order/SUP_REF_101')) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              order_ref: 'SUP_REF_101',
+              idempotency_key: 'IDEM_101',
+              status: 'completed',
+              delivered_items: ['u1:p1'],
+            },
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/order/MISSING_REF')) {
+        return new Response(JSON.stringify({ message: 'Not found' }), { status: 404 });
+      }
+      return new Response('Bad Gateway', { status: 502 });
+    });
+
+    try {
+      const list = await supplierService.listOrdersReadOnly();
+      assert.strictEqual(list.ok, true);
+      assert.strictEqual(list.httpStatus, 200);
+      assert.strictEqual(list.orders.length, 1);
+      assert.strictEqual(list.orders[0].order_ref, 'SUP_REF_101');
+
+      const found = await supplierService.getOrderByRef('SUP_REF_101');
+      assert.strictEqual(found.ok, true);
+      assert.strictEqual(found.found, true);
+      assert.strictEqual(found.status, 'completed');
+      assert.deepStrictEqual(found.delivered_items, ['u1:p1']);
+
+      const missing = await supplierService.getOrderByRef('MISSING_REF');
+      assert.strictEqual(missing.ok, true);
+      assert.strictEqual(missing.found, false);
+      assert.strictEqual(missing.httpStatus, 404);
+      assert.strictEqual(missing.status, 'not_found');
+
+      const badGw = await supplierService.getOrderByRef('ERR_REF');
+      assert.strictEqual(badGw.ok, false);
+      assert.strictEqual(badGw.status, 'error');
+      assert.strictEqual(badGw.httpStatus, 502);
+
+      assert.ok(seenUrls.every(u => u.startsWith('GET ')));
+      assert.ok(seenUrls.some(u => u === `GET ${OFFICIAL_AITOOLSHOP_DOC_BASE_URL}/orders`));
+    } finally {
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Contract 3: UNCERTAIN order reconciled via GET /orders + GET /order/:ref completes with AES-256-GCM encryption and zero double-debit or POST /order replay', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let postOrderCalls = 0;
+    let getCalls = 0;
+    let orderCreatedKey = '';
+    const deliveredSecret = 'recon_user@example.com:Sup3rS3cret!99';
+
+    supplierService.setTestApiKey('mock_contract_key');
+    supplierService.setFetchOverride(async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.endsWith('/order')) {
+        postOrderCalls++;
+        const parsed = JSON.parse(String(init?.body || '{}'));
+        orderCreatedKey = parsed.idempotency_key;
+        // Simulate timeout during initial POST /order after supplier actually accepted order
+        throw new Error('upstream socket timeout');
+      }
+
+      getCalls++;
+      if (url.endsWith(`/order/${encodeURIComponent(orderCreatedKey)}`)) {
+        // Not indexed by idempotency_key path directly; force fallback to GET /orders
+        return new Response(JSON.stringify({ message: 'Not found' }), { status: 404 });
+      }
+      if (url.endsWith('/orders')) {
+        return new Response(
+          JSON.stringify({
+            orders: [
+              {
+                order_ref: 'SUP_RECON_555',
+                idempotency_key: orderCreatedKey,
+                status: 'completed',
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/order/SUP_RECON_555')) {
+        return new Response(
+          JSON.stringify({
+            order_ref: 'SUP_RECON_555',
+            idempotency_key: orderCreatedKey,
+            status: 'completed',
+            items: [deliveredSecret],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    try {
+      const uid = '82001';
+      await ensureAuditUser(uid, '10.0000');
+      const prodId = await insertTestProduct({ id: 'contract_recon_ok', name: 'Contract Recon Complete', your_cost: 1.00, stock: 10 });
+      await pricingService.setFixedRetailPrice(prodId, '2.50', '123456789');
+
+      // Initial checkout times out -> UNCERTAIN, wallet debited once (7.5000 left)
+      const first = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(first.status, 'UNCERTAIN');
+      assert.strictEqual(postOrderCalls, 1);
+
+      // Reconcile read-only -> resolves supplier_order_ref via GET /orders + items via GET /order/:ref
+      const recon = await orderService.reconcileUncertainOrder(first.orderId);
+      assert.strictEqual(recon.status, 'COMPLETED');
+      assert.strictEqual(postOrderCalls, 1, 'Reconciliation must NEVER issue another POST /order');
+      assert.ok(getCalls >= 2, 'Reconciliation must use read-only GET endpoints');
+
+      // Encrypted at rest, zero double-debit, supplier_order_ref stored, payload redacted
+      const delRow = await db.queryRow<any>('SELECT content FROM delivered_items WHERE local_order_id = $1', [first.orderId]);
+      assert.ok(delRow?.content?.startsWith('v1:'));
+      assert.strictEqual(encryptionService.decrypt(delRow.content), deliveredSecret);
+
+      const soRow = await db.queryRow<any>('SELECT supplier_order_ref, supplier_status, response_payload FROM supplier_orders WHERE local_order_id = $1', [first.orderId]);
+      assert.strictEqual(soRow?.supplier_order_ref, 'SUP_RECON_555');
+      assert.strictEqual(soRow?.supplier_status, 'COMPLETED');
+      assert.strictEqual(String(soRow?.response_payload).includes('Sup3rS3cret!99'), false);
+
+      const debits = await db.queryRow<{ c: string }>(
+        "SELECT COUNT(*) as c FROM ledger_entries WHERE user_id = $1 AND entry_type = 'PURCHASE_DEBIT'",
+        [uid]
+      );
+      assert.strictEqual(parseInt(debits?.c || '0', 10), 1);
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '7.5000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Contract 4: UNCERTAIN order confirmed failed via GET /order/:ref refunds ONCE and blocks re-reconciliation', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let postOrderCalls = 0;
+
+    supplierService.setTestApiKey('mock_contract_key');
+    supplierService.setFetchOverride(async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.endsWith('/order')) {
+        postOrderCalls++;
+        return new Response(
+          JSON.stringify({ status: 'unknown', error_code: 'UNCERTAIN_HTTP_503', order_ref: 'SUP_FAIL_888', message: 'Gateway Timeout' }),
+          { status: 503 }
+        );
+      }
+      if (url.endsWith('/order/SUP_FAIL_888')) {
+        return new Response(
+          JSON.stringify({
+            order_ref: 'SUP_FAIL_888',
+            status: 'failed',
+            error_code: 'SUPPLIER_FULFILLMENT_FAILED',
+            message: 'Stock exhausted during async provisioning',
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    try {
+      const uid = '82002';
+      await ensureAuditUser(uid, '10.0000');
+      const prodId = await insertTestProduct({ id: 'contract_recon_fail', name: 'Contract Recon Fail', your_cost: 1.00, stock: 10 });
+      await pricingService.setFixedRetailPrice(prodId, '3.00', '123456789');
+
+      const first = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(first.status, 'UNCERTAIN');
+      assert.strictEqual(postOrderCalls, 1);
+
+      const recon1 = await orderService.reconcileUncertainOrder(first.orderId);
+      assert.strictEqual(recon1.status, 'FAILED');
+      assert.strictEqual(postOrderCalls, 1);
+
+      // Re-running retryOrder/reconcile must NOT refund twice or reorder
+      const recon2 = await orderService.retryOrder(first.orderId);
+      assert.strictEqual(recon2.status, 'FAILED');
+      assert.strictEqual(recon2.success, false);
+      assert.strictEqual(postOrderCalls, 1);
+
+      const refunds = await db.queryRow<{ c: string }>(
+        "SELECT COUNT(*) as c FROM ledger_entries WHERE user_id = $1 AND entry_type = 'REFUND'",
+        [uid]
+      );
+      assert.strictEqual(parseInt(refunds?.c || '0', 10), 1);
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '10.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Contract 5: UNCERTAIN order returning not_found, pending, or lookup error stays under review without reorder or premature refund', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+    let postOrderCalls = 0;
+    let lookupMode: 'not_found' | 'pending' | 'error' = 'not_found';
+
+    supplierService.setTestApiKey('mock_contract_key');
+    supplierService.setFetchOverride(async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.endsWith('/order')) {
+        postOrderCalls++;
+        throw new Error('connect ETIMEDOUT');
+      }
+      if (lookupMode === 'not_found') {
+        return new Response(url.endsWith('/orders') ? JSON.stringify({ orders: [] }) : JSON.stringify({ message: 'Not found' }), {
+          status: url.endsWith('/orders') ? 200 : 404,
+        });
+      }
+      if (lookupMode === 'pending') {
+        return new Response(
+          JSON.stringify({ order_ref: 'SUP_PEND_77', status: 'processing', message: 'Still queued' }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ message: 'Supplier temporary 502' }), { status: 502 });
+    });
+
+    try {
+      const uid = '82003';
+      await ensureAuditUser(uid, '10.0000');
+      const prodId = await insertTestProduct({ id: 'contract_recon_hold', name: 'Contract Recon Hold', your_cost: 1.00, stock: 10 });
+      await pricingService.setFixedRetailPrice(prodId, '2.00', '123456789');
+
+      const first = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+      assert.strictEqual(first.status, 'UNCERTAIN');
+
+      for (const mode of ['not_found', 'pending', 'error'] as const) {
+        lookupMode = mode;
+        const r = await orderService.reconcileUncertainOrder(first.orderId);
+        assert.strictEqual(r.status, 'UNCERTAIN', `Expected UNCERTAIN to remain under review for lookup=${mode}`);
+      }
+
+      assert.strictEqual(postOrderCalls, 1, 'Must never repeat POST /order during not_found/pending/error');
+      const refunds = await db.queryRow<{ c: string }>(
+        "SELECT COUNT(*) as c FROM ledger_entries WHERE user_id = $1 AND entry_type = 'REFUND'",
+        [uid]
+      );
+      assert.strictEqual(parseInt(refunds?.c || '0', 10), 0, 'Must never issue premature refund');
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '8.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('Contract 6: Admin-only read-only supplier diagnostic enforces auth, checks balance/products/orders/order/:ref, and triggers zero POST /order', 'mock_integration', async () => {
+    const sentMessages: Array<{ chatId: number; text: string }> = [];
+    const requestsSeen: Array<{ method: string; url: string }> = [];
+
+    supplierService.setTestApiKey('secret_reseller_key_must_never_leak');
+    supplierService.setFetchOverride(async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      requestsSeen.push({ method, url });
+      if (url.endsWith('/balance')) {
+        return new Response(JSON.stringify({ balance: '14.2500', currency: 'USDT' }), { status: 200 });
+      }
+      if (url.endsWith('/products')) {
+        return new Response(
+          JSON.stringify({
+            products: [
+              { id: '99', name: 'Expensive Suite', your_cost: 9.0, stock: 5, requires_email: false },
+              { id: '12', name: 'Cheapest Instant Key', your_cost: 0.15, stock: 40, requires_email: false, type: 'account' },
+              { id: '11', name: 'Ultra Cheap Email Invite', your_cost: 0.10, stock: 10, requires_email: true, type: 'invite' },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/orders')) {
+        return new Response(
+          JSON.stringify({
+            orders: [{ order_ref: 'SUP_LIVE_REF_9876543210', status: 'completed' }],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes('/order/')) {
+        return new Response(
+          JSON.stringify({ order_ref: 'SUP_LIVE_REF_9876543210', status: 'completed', items: ['redacted:item'] }),
+          { status: 200 }
+        );
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (method === 'sendMessage' || method === 'editMessageText') {
+        sentMessages.push({ chatId: Number(body.chat_id), text: String(body.text || '') });
+      }
+      return { ok: true, result: { message_id: 9980 } };
+    });
+
+    try {
+      assert.strictEqual(isRegisteredCallbackRoute('adm:sup_diag'), true);
+      assert.strictEqual(isRegisteredCallbackRoute('adm:sup_diag_run'), true);
+      assert.strictEqual(isRegisteredCallbackRoute('adm:sup_diag_ord'), true);
+      assert.strictEqual(isRegisteredCallbackRoute('adm:sup_diag_clr'), true);
+
+      // Non-admin must be strictly rejected
+      await assert.rejects(
+        async () => adminHandler.executeAdminSupplierDiagnostic(999999999, '999999999'),
+        /Unauthorized admin supplier diagnostic execution/
+      );
+
+      sentMessages.length = 0;
+      const diag = await adminHandler.executeAdminSupplierDiagnostic(123456789, '123456789');
+      assert.strictEqual(diag.mode, 'READ_ONLY');
+      assert.strictEqual(diag.purchasingCapability, 'ZERO');
+      assert.strictEqual(diag.walletMutation, 'IMPOSSIBLE');
+      assert.strictEqual(diag.liveOrderingEnabled, false);
+      assert.strictEqual(diag.balanceCheck.balanceUsdt, '14.2500');
+      assert.strictEqual(diag.productsCheck.cheapestActiveInStock?.supplierProductId, '11');
+      assert.strictEqual(diag.productsCheck.cheapestInstantInStock?.supplierProductId, '12');
+      assert.strictEqual(diag.ordersListCheck.count, 1);
+      assert.strictEqual(diag.orderRefCheck.found, true);
+
+      // Zero POST /order requests allowed anywhere in diagnostic
+      assert.strictEqual(requestsSeen.some(r => r.method !== 'GET'), false);
+      assert.strictEqual(requestsSeen.some(r => r.url.endsWith('/order')), false);
+
+      // Verify secret API key and full raw order_ref are masked in Telegram output
+      const reportMsg = sentMessages.find(m => m.text.includes('SUPPLIER READ-ONLY DIAGNOSTIC REPORT'));
+      assert.ok(reportMsg, 'Admin should receive diagnostic report');
+      assert.strictEqual(reportMsg!.text.includes('secret_reseller_key'), false);
+      assert.strictEqual(reportMsg!.text.includes('SUP_LIVE_REF_9876543210'), false);
+      assert.ok(reportMsg!.text.includes('SUP_LI...3210'));
+
+      // Verify sanitized audit log persisted
+      const auditRow = await db.queryRow<any>(
+        "SELECT action, details FROM admin_audit_logs WHERE action = 'SUPPLIER_READ_ONLY_DIAGNOSTIC_EXECUTED' ORDER BY created_at DESC LIMIT 1"
+      );
+      assert.ok(auditRow);
+      assert.strictEqual(String(auditRow.details).includes('secret_reseller_key'), false);
+    } finally {
+      supplierService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
   });
 
   // SUMMARY & STATS DYNAMIC COMPUTATION

@@ -637,6 +637,15 @@ export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): Telegr
         ButtonBuilder.buildButton({ text: 'SUPPLIER SYNC', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sync' }),
         ButtonBuilder.buildButton({ text: 'SYSTEM HEALTH', fallbackEmoji: '🩺', style: 'default', callbackData: 'adm:hlth' }),
       ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({
+          text: 'SUPPLIER READ-ONLY DIAG',
+          fallbackEmoji: '🔬',
+          style: 'primary',
+          callbackData: 'adm:sup_diag',
+          forceVisible: true,
+        }),
+      ]),
       ...(config.binance.diagnosticEnabled
         ? [
             ButtonBuilder.buildActionRow([

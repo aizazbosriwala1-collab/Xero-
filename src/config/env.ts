@@ -1,6 +1,9 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+export const OFFICIAL_AITOOLSHOP_DOC_BASE_URL = 'https://bot.aitoolifystudio.io/api/reseller/v1';
+export const DEFAULT_AITOOLSHOP_BASE_URL = 'https://aitoolshop.aitoolifystudio.io/api/reseller/v1';
+
 export interface AppConfig {
   nodeEnv: string;
   port: number;
@@ -14,6 +17,8 @@ export interface AppConfig {
   };
   supplier: {
     baseUrl: string;
+    baseUrlSource: 'ENV_OVERRIDE' | 'CODE_DEFAULT';
+    officialDocBaseUrl: string;
     apiKey?: string;
   };
   binance: {
@@ -59,6 +64,9 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     .map(id => id.trim())
     .filter(Boolean);
 
+  const explicitSupplierBaseUrl = typeof env.AITOOLSHOP_BASE_URL === 'string' ? env.AITOOLSHOP_BASE_URL.trim() : '';
+  const resolvedSupplierBaseUrl = (explicitSupplierBaseUrl || DEFAULT_AITOOLSHOP_BASE_URL).replace(/\/+$/, '');
+
   return {
     nodeEnv: env.NODE_ENV || 'development',
     port: parseInt(env.PORT || '3000', 10),
@@ -71,7 +79,9 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       adminIds,
     },
     supplier: {
-      baseUrl: env.AITOOLSHOP_BASE_URL || 'https://aitoolshop.aitoolifystudio.io/api/reseller/v1',
+      baseUrl: resolvedSupplierBaseUrl,
+      baseUrlSource: explicitSupplierBaseUrl ? 'ENV_OVERRIDE' : 'CODE_DEFAULT',
+      officialDocBaseUrl: OFFICIAL_AITOOLSHOP_DOC_BASE_URL,
       apiKey: env.AITOOLSHOP_RESELLER_API_KEY,
     },
     binance: {
@@ -122,6 +132,8 @@ export function getSanitizedConfig(): Record<string, unknown> {
     },
     supplier: {
       baseUrl: config.supplier.baseUrl,
+      baseUrlSource: config.supplier.baseUrlSource,
+      officialDocBaseUrl: config.supplier.officialDocBaseUrl,
       apiKeyConfigured: Boolean(config.supplier.apiKey),
     },
     binance: {
