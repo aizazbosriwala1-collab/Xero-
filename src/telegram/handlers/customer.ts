@@ -4,7 +4,7 @@ import { redis } from '../../services/redis.js';
 import { walletService } from '../../services/wallet.js';
 import { pricingService } from '../../services/pricing.js';
 import { manualPaymentService } from '../../services/manualPayment.js';
-import { binanceService } from '../../services/binance.js';
+import { binanceService, BinanceVerificationResult, maskIdentifier } from '../../services/binance.js';
 import { orderService } from '../../services/order.js';
 import { referralService } from '../../services/referral.js';
 import { giveawayService } from '../../services/giveaway.js';
@@ -517,6 +517,33 @@ export class CustomerHandler {
       await telegramClient.sendMessage(chatId, prompt, {
         reply_markup: getBackHomeKeyboard('m:dep', lang),
       });
+      await ackPromise;
+      return;
+    }
+
+    // Binance: Retry Verification with last submitted Transaction ID
+    if (data.startsWith('bin_r:')) {
+      const [, depositId] = data.split(':');
+      const allowed = await navigationService.acquireActionLock(userId, `bin_r:${depositId}`, 3);
+      if (!allowed) {
+        await ackPromise;
+        return;
+      }
+
+      const lastTx = await redis.get(`bin_last_tx:${userId}:${depositId}`).catch(() => null);
+      if (!lastTx) {
+        await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } });
+        await telegramClient.sendMessage(
+          chatId,
+          '🔎 Please paste your Binance *Transaction ID* again to retry verification:',
+          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
+        );
+        await ackPromise;
+        return;
+      }
+
+      await this.executeBinanceTxVerification(chatId, userId, depositId, lastTx, lang);
+      await ackPromise;
       return;
     }
 
@@ -836,19 +863,9 @@ export class CustomerHandler {
 
     // FSM: Binance TXID
     if (fsm.step === 'AWAITING_BINANCE_TXID') {
-      const depositId = fsm.data?.depositId;
+      const depositId = String(fsm.data?.depositId || '');
       await redis.clearFsmState(userId);
-      await telegramClient.sendMessage(chatId, `🔍 Verifying submitted Transaction ID \`${text}\`...`);
-      const res = await binanceService.verifyDeposit(depositId, text, userId);
-      if (res.verified) {
-        await telegramClient.sendMessage(chatId, `✅ *PAYMENT VERIFIED!*\n\n${res.message}`, {
-          reply_markup: getBackHomeKeyboard('m:wall', lang),
-        });
-      } else {
-        await telegramClient.sendMessage(chatId, `⚠️ *VERIFICATION FAILED (${res.classification})*\n\n${res.message}`, {
-          reply_markup: getBinanceInvoiceKeyboard(depositId, lang),
-        });
-      }
+      await this.executeBinanceTxVerification(chatId, userId, depositId, text, lang);
       return;
     }
 
@@ -1178,6 +1195,116 @@ export class CustomerHandler {
       `📝 *Description:*\n_${p.description.substring(0, 160)}${p.description.length > 160 ? '...' : ''}_\n\n` +
       `🛡️ *Warranty:* ${p.warrantySummary}`
     );
+  }
+
+  private escapeMarkdownText(raw: string): string {
+    return String(raw || '').replace(/([_*`\[])/g, '\\$1');
+  }
+
+  /**
+   * Execute Binance TXID verification with guaranteed terminal Telegram response + safe Retry Verification button.
+   */
+  public async executeBinanceTxVerification(
+    chatId: number,
+    userId: string,
+    depositId: string,
+    submittedTxId: string,
+    lang: SupportedLanguage = 'en'
+  ): Promise<BinanceVerificationResult> {
+    const cleanTx = submittedTxId.trim();
+    const maskedTx = maskIdentifier(cleanTx);
+    const stageStart = Date.now();
+
+    if (depositId && cleanTx) {
+      await redis.set(`bin_last_tx:${userId}:${depositId}`, cleanTx, 3600).catch(() => {});
+    }
+
+    await telegramClient.sendMessage(chatId, `🔍 Verifying submitted Transaction ID \`${cleanTx}\`...`);
+
+    let res: BinanceVerificationResult;
+    try {
+      res = await binanceService.verifyDeposit(depositId, cleanTx, userId);
+    } catch (err: any) {
+      logger.error('Binance verification handler caught exception', {
+        depositId,
+        maskedTx,
+        error: err?.message || 'Unknown error',
+      });
+      res = {
+        verified: false,
+        classification: 'BINANCE_API_ERROR',
+        message: 'Verification could not complete due to a temporary server error. Zero credit was applied — please tap Retry Verification.',
+        sanitizedDetails: { retryable: true },
+      };
+    }
+
+    const sendStart = Date.now();
+    let tgRes: any;
+    if (res.verified) {
+      tgRes = await telegramClient.sendMessage(
+        chatId,
+        `✅ *PAYMENT VERIFIED!*\n\n${this.escapeMarkdownText(res.message)}`,
+        { reply_markup: getBackHomeKeyboard('m:wall', lang) }
+      );
+    } else {
+      const safeClassification = this.escapeMarkdownText(res.classification);
+      const safeMessage = this.escapeMarkdownText(res.message);
+
+      let replyMarkup: any;
+      if (res.classification === 'EXPIRED_INVOICE' || !depositId) {
+        replyMarkup = {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'ADD FUNDS (NEW INVOICE)',
+                fallbackEmoji: '➕',
+                style: 'primary',
+                callbackData: 'm:dep',
+                forceVisible: true,
+              }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
+            ]),
+          ],
+        };
+      } else if (res.classification === 'BINANCE_API_TIMEOUT' || res.classification === 'BINANCE_API_ERROR') {
+        replyMarkup = {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'RETRY VERIFICATION',
+                fallbackEmoji: '🔄',
+                style: 'primary',
+                callbackData: `bin_r:${depositId}`,
+                forceVisible: true,
+              }),
+            ]),
+            ...getBinanceInvoiceKeyboard(depositId, lang).inline_keyboard,
+          ],
+        };
+      } else {
+        replyMarkup = getBinanceInvoiceKeyboard(depositId, lang);
+      }
+
+      tgRes = await telegramClient.sendMessage(
+        chatId,
+        `⚠️ *VERIFICATION RESULT (${safeClassification})*\n\n${safeMessage}`,
+        { reply_markup: replyMarkup }
+      );
+    }
+
+    logger.info('Binance verification stage: telegram_final_response_sent', {
+      depositId,
+      maskedTx,
+      classification: res.classification,
+      verified: res.verified,
+      telegramOk: Boolean(tgRes?.ok),
+      telegramSendMs: Date.now() - sendStart,
+      totalHandlerMs: Date.now() - stageStart,
+    });
+
+    return res;
   }
 }
 

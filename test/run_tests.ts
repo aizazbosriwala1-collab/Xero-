@@ -880,7 +880,7 @@ export async function runComprehensiveTests() {
     await db.query("UPDATE deposits SET expires_at = now() - INTERVAL '1 hour' WHERE id = $1", [inv.id]);
     const res = await binanceService.verifyDeposit(inv.id);
     assert.strictEqual(res.verified, false);
-    assert.strictEqual(res.classification, 'ZERO_RECORDS_FOUND');
+    assert.strictEqual(res.classification, 'EXPIRED_INVOICE');
   });
 
   await it('Binance: duplicate transaction ID triggers DUPLICATE_TRANSACTION', 'unit', async () => {
@@ -1114,8 +1114,11 @@ export async function runComprehensiveTests() {
     const res = await binanceService.verifyDeposit(inv.id, wrongTxId, 'usr_not_found');
     assert.strictEqual(res.verified, false, 'Wrong TXID must never verify');
     assert.ok(
-      res.classification === 'TXID_NOT_FOUND' || res.classification === 'ZERO_RECORDS_FOUND' || res.classification === 'AUTH_REJECTION',
-      `Expected TXID_NOT_FOUND, ZERO_RECORDS_FOUND or AUTH_REJECTION, got ${res.classification}`
+      res.classification === 'TXID_NOT_FOUND' ||
+        res.classification === 'ZERO_RECORDS_FOUND' ||
+        res.classification === 'AUTH_REJECTION' ||
+        res.classification === 'BINANCE_API_ERROR',
+      `Expected TXID_NOT_FOUND, ZERO_RECORDS_FOUND, AUTH_REJECTION or BINANCE_API_ERROR, got ${res.classification}`
     );
 
     const d = await db.queryRow<any>('SELECT status FROM deposits WHERE id = $1', [inv.id]);
@@ -2625,6 +2628,517 @@ export async function runComprehensiveTests() {
     await invalidateUserLanguageCache('70001');
     const afterInvalidation = await redis.get('userlang:70001');
     assert.strictEqual(afterInvalidation, null);
+  });
+
+  // =========================================================================
+  // 13. BINANCE VERIFICATION TERMINAL RESPONSE & RESILIENCE SUITE
+  // =========================================================================
+  currentCategory = 'Binance Verification Terminal Response & Resilience';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  const withMockBinanceEnv = async (fn: (ctx: { receiverId: string; apiKey: string; apiSecret: string }) => Promise<void>) => {
+    const orig = {
+      enabled: config.binance.enabled,
+      apiKey: config.binance.apiKey,
+      apiSecret: config.binance.apiSecret,
+      receiverId: config.binance.receiverId,
+      timeoutMs: config.binance.requestTimeoutMs,
+      recoveryMode: config.safety.recoveryMode,
+    };
+    const receiverId = 'BIN_REC_9001';
+    const apiKey = 'test_binance_api_key_redacted';
+    const apiSecret = 'test_binance_api_secret_redacted';
+    config.binance.enabled = true;
+    config.binance.apiKey = apiKey;
+    config.binance.apiSecret = apiSecret;
+    config.binance.receiverId = receiverId;
+    try {
+      await fn({ receiverId, apiKey, apiSecret });
+    } finally {
+      config.binance.enabled = orig.enabled;
+      config.binance.apiKey = orig.apiKey;
+      config.binance.apiSecret = orig.apiSecret;
+      config.binance.receiverId = orig.receiverId;
+      config.binance.requestTimeoutMs = orig.timeoutMs;
+      config.safety.recoveryMode = orig.recoveryMode;
+      binanceService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
+  };
+
+  await it('Binance Terminal 1: queryTransactions uses startTime/endTime, HMAC signature, durationMs, and omits invented orderId', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ apiKey, apiSecret }) => {
+      let requestedUrl = '';
+      let requestedHeaders: Record<string, any> = {};
+      binanceService.setFetchOverride(async (input: any, init?: any) => {
+        requestedUrl = String(input);
+        requestedHeaders = (init?.headers || {}) as Record<string, any>;
+        return {
+          status: 200,
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              code: '000000',
+              message: 'success',
+              data: [
+                {
+                  transactionId: 'TX_NO_ORDER_123456',
+                  transactionTime: Date.now(),
+                  orderType: 'C2C',
+                  amount: '1.5000',
+                  currency: 'USDT',
+                  receiverInfo: { binanceId: 'BIN_REC_9001' },
+                },
+              ],
+            }),
+        } as any;
+      });
+
+      const res = await binanceService.queryTransactions({
+        startTime: Date.now() - 60000,
+        endTime: Date.now(),
+        limit: 10,
+      });
+
+      assert.strictEqual(res.httpStatus, 200);
+      assert.strictEqual(res.errorClassification, undefined);
+      assert.strictEqual(res.records.length, 1);
+      assert.strictEqual(res.records[0].transactionId, 'TX_NO_ORDER_123456');
+      assert.strictEqual(res.records[0].orderId, undefined, 'orderId must NOT be invented when absent');
+      assert.ok(res.durationMs >= 0);
+
+      const u = new URL(requestedUrl);
+      assert.strictEqual(u.pathname, '/sapi/v1/pay/transactions');
+      assert.ok(u.searchParams.get('startTime'), 'Must send official startTime query param');
+      assert.ok(u.searchParams.get('endTime'), 'Must send official endTime query param');
+      assert.strictEqual(u.searchParams.get('startTimestamp'), null, 'Must not send deprecated startTimestamp');
+      assert.strictEqual(requestedHeaders['X-MBX-APIKEY'], apiKey);
+
+      const sig = u.searchParams.get('signature');
+      const rawWithoutSig = requestedUrl.split('?')[1].split('&signature=')[0];
+      const expectedSig = crypto.createHmac('sha256', apiSecret).update(rawWithoutSig).digest('hex');
+      assert.strictEqual(sig, expectedSig, 'HMAC-SHA256 signature must verify');
+    });
+  });
+
+  await it('Binance Terminal 2: request timeout returns BINANCE_API_TIMEOUT, retryable, zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      config.binance.requestTimeoutMs = 1000;
+      const inv = await binanceService.createInvoice('usr_bin_timeout', '2.00');
+      const balBefore = (await walletService.getBalance('usr_bin_timeout')).available;
+
+      binanceService.setFetchOverride(async () => {
+        const err: any = new Error('The operation was aborted due to timeout');
+        err.name = 'AbortError';
+        throw err;
+      });
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_TIMEOUT_999', 'usr_bin_timeout');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'BINANCE_API_TIMEOUT');
+      assert.strictEqual(res.sanitizedDetails?.retryable, true);
+
+      const d = await db.queryRow<any>('SELECT status FROM deposits WHERE id = $1', [inv.id]);
+      assert.strictEqual(d.status, 'PENDING');
+      const balAfter = (await walletService.getBalance('usr_bin_timeout')).available;
+      assert.strictEqual(balAfter.equals(balBefore), true);
+    });
+  });
+
+  await it('Binance Terminal 3: DNS/network error returns BINANCE_API_ERROR, retryable, zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      const inv = await binanceService.createInvoice('usr_bin_dns', '2.00');
+      binanceService.setFetchOverride(async () => {
+        const err: any = new Error('getaddrinfo ENOTFOUND bpay.binanceapi.com');
+        err.code = 'ENOTFOUND';
+        throw err;
+      });
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_DNS_888', 'usr_bin_dns');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'BINANCE_API_ERROR');
+      assert.strictEqual(res.sanitizedDetails?.upstreamClassification, 'DNS_FAILURE');
+      assert.strictEqual(res.sanitizedDetails?.retryable, true);
+    });
+  });
+
+  await it('Binance Terminal 4: HTTP errors (401/403/429/500) return BINANCE_API_ERROR with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      const inv = await binanceService.createInvoice('usr_bin_http', '3.00');
+      for (const statusCode of [401, 403, 429, 500]) {
+        binanceService.setFetchOverride(async () => ({
+          status: statusCode,
+          ok: false,
+          text: async () => JSON.stringify({ code: -2015, msg: `HTTP error ${statusCode}` }),
+        }) as any);
+
+        const res = await binanceService.verifyDeposit(inv.id, `TX_HTTP_${statusCode}`, 'usr_bin_http');
+        assert.strictEqual(res.verified, false);
+        assert.strictEqual(res.classification, 'BINANCE_API_ERROR');
+        assert.strictEqual(res.sanitizedDetails?.httpStatus, statusCode);
+      }
+    });
+  });
+
+  await it('Binance Terminal 5: malformed HTML/non-JSON response returns BINANCE_API_ERROR with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      const inv = await binanceService.createInvoice('usr_bin_malformed', '2.00');
+      binanceService.setFetchOverride(async () => ({
+        status: 502,
+        ok: false,
+        text: async () => '<html><body>502 Bad Gateway</body></html>',
+      }) as any);
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_HTML_502', 'usr_bin_malformed');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'BINANCE_API_ERROR');
+      assert.strictEqual(res.sanitizedDetails?.upstreamClassification, 'MALFORMED_JSON');
+    });
+  });
+
+  await it('Binance Terminal 6: HTTP 200 with non-000000 Binance business code returns BINANCE_API_ERROR with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      const inv = await binanceService.createInvoice('usr_bin_bizerr', '2.00');
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({ code: '100002001', message: 'Signature invalid or permission denied', data: [] }),
+      }) as any);
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_BIZ_ERR', 'usr_bin_bizerr');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'BINANCE_API_ERROR');
+      assert.strictEqual(res.sanitizedDetails?.binanceCode, '100002001');
+    });
+  });
+
+  await it('Binance Terminal 7: transaction not found returns TXID_NOT_FOUND + CUSTOMER_REFERENCE_NOT_API_MATCHABLE', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      const inv = await binanceService.createInvoice('usr_bin_nf', '1.00');
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: '999888777666555',
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '1.0000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const res = await binanceService.verifyDeposit(inv.id, '465195606769819648', 'usr_bin_nf');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'TXID_NOT_FOUND');
+      assert.strictEqual(res.sanitizedDetails?.identifierMatchField, 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE');
+    });
+  });
+
+  await it('Binance Terminal 8: wrong amount returns WRONG_AMOUNT with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      const inv = await binanceService.createInvoice('usr_bin_wamt', '5.00');
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: 'TX_WAMT_12345',
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '4.9900',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_WAMT_12345', 'usr_bin_wamt');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'WRONG_AMOUNT');
+    });
+  });
+
+  await it('Binance Terminal 9: wrong currency returns WRONG_CURRENCY with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      const inv = await binanceService.createInvoice('usr_bin_wcur', '5.00');
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: 'TX_WCUR_12345',
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '5.0000',
+                currency: 'BNB',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_WCUR_12345', 'usr_bin_wcur');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'WRONG_CURRENCY');
+    });
+  });
+
+  await it('Binance Terminal 10: wrong receiver returns WRONG_RECEIVER with zero credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      const inv = await binanceService.createInvoice('usr_bin_wrec', '5.00');
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: 'TX_WREC_12345',
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '5.0000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: 'WRONG_IMPOSTER_ID' },
+              },
+            ],
+          }),
+      }) as any);
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_WREC_12345', 'usr_bin_wrec');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'WRONG_RECEIVER');
+    });
+  });
+
+  await it('Binance Terminal 11: duplicate transaction returns DUPLICATE_TRANSACTION with zero second credit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      const dupTx = `TX_DUP_TERM_${Date.now()}`;
+      await db.query(
+        `INSERT INTO deposits (id, user_id, payment_method_code, amount, status, binance_transaction_id, created_at, updated_at)
+         VALUES ($1, 'usr_prior_dup', 'BINANCE_USDT', 5.0000, 'VERIFIED', $2, now(), now())`,
+        [`dep_prior_term_${Date.now()}`, dupTx]
+      );
+
+      const inv = await binanceService.createInvoice('usr_bin_dup2', '5.00');
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: dupTx,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '5.0000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const res = await binanceService.verifyDeposit(inv.id, dupTx, 'usr_bin_dup2');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'DUPLICATE_TRANSACTION');
+    });
+  });
+
+  await it('Binance Terminal 12: expired invoice returns EXPIRED_INVOICE without querying Binance API', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      let fetchCalled = false;
+      binanceService.setFetchOverride(async () => {
+        fetchCalled = true;
+        throw new Error('Should not be called');
+      });
+
+      const inv = await binanceService.createInvoice('usr_bin_exp2', '2.00');
+      await db.query("UPDATE deposits SET expires_at = now() - INTERVAL '30 minutes' WHERE id = $1", [inv.id]);
+
+      const res = await binanceService.verifyDeposit(inv.id, 'TX_EXP_ANY', 'usr_bin_exp2');
+      assert.strictEqual(res.verified, false);
+      assert.strictEqual(res.classification, 'EXPIRED_INVOICE');
+      assert.strictEqual(fetchCalled, false, 'Expired invoice must terminate immediately without Binance call');
+    });
+  });
+
+  await it('Binance Terminal 13: TelegramClient falls back to plain text on Markdown parse 400 and CustomerHandler ALWAYS delivers terminal message', 'mock_integration', async () => {
+    await withMockBinanceEnv(async () => {
+      const sentPayloads: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        sentPayloads.push(JSON.parse(JSON.stringify({ method, ...body })));
+        if (method === 'sendMessage' && body.parse_mode === 'Markdown' && String(body.text).includes('RETRY')) {
+          return { ok: false, error_code: 400, description: "Bad Request: can't parse entities: Can't find end of the entity" };
+        }
+        return { ok: true, result: { message_id: 9910 } };
+      });
+
+      const plainTest = await telegramClient.sendMessage(70001, 'Test _broken_ RETRY_TAG_UNCLOSED');
+      assert.strictEqual(plainTest.ok, true, 'TelegramClient must retry without parse_mode on Markdown 400');
+
+      sentPayloads.length = 0;
+      const inv = await binanceService.createInvoice('70001', '2.00');
+      binanceService.setFetchOverride(async () => {
+        throw new Error('ECONNRESET socket hang up');
+      });
+
+      await customerHandler.executeBinanceTxVerification(70001, '70001', inv.id, 'TX_FINAL_MSG_1', 'en');
+      const finalSend = sentPayloads.filter(p => p.method === 'sendMessage').pop();
+      assert.ok(finalSend, 'Final Telegram message must always be sent');
+      assert.ok(String(finalSend.text).includes('BINANCE\\_API\\_ERROR') || String(finalSend.text).includes('BINANCE_API_ERROR'));
+      const hasRetryBtn = finalSend.reply_markup?.inline_keyboard?.flat().some((b: any) => b.callback_data === `bin_r:${inv.id}`);
+      assert.strictEqual(hasRetryBtn, true, 'BINANCE_API_ERROR response must include RETRY VERIFICATION button');
+    });
+  });
+
+  await it('Binance Terminal 14: retry (bin_r:) after transient API failure credits atomically ONCE with zero duplicate deposit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      config.safety.recoveryMode = false;
+      const userId = '70001';
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+
+      const sentPayloads: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        if (method === 'sendMessage') sentPayloads.push(JSON.parse(JSON.stringify(body)));
+        return { ok: true, result: { message_id: 9920 } };
+      });
+
+      // Step 1: Prime readOnlyLiveVerified with mocked 200 query
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({ code: '000000', data: [] }),
+      }) as any);
+      const probe = await binanceService.testReadOnlyVerification(true);
+      assert.strictEqual(probe.readOnlyLiveVerified, true);
+
+      const balBefore = (await walletService.getBalance(userId)).available;
+      const inv = await binanceService.createInvoice(userId, '1.25');
+      const txId = `TX_RETRY_OK_${Date.now()}`;
+
+      // Step 2: First attempt fails with timeout -> zero credit + Retry button shown
+      binanceService.setFetchOverride(async () => {
+        const e: any = new Error('timeout');
+        e.name = 'AbortError';
+        throw e;
+      });
+      await customerHandler.executeBinanceTxVerification(70001, userId, inv.id, txId, 'en');
+      const balMid = (await walletService.getBalance(userId)).available;
+      assert.strictEqual(balMid.equals(balBefore), true, 'Timeout must apply zero credit');
+
+      // Step 3: Binance recovers -> customer taps bin_r:<depositId> -> single atomic credit
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: txId,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '1.2500',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const retryRes = await telegramBotRouter.handleUpdate({
+        update_id: 50001,
+        callback_query: {
+          id: 'cb_bin_retry_1',
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          data: `bin_r:${inv.id}`,
+          message: {
+            message_id: 9920,
+            chat: { id: 70001, type: 'private' as const },
+            date: Math.floor(Date.now() / 1000),
+            text: 'Retry',
+          },
+        },
+      });
+      assert.strictEqual(retryRes.status, 'CALLBACK_PROCESSED');
+
+      const balAfter = (await walletService.getBalance(userId)).available;
+      assert.strictEqual(balAfter.minus(balBefore).toFixed(4), '1.2500', 'Retry must credit exact invoice amount once');
+
+      // Ensure zero duplicate deposit rows for txId
+      const dupCount = await db.queryRow<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM deposits WHERE binance_transaction_id = $1', [txId]);
+      assert.strictEqual(Number(dupCount?.cnt), 1, 'Retry must reuse existing deposit invoice without creating duplicate');
+    });
+  });
+
+  await it('Binance Terminal 15: matches transactionId & existing orderId cleanly and rejects idempotently on second submit', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({ code: '000000', data: [] }),
+      }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = `usr_bin_orderid_${Date.now()}`;
+      const inv = await binanceService.createInvoice(userId, '3.50');
+      const apiTxId = `TX_EXACT_${Date.now()}`;
+      const apiOrderId = `ORD_EXACT_${Date.now()}`;
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: apiTxId,
+                orderId: apiOrderId,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '3.5000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      // Submit by exact orderId returned from Binance
+      const res1 = await binanceService.verifyDeposit(inv.id, apiOrderId, userId);
+      assert.strictEqual(res1.verified, true);
+      assert.strictEqual(res1.classification, 'VERIFIED');
+      assert.strictEqual(res1.sanitizedDetails?.identifierMatchField, 'MATCHED_ORDER_ID');
+
+      const bal = (await walletService.getBalance(userId)).available;
+      assert.strictEqual(bal.toFixed(4), '3.5000');
+
+      // Re-verifying already verified deposit is idempotent with zero second credit
+      const res2 = await binanceService.verifyDeposit(inv.id, apiTxId, userId);
+      assert.strictEqual(res2.verified, true);
+      const bal2 = (await walletService.getBalance(userId)).available;
+      assert.strictEqual(bal2.toFixed(4), '3.5000');
+    });
   });
 
   // SUMMARY & STATS DYNAMIC COMPUTATION

@@ -32,7 +32,7 @@ export const REGISTERED_CUSTOMER_CALLBACKS = {
     'm:lang',
     'm:api',
   ]),
-  prefixes: ['nav:', 'catp:', 'feat:', 'srch:', 'cat:', 'p:', 'qty:', 'buy:', 'buyc:', 'det:', 'bin_tx:', 'gw_cl:', 'lang:'],
+  prefixes: ['nav:', 'catp:', 'feat:', 'srch:', 'cat:', 'p:', 'qty:', 'buy:', 'buyc:', 'det:', 'bin_tx:', 'bin_r:', 'gw_cl:', 'lang:'],
 };
 
 export const REGISTERED_ADMIN_CALLBACKS = {

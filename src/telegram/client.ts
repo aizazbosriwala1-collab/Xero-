@@ -275,6 +275,25 @@ export class TelegramClient {
     if (res?.ok) return res;
 
     const desc = String(res?.description || '');
+    const lowerDesc = desc.toLowerCase();
+
+    // Critical delivery safeguard: if Telegram rejects Markdown entities (e.g. underscores in classifications/error strings),
+    // retry immediately as plain text without parse_mode so terminal customer responses NEVER disappear!
+    if (
+      (method === 'sendMessage' || method === 'editMessageText') &&
+      preparedBody.parse_mode &&
+      (lowerDesc.includes('parse entities') || lowerDesc.includes("can't find end of the entity"))
+    ) {
+      logger.warn('Telegram rejected Markdown entities; retrying as plain text to guarantee delivery', {
+        method,
+        description: desc,
+      });
+      const plainBody = { ...preparedBody };
+      delete plainBody.parse_mode;
+      const plainRes = await this.postRaw(method, plainBody);
+      if (plainRes?.ok) return plainRes;
+    }
+
     const markup = preparedBody.reply_markup as TelegramInlineKeyboardMarkup | TelegramReplyKeyboardMarkup | undefined;
 
     if (markup && (method === 'sendMessage' || method === 'editMessageText' || method === 'editMessageReplyMarkup')) {
