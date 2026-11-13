@@ -52,6 +52,9 @@ export const REGISTERED_ADMIN_CALLBACKS = {
     'adm:ui_imp',
     'adm:ui_rst_all',
     'adm:ui_rst_all_c',
+    'adm:bin_diag',
+    'adm:bin_diag_run',
+    'adm:bin_diag_clr',
   ]),
   prefixes: [
     'adm:cat_tog:',

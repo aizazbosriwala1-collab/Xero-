@@ -82,6 +82,59 @@ export interface BinanceInvoice {
   transactionId?: string;
 }
 
+export const BINANCE_DIAGNOSTIC_FIXED_WINDOW = {
+  startTime: 1794581745000, // 2026-11-13T14:55:45.000Z
+  endTime: 1794582945000,   // 2026-11-13T15:15:45.000Z
+  limit: 100,
+  targetAmount: '0.2',
+  targetCurrency: 'USDT',
+} as const;
+
+export type BinanceDiagnosticConclusion =
+  | 'MATCHED_TRANSACTION_ID'
+  | 'MATCHED_ORDER_ID'
+  | 'MATCHED_ORDER_NO'
+  | 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE'
+  | 'PAYMENT_RECORD_FOUND_BUT_NO_COMPARABLE_IDENTIFIER'
+  | 'NO_RELEVANT_0_2_USDT_RECORD'
+  | 'BINANCE_API_REJECTED'
+  | 'BINANCE_API_TIMEOUT';
+
+export interface BinanceDiagnosticCandidate {
+  transactionTime: number;
+  amount: string;
+  currency: string;
+  orderType: string;
+  direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN';
+  receiverMatch: 'YES' | 'NO' | 'UNKNOWN';
+  transactionIdPresent: 'YES' | 'NO';
+  maskedTransactionId: string;
+  orderIdPresent: 'YES' | 'NO';
+  maskedOrderId?: string;
+  orderNoPresent: 'YES' | 'NO';
+  maskedOrderNo?: string;
+  presentIdentifierKeys: string[];
+}
+
+export interface BinanceReadOnlyDiagnosticResult {
+  mode: 'READ_ONLY';
+  walletMutation: 'IMPOSSIBLE';
+  windowStartMs: number;
+  windowEndMs: number;
+  windowStartIso: string;
+  windowEndIso: string;
+  httpStatus: number;
+  binanceCode: string | null;
+  binanceMessage: string | null;
+  recordsReturned: number;
+  relevantRecordsCount: number;
+  candidates: BinanceDiagnosticCandidate[];
+  identifierConclusion: BinanceDiagnosticConclusion;
+  durationMs: number;
+  success: boolean;
+  errorClassification?: string;
+}
+
 export type FetchLike = typeof fetch;
 
 export function maskIdentifier(id?: string | null): string {
@@ -1193,6 +1246,220 @@ export class BinanceService {
       readOnlyLiveVerified: this.readOnlyLiveVerified,
       automaticCreditEnabled: readiness.automaticCreditEnabled,
     };
+  }
+
+  private sanitizeDiagnosticMessage(msg?: string | null): string | null {
+    if (!msg) return null;
+    return String(msg)
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(/[<>`*_\[\\]/g, '')
+      .trim()
+      .slice(0, 120);
+  }
+
+  /**
+   * TEMPORARY ADMIN-ONLY STRICTLY READ-ONLY BINANCE HISTORY DIAGNOSTIC
+   *
+   * Structurally isolated from wallet credits, ledger entries, deposits, orders, or any DB mutations.
+   * Calls ONLY official signed GET /sapi/v1/pay/transactions and returns sanitized fields only.
+   */
+  public async inspectPayHistoryReadOnly(
+    startTime: number,
+    endTime: number,
+    submittedReference?: string
+  ): Promise<BinanceReadOnlyDiagnosticResult> {
+    const startedAt = Date.now();
+    const safeStart = Number(startTime);
+    const safeEnd = Number(endTime);
+    const windowStartIso = Number.isFinite(safeStart) ? new Date(safeStart).toISOString() : '';
+    const windowEndIso = Number.isFinite(safeEnd) ? new Date(safeEnd).toISOString() : '';
+    const normalizedRef = typeof submittedReference === 'string' ? submittedReference.trim() : '';
+
+    try {
+      const apiRes = await this.queryTransactions({
+        startTime: safeStart,
+        endTime: safeEnd,
+        limit: BINANCE_DIAGNOSTIC_FIXED_WINDOW.limit,
+      });
+
+      if (apiRes.errorClassification) {
+        const isTimeout = this.isTimeoutClassification(apiRes.errorClassification);
+        const conclusion: BinanceDiagnosticConclusion = isTimeout ? 'BINANCE_API_TIMEOUT' : 'BINANCE_API_REJECTED';
+        return {
+          mode: 'READ_ONLY',
+          walletMutation: 'IMPOSSIBLE',
+          windowStartMs: safeStart,
+          windowEndMs: safeEnd,
+          windowStartIso,
+          windowEndIso,
+          httpStatus: apiRes.httpStatus,
+          binanceCode: apiRes.binanceCode ? String(apiRes.binanceCode) : null,
+          binanceMessage: this.sanitizeDiagnosticMessage(apiRes.binanceMessage || apiRes.errorMessage),
+          recordsReturned: 0,
+          relevantRecordsCount: 0,
+          candidates: [],
+          identifierConclusion: conclusion,
+          durationMs: Date.now() - startedAt,
+          success: false,
+          errorClassification: apiRes.errorClassification,
+        };
+      }
+
+      const rawList: any[] = Array.isArray(apiRes.raw?.data)
+        ? apiRes.raw.data
+        : Array.isArray(apiRes.raw?.records)
+          ? apiRes.raw.records
+          : [];
+
+      const targetAmount = new Decimal(BINANCE_DIAGNOSTIC_FIXED_WINDOW.targetAmount);
+      const targetCurrency = BINANCE_DIAGNOSTIC_FIXED_WINDOW.targetCurrency;
+      const configuredReceiver = (this.getReceiverId() || '').trim().toLowerCase();
+
+      const candidates: BinanceDiagnosticCandidate[] = [];
+      let matchedConclusion: BinanceDiagnosticConclusion | null = null;
+      let anyComparablePresent = false;
+
+      for (const rawItem of rawList) {
+        if (!rawItem || typeof rawItem !== 'object') continue;
+
+        const txTime = Number(rawItem.transactionTime ?? rawItem.orderTime ?? NaN);
+        if (!Number.isFinite(txTime) || txTime < safeStart || txTime > safeEnd) continue;
+
+        const currency = String(rawItem.currency || '').trim().toUpperCase();
+        if (currency !== targetCurrency) continue;
+
+        let amountDec: Decimal;
+        try {
+          amountDec = new Decimal(rawItem.amount ?? 'NaN');
+        } catch {
+          continue;
+        }
+        if (amountDec.isNaN() || !amountDec.equals(targetAmount)) continue;
+
+        const orderType = String(rawItem.orderType || '').trim();
+        const otUpper = orderType.toUpperCase();
+        const direction: 'INCOMING' | 'OUTGOING' | 'UNKNOWN' =
+          otUpper.includes('PAYOUT') || otUpper.includes('WITHDRAW') || otUpper.includes('OUT')
+            ? 'OUTGOING'
+            : otUpper
+              ? 'INCOMING'
+              : 'UNKNOWN';
+
+        if (direction === 'OUTGOING') continue;
+
+        const recBinanceIdRaw = rawItem.receiverInfo?.binanceId;
+        const recBinanceId =
+          recBinanceIdRaw !== undefined && recBinanceIdRaw !== null ? String(recBinanceIdRaw).trim().toLowerCase() : '';
+        const receiverMatch: 'YES' | 'NO' | 'UNKNOWN' =
+          configuredReceiver && recBinanceId ? (recBinanceId === configuredReceiver ? 'YES' : 'NO') : 'UNKNOWN';
+
+        if (receiverMatch === 'NO') continue;
+
+        const rawTxId =
+          rawItem.transactionId !== undefined && rawItem.transactionId !== null
+            ? String(rawItem.transactionId).trim()
+            : '';
+        const rawOrdId =
+          rawItem.orderId !== undefined && rawItem.orderId !== null
+            ? String(rawItem.orderId).trim()
+            : '';
+        const rawOrdNo =
+          rawItem.orderNo !== undefined && rawItem.orderNo !== null
+            ? String(rawItem.orderNo).trim()
+            : '';
+
+        const presentIdentifierKeys = Object.keys(rawItem).filter((k) => {
+          if (k === 'payerId' || k === 'receiverId' || k === 'userId' || k === 'uid') return false;
+          if (!/^[a-zA-Z0-9_]{1,40}$/.test(k)) return false;
+          if (!(k.endsWith('Id') || k === 'orderNo')) return false;
+          const val = rawItem[k];
+          return val !== undefined && val !== null && String(val).trim() !== '';
+        });
+
+        const txPresent = rawTxId.length > 0;
+        const ordIdPresent = rawOrdId.length > 0;
+        const ordNoPresent = rawOrdNo.length > 0;
+
+        if (txPresent || ordIdPresent || ordNoPresent) {
+          anyComparablePresent = true;
+        }
+
+        if (normalizedRef && !matchedConclusion) {
+          const normLower = normalizedRef.toLowerCase();
+          if (txPresent && rawTxId.toLowerCase() === normLower) {
+            matchedConclusion = 'MATCHED_TRANSACTION_ID';
+          } else if (ordIdPresent && rawOrdId.toLowerCase() === normLower) {
+            matchedConclusion = 'MATCHED_ORDER_ID';
+          } else if (ordNoPresent && rawOrdNo.toLowerCase() === normLower) {
+            matchedConclusion = 'MATCHED_ORDER_NO';
+          }
+        }
+
+        candidates.push({
+          transactionTime: txTime,
+          amount: amountDec.toFixed(),
+          currency,
+          orderType: orderType || 'UNKNOWN',
+          direction,
+          receiverMatch,
+          transactionIdPresent: txPresent ? 'YES' : 'NO',
+          maskedTransactionId: txPresent ? maskIdentifier(rawTxId) : 'NONE',
+          orderIdPresent: ordIdPresent ? 'YES' : 'NO',
+          ...(ordIdPresent ? { maskedOrderId: maskIdentifier(rawOrdId) } : {}),
+          orderNoPresent: ordNoPresent ? 'YES' : 'NO',
+          ...(ordNoPresent ? { maskedOrderNo: maskIdentifier(rawOrdNo) } : {}),
+          presentIdentifierKeys,
+        });
+      }
+
+      let identifierConclusion: BinanceDiagnosticConclusion;
+      if (candidates.length === 0) {
+        identifierConclusion = 'NO_RELEVANT_0_2_USDT_RECORD';
+      } else if (matchedConclusion) {
+        identifierConclusion = matchedConclusion;
+      } else if (!anyComparablePresent) {
+        identifierConclusion = 'PAYMENT_RECORD_FOUND_BUT_NO_COMPARABLE_IDENTIFIER';
+      } else {
+        identifierConclusion = 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE';
+      }
+
+      return {
+        mode: 'READ_ONLY',
+        walletMutation: 'IMPOSSIBLE',
+        windowStartMs: safeStart,
+        windowEndMs: safeEnd,
+        windowStartIso,
+        windowEndIso,
+        httpStatus: apiRes.httpStatus,
+        binanceCode: apiRes.binanceCode ? String(apiRes.binanceCode) : null,
+        binanceMessage: this.sanitizeDiagnosticMessage(apiRes.binanceMessage || 'success'),
+        recordsReturned: rawList.length,
+        relevantRecordsCount: candidates.length,
+        candidates,
+        identifierConclusion,
+        durationMs: Date.now() - startedAt,
+        success: true,
+      };
+    } catch (err: any) {
+      return {
+        mode: 'READ_ONLY',
+        walletMutation: 'IMPOSSIBLE',
+        windowStartMs: safeStart,
+        windowEndMs: safeEnd,
+        windowStartIso,
+        windowEndIso,
+        httpStatus: 0,
+        binanceCode: null,
+        binanceMessage: this.sanitizeDiagnosticMessage(err?.message || 'Unexpected diagnostic error'),
+        recordsReturned: 0,
+        relevantRecordsCount: 0,
+        candidates: [],
+        identifierConclusion: 'BINANCE_API_REJECTED',
+        durationMs: Date.now() - startedAt,
+        success: false,
+        errorClassification: 'DIAGNOSTIC_EXCEPTION',
+      };
+    }
   }
 }
 

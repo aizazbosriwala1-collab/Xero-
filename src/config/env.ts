@@ -26,6 +26,7 @@ export interface AppConfig {
     requestTimeoutMs: number;
     minDepositUsdt: number;
     maxDepositUsdt: number;
+    diagnosticEnabled: boolean;
   };
   safety: {
     recoveryMode: boolean;
@@ -65,6 +66,7 @@ export const config: AppConfig = {
     requestTimeoutMs: parseInt(process.env.BINANCE_REQUEST_TIMEOUT_MS || '10000', 10),
     minDepositUsdt: parseFloat(process.env.BINANCE_MIN_DEPOSIT_USDT || '0.10'),
     maxDepositUsdt: parseFloat(process.env.BINANCE_MAX_DEPOSIT_USDT || '10000.00'),
+    diagnosticEnabled: process.env.BINANCE_DIAGNOSTIC_ENABLED === 'true',
   },
   safety: {
     recoveryMode: process.env.RECOVERY_MODE !== 'false', // Defaults to true
@@ -108,6 +110,7 @@ export function getSanitizedConfig(): Record<string, unknown> {
       recvWindowMs: config.binance.recvWindowMs,
       requestTimeoutMs: config.binance.requestTimeoutMs,
       limits: `${config.binance.minDepositUsdt} - ${config.binance.maxDepositUsdt} USDT`,
+      diagnosticEnabled: config.binance.diagnosticEnabled,
     },
     safety: { ...config.safety },
   };

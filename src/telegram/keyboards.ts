@@ -6,6 +6,7 @@ import {
 import { ButtonBuilder } from './buttonBuilder.js';
 import { SupportedLanguage, t } from '../services/i18n.js';
 import { uiConfigService, UISection, UISettingRecord } from '../services/uiConfig.js';
+import { config } from '../config/env.js';
 
 function filterNonEmptyRows(rows: TelegramInlineKeyboardButton[][]): TelegramInlineKeyboardButton[][] {
   return rows.filter(r => r.length > 0);
@@ -597,6 +598,19 @@ export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): Telegr
         ButtonBuilder.buildButton({ text: 'SUPPLIER SYNC', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sync' }),
         ButtonBuilder.buildButton({ text: 'SYSTEM HEALTH', fallbackEmoji: '🩺', style: 'default', callbackData: 'adm:hlth' }),
       ]),
+      ...(config.binance.diagnosticEnabled
+        ? [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'BINANCE HISTORY DIAGNOSTIC',
+                fallbackEmoji: '🔬',
+                style: 'primary',
+                callbackData: 'adm:bin_diag',
+                forceVisible: true,
+              }),
+            ]),
+          ]
+        : []),
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ settingKey: 'btn.adm.exit', lang, callbackData: 'm:home', forceVisible: true }),
       ]),

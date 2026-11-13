@@ -4,7 +4,12 @@ import { config, getSanitizedConfig } from '../../config/env.js';
 import { supplierService } from '../../services/supplier.js';
 import { pricingService } from '../../services/pricing.js';
 import { manualPaymentService } from '../../services/manualPayment.js';
-import { binanceService } from '../../services/binance.js';
+import {
+  binanceService,
+  BINANCE_DIAGNOSTIC_FIXED_WINDOW,
+  BinanceReadOnlyDiagnosticResult,
+  maskIdentifier,
+} from '../../services/binance.js';
 import { uiConfigService, UISection, UISettingRecord } from '../../services/uiConfig.js';
 import { SupportedLanguage } from '../../services/i18n.js';
 import { ButtonBuilder } from '../buttonBuilder.js';
@@ -556,6 +561,116 @@ export class AdminHandler {
     }
 
     // =========================================================================
+    // TEMPORARY ADMIN-ONLY READ-ONLY BINANCE HISTORY DIAGNOSTIC
+    // =========================================================================
+
+    if (data === 'adm:bin_diag') {
+      if (!config.binance.diagnosticEnabled) {
+        await redis.clearFsmState(userId);
+        await redis.del(`adm_bin_diag_ref:${userId}`).catch(() => {});
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          '🔒 *DIAGNOSTIC DISABLED*\n\nThis temporary Binance read-only diagnostic is disabled (`BINANCE_DIAGNOSTIC_ENABLED=false`).',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'ADMIN MENU', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      await redis.setFsmState(
+        userId,
+        { step: 'ADMIN_BINANCE_DIAG_ORDER_ID', data: { fixedWindow: true } },
+        300
+      );
+
+      const prompt =
+        `🔬 *BINANCE READ-ONLY HISTORY DIAGNOSTIC*\n\n` +
+        `• Mode: \`READ-ONLY\`\n` +
+        `• Wallet Mutation: \`IMPOSSIBLE\`\n` +
+        `• Fixed Window:\n` +
+        `\`2026-11-13 14:55:45Z\`\n` +
+        `to\n` +
+        `\`2026-11-13 15:15:45Z\`\n\n` +
+        `Please enter the customer-visible Binance *Order ID* to compare against official Binance API records.\n\n` +
+        `_Held temporarily in short-TTL Redis state only (never stored in PostgreSQL)._`;
+
+      await telegramClient.editMessageText(chatId, messageId, prompt, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'CLEAR DIAGNOSTIC STATE', fallbackEmoji: '🧹', style: 'default', callbackData: 'adm:bin_diag_clr', forceVisible: true }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'ADMIN MENU', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    if (data === 'adm:bin_diag_run') {
+      if (!config.binance.diagnosticEnabled) {
+        await redis.clearFsmState(userId);
+        await redis.del(`adm_bin_diag_ref:${userId}`).catch(() => {});
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          '🔒 *DIAGNOSTIC DISABLED*\n\nTemporary Binance history diagnostic is disabled (`BINANCE_DIAGNOSTIC_ENABLED=false`).',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'ADMIN MENU', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      const cachedRef = (await redis.get(`adm_bin_diag_ref:${userId}`).catch(() => null)) || '';
+      await this.executeAdminBinanceDiagnostic(chatId, userId, cachedRef);
+      return;
+    }
+
+    if (data === 'adm:bin_diag_clr') {
+      await redis.clearFsmState(userId);
+      await redis.del(`adm_bin_diag_ref:${userId}`).catch(() => {});
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        '🧹 *DIAGNOSTIC STATE CLEARED*\n\nTemporary diagnostic reference and FSM state removed.',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ...(config.binance.diagnosticEnabled
+                ? [
+                    ButtonBuilder.buildActionRow([
+                      ButtonBuilder.buildButton({ text: 'BINANCE HISTORY DIAGNOSTIC', fallbackEmoji: '🔬', style: 'primary', callbackData: 'adm:bin_diag', forceVisible: true }),
+                    ]),
+                  ]
+                : []),
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'ADMIN MENU', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    // =========================================================================
     // ADMIN UI CUSTOMIZATION CENTER
     // =========================================================================
 
@@ -875,6 +990,218 @@ export class AdminHandler {
       }
       return;
     }
+
+    if (fsm.step === 'ADMIN_BINANCE_DIAG_ORDER_ID') {
+      await redis.clearFsmState(userId);
+      if (!config.binance.diagnosticEnabled) {
+        await redis.del(`adm_bin_diag_ref:${userId}`).catch(() => {});
+        await telegramClient.sendMessage(
+          chatId,
+          '🔒 *DIAGNOSTIC DISABLED*\n\nTemporary Binance history diagnostic is disabled (`BINANCE_DIAGNOSTIC_ENABLED=false`).',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'ADMIN MENU', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      const normalizedOrderId = text.trim();
+      if (normalizedOrderId) {
+        await redis.set(`adm_bin_diag_ref:${userId}`, normalizedOrderId, 300).catch(() => {});
+      }
+      await this.executeAdminBinanceDiagnostic(chatId, userId, normalizedOrderId);
+      return;
+    }
+  }
+
+  private escapeDiagMarkdown(val: string): string {
+    return String(val || '').replace(/([_*`\[])/g, '\\$1');
+  }
+
+  private getDiagnosticActionKeyboard() {
+    return {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'RUN READ-ONLY AGAIN',
+            fallbackEmoji: '🔄',
+            style: 'primary',
+            callbackData: 'adm:bin_diag_run',
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'CLEAR DIAGNOSTIC STATE',
+            fallbackEmoji: '🧹',
+            style: 'default',
+            callbackData: 'adm:bin_diag_clr',
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'ADMIN MENU',
+            fallbackEmoji: '⬅️',
+            style: 'default',
+            callbackData: 'adm:main',
+            forceVisible: true,
+          }),
+        ]),
+      ],
+    };
+  }
+
+  /**
+   * Execute temporary admin-only read-only Binance history diagnostic with guaranteed terminal response.
+   */
+  public async executeAdminBinanceDiagnostic(
+    chatId: number,
+    userId: string,
+    submittedReference = ''
+  ): Promise<BinanceReadOnlyDiagnosticResult> {
+    if (!this.checkAuthorization(userId)) {
+      await telegramClient.sendMessage(chatId, '⛔ *ACCESS DENIED*');
+      throw new Error('Unauthorized admin diagnostic execution');
+    }
+
+    if (!config.binance.diagnosticEnabled) {
+      const blocked: BinanceReadOnlyDiagnosticResult = {
+        mode: 'READ_ONLY',
+        walletMutation: 'IMPOSSIBLE',
+        windowStartMs: BINANCE_DIAGNOSTIC_FIXED_WINDOW.startTime,
+        windowEndMs: BINANCE_DIAGNOSTIC_FIXED_WINDOW.endTime,
+        windowStartIso: new Date(BINANCE_DIAGNOSTIC_FIXED_WINDOW.startTime).toISOString(),
+        windowEndIso: new Date(BINANCE_DIAGNOSTIC_FIXED_WINDOW.endTime).toISOString(),
+        httpStatus: 0,
+        binanceCode: null,
+        binanceMessage: 'Feature flag BINANCE_DIAGNOSTIC_ENABLED is false',
+        recordsReturned: 0,
+        relevantRecordsCount: 0,
+        candidates: [],
+        identifierConclusion: 'BINANCE_API_REJECTED',
+        durationMs: 0,
+        success: false,
+      };
+      await telegramClient.sendMessage(
+        chatId,
+        '🔒 *DIAGNOSTIC DISABLED*\n\nFeature flag `BINANCE_DIAGNOSTIC_ENABLED=false`.',
+        { reply_markup: this.getDiagnosticActionKeyboard() }
+      );
+      return blocked;
+    }
+
+    await telegramClient.sendMessage(chatId, '🔬 Running read-only Binance history diagnostic...').catch(() => {});
+
+    let diag: BinanceReadOnlyDiagnosticResult;
+    try {
+      diag = await binanceService.inspectPayHistoryReadOnly(
+        BINANCE_DIAGNOSTIC_FIXED_WINDOW.startTime,
+        BINANCE_DIAGNOSTIC_FIXED_WINDOW.endTime,
+        submittedReference
+      );
+    } catch (err: any) {
+      diag = {
+        mode: 'READ_ONLY',
+        walletMutation: 'IMPOSSIBLE',
+        windowStartMs: BINANCE_DIAGNOSTIC_FIXED_WINDOW.startTime,
+        windowEndMs: BINANCE_DIAGNOSTIC_FIXED_WINDOW.endTime,
+        windowStartIso: new Date(BINANCE_DIAGNOSTIC_FIXED_WINDOW.startTime).toISOString(),
+        windowEndIso: new Date(BINANCE_DIAGNOSTIC_FIXED_WINDOW.endTime).toISOString(),
+        httpStatus: 0,
+        binanceCode: null,
+        binanceMessage: 'Diagnostic exception occurred safely without mutation',
+        recordsReturned: 0,
+        relevantRecordsCount: 0,
+        candidates: [],
+        identifierConclusion: 'BINANCE_API_REJECTED',
+        durationMs: 0,
+        success: false,
+        errorClassification: err?.message || 'EXCEPTION',
+      };
+    }
+
+    const maskedAdmin = maskIdentifier(userId);
+    const auditPayload = {
+      adminUserId: maskedAdmin,
+      windowStart: diag.windowStartIso,
+      windowEnd: diag.windowEndIso,
+      httpStatus: diag.httpStatus,
+      binanceCode: diag.binanceCode,
+      recordsReturned: diag.recordsReturned,
+      relevantRecords: diag.relevantRecordsCount,
+      identifierConclusion: diag.identifierConclusion,
+      durationMs: diag.durationMs,
+      status: diag.success ? 'SUCCESS' : 'FAILED',
+    };
+
+    logger.info('BINANCE_READ_ONLY_DIAGNOSTIC_EXECUTED', auditPayload);
+    try {
+      await db.query(
+        `INSERT INTO admin_audit_logs (id, admin_id, action, target_entity, target_id, details)
+         VALUES ($1, $2, 'BINANCE_READ_ONLY_DIAGNOSTIC_EXECUTED', 'binance_pay_history', $3, $4)`,
+        [
+          `aud_bin_diag_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          maskedAdmin,
+          'fixed_20261113_0_2_usdt',
+          JSON.stringify(auditPayload),
+        ]
+      );
+    } catch (auditErr: any) {
+      logger.warn('Failed to persist sanitized Binance diagnostic audit row (non-fatal)', {
+        error: auditErr?.message,
+      });
+    }
+
+    let report =
+      `🔬 *BINANCE READ-ONLY DIAGNOSTIC*\n\n` +
+      `Mode: \`READ-ONLY\`\n` +
+      `Wallet Mutation: \`IMPOSSIBLE\`\n` +
+      `Window:\n` +
+      `\`2026-11-13 14:55:45Z\`\n` +
+      `to\n` +
+      `\`2026-11-13 15:15:45Z\`\n\n` +
+      `HTTP Status: \`${diag.httpStatus}\`\n` +
+      `Binance Code: \`${diag.binanceCode || 'NONE'}\`\n` +
+      `Message: ${this.escapeDiagMarkdown(diag.binanceMessage || 'NONE')}\n` +
+      `Records Returned: \`${diag.recordsReturned}\`\n` +
+      `Relevant 0.2 USDT Records: \`${diag.relevantRecordsCount}\`\n`;
+
+    if (diag.candidates.length > 0) {
+      for (const c of diag.candidates.slice(0, 5)) {
+        const timeIso = new Date(c.transactionTime).toISOString();
+        const keysStr = c.presentIdentifierKeys.length > 0 ? c.presentIdentifierKeys.join(', ') : 'NONE';
+        report +=
+          `\nCandidate:\n` +
+          `Time: \`${timeIso}\`\n` +
+          `Amount: \`${c.amount} ${c.currency}\`\n` +
+          `Order Type: \`${c.orderType.replace(/`/g, '')}\`\n` +
+          `Direction: \`${c.direction}\`\n` +
+          `Receiver Match: \`${c.receiverMatch}\`\n` +
+          `Transaction ID: \`${c.maskedTransactionId}\`\n` +
+          `Order ID Present: \`${c.orderIdPresent}\`\n` +
+          (c.orderIdPresent === 'YES' && c.maskedOrderId ? `Masked Order ID: \`${c.maskedOrderId}\`\n` : '') +
+          (c.orderNoPresent === 'YES' && c.maskedOrderNo ? `Order No Present: \`YES\` (\`${c.maskedOrderNo}\`)\n` : '') +
+          `Identifier Keys: \`${keysStr}\`\n`;
+      }
+    }
+
+    report +=
+      `\nSubmitted Reference Match:\n` +
+      `\`${diag.identifierConclusion}\`\n\n` +
+      `No wallet or deposit was modified.`;
+
+    await telegramClient.sendMessage(chatId, report, {
+      reply_markup: this.getDiagnosticActionKeyboard(),
+    });
+
+    return diag;
   }
 
   private async renderUiItemEditor(

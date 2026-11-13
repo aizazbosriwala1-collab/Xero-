@@ -7,7 +7,11 @@ import { walletService } from '../src/services/wallet.js';
 import { pricingService } from '../src/services/pricing.js';
 import { supplierService, SupplierRawProduct } from '../src/services/supplier.js';
 import { manualPaymentService } from '../src/services/manualPayment.js';
-import { binanceService, BinanceTransactionRecord } from '../src/services/binance.js';
+import {
+  binanceService,
+  BinanceTransactionRecord,
+  BINANCE_DIAGNOSTIC_FIXED_WINDOW,
+} from '../src/services/binance.js';
 import { orderService } from '../src/services/order.js';
 import { referralService } from '../src/services/referral.js';
 import { giveawayService } from '../src/services/giveaway.js';
@@ -3138,6 +3142,494 @@ export async function runComprehensiveTests() {
       assert.strictEqual(res2.verified, true);
       const bal2 = (await walletService.getBalance(userId)).available;
       assert.strictEqual(bal2.toFixed(4), '3.5000');
+    });
+  });
+
+  // =========================================================================
+  // 14. TEMPORARY ADMIN READ-ONLY BINANCE HISTORY DIAGNOSTIC SUITE
+  // =========================================================================
+  currentCategory = 'Admin Read-Only Binance History Diagnostic';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  const withDiagTestEnv = async (
+    enabled: boolean,
+    fn: (ctx: { adminId: string; apiKey: string; apiSecret: string; receiverId: string }) => Promise<void>
+  ) => {
+    const orig = {
+      enabled: config.binance.enabled,
+      apiKey: config.binance.apiKey,
+      apiSecret: config.binance.apiSecret,
+      receiverId: config.binance.receiverId,
+      diagEnabled: config.binance.diagnosticEnabled,
+      timeoutMs: config.binance.requestTimeoutMs,
+      recoveryMode: config.safety.recoveryMode,
+      liveOrdering: config.safety.liveOrderingEnabled,
+    };
+    const adminId = '123456789';
+    if (!config.telegram.adminIds.includes(adminId)) config.telegram.adminIds.push(adminId);
+
+    const apiKey = 'DIAG_SECRET_KEY_MUST_NOT_LEAK_12345';
+    const apiSecret = 'DIAG_SECRET_HMAC_MUST_NOT_LEAK_67890';
+    const receiverId = 'DIAG_REC_UID_99887766';
+
+    config.binance.enabled = true;
+    config.binance.apiKey = apiKey;
+    config.binance.apiSecret = apiSecret;
+    config.binance.receiverId = receiverId;
+    config.binance.diagnosticEnabled = enabled;
+
+    try {
+      await fn({ adminId, apiKey, apiSecret, receiverId });
+    } finally {
+      config.binance.enabled = orig.enabled;
+      config.binance.apiKey = orig.apiKey;
+      config.binance.apiSecret = orig.apiSecret;
+      config.binance.receiverId = orig.receiverId;
+      config.binance.diagnosticEnabled = orig.diagEnabled;
+      config.binance.requestTimeoutMs = orig.timeoutMs;
+      config.safety.recoveryMode = orig.recoveryMode;
+      config.safety.liveOrderingEnabled = orig.liveOrdering;
+      binanceService.resetTestState();
+      telegramClient.setTransportOverride(null);
+      await redis.clearFsmState(adminId).catch(() => {});
+      await redis.del(`adm_bin_diag_ref:${adminId}`).catch(() => {});
+    }
+  };
+
+  await it('Diag 1: BINANCE_DIAGNOSTIC_ENABLED defaults false, safety flags intact, button gated & customer menus untouched', 'unit', async () => {
+    // Check default env flag behavior (when env var is not 'true')
+    assert.strictEqual(process.env.BINANCE_DIAGNOSTIC_ENABLED === 'true', config.binance.diagnosticEnabled);
+    assert.strictEqual(config.safety.recoveryMode, true);
+    assert.strictEqual(config.safety.liveOrderingEnabled, false);
+
+    assert.strictEqual(isRegisteredCallbackRoute('adm:bin_diag'), true);
+    assert.strictEqual(isRegisteredCallbackRoute('adm:bin_diag_run'), true);
+    assert.strictEqual(isRegisteredCallbackRoute('adm:bin_diag_clr'), true);
+
+    await withDiagTestEnv(false, async () => {
+      const adminDisabledKb = getAdminMainMenuKeyboard('en');
+      const hasDiagDisabled = adminDisabledKb.inline_keyboard.flat().some(b => b.callback_data === 'adm:bin_diag');
+      assert.strictEqual(hasDiagDisabled, false, 'Diagnostic button must be hidden when feature flag is false');
+    });
+
+    await withDiagTestEnv(true, async () => {
+      const adminEnabledKb = getAdminMainMenuKeyboard('en');
+      const hasDiagEnabled = adminEnabledKb.inline_keyboard.flat().some(b => b.callback_data === 'adm:bin_diag');
+      assert.strictEqual(hasDiagEnabled, true, 'Diagnostic button must appear in Admin menu when flag is true');
+
+      const custKb = getCustomerMainInlineKeyboard(true, 'en');
+      assert.strictEqual(custKb.inline_keyboard.flat().some(b => b.callback_data === 'adm:bin_diag'), false);
+    });
+  });
+
+  await it('Diag 2: non-admin rejected server-side from callbacks, FSM, and direct execution; disabled flag blocks access', 'mock_integration', async () => {
+    await withDiagTestEnv(true, async () => {
+      let binanceCalled = false;
+      binanceService.setFetchOverride(async () => {
+        binanceCalled = true;
+        throw new Error('Must not reach Binance');
+      });
+
+      const tgCalls: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        tgCalls.push({ method, body });
+        return { ok: true, result: { message_id: 9501 } };
+      });
+
+      const nonAdminId = 888777666;
+      await telegramBotRouter.handleUpdate({
+        update_id: 60001,
+        callback_query: {
+          id: 'cb_non_adm_diag',
+          from: { id: nonAdminId, is_bot: false, first_name: 'Intruder' },
+          data: 'adm:bin_diag',
+          message: { message_id: 1, chat: { id: nonAdminId, type: 'private' as const }, date: Math.floor(Date.now() / 1000), text: 'x' },
+        },
+      });
+      assert.strictEqual(binanceCalled, false);
+      assert.ok(tgCalls.some(c => c.method === 'answerCallbackQuery' && String(c.body.text).includes('Access Denied')));
+
+      await assert.rejects(
+        () => adminHandler.executeAdminBinanceDiagnostic(nonAdminId, String(nonAdminId), '12345'),
+        /Unauthorized/
+      );
+      assert.strictEqual(binanceCalled, false);
+    });
+
+    // Disabled flag must block even an authorized admin
+    await withDiagTestEnv(false, async ({ adminId }) => {
+      let binanceCalled = false;
+      binanceService.setFetchOverride(async () => {
+        binanceCalled = true;
+        throw new Error('Must not reach Binance');
+      });
+
+      const tgCalls: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        tgCalls.push({ method, body });
+        return { ok: true, result: { message_id: 9502 } };
+      });
+
+      await telegramBotRouter.handleUpdate({
+        update_id: 60002,
+        callback_query: {
+          id: 'cb_adm_diag_disabled',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:bin_diag_run',
+          message: { message_id: 2, chat: { id: Number(adminId), type: 'private' as const }, date: Math.floor(Date.now() / 1000), text: 'x' },
+        },
+      });
+      assert.strictEqual(binanceCalled, false);
+      assert.ok(tgCalls.some(c => String(c.body?.text || '').includes('DIAGNOSTIC DISABLED')));
+    });
+  });
+
+  await it('Diag 3: inspectPayHistoryReadOnly uses exact fixed window + GET only + ZERO DB INSERT/UPDATE/DELETE/locks & ZERO wallet/verify/ledger calls', 'mock_integration', async () => {
+    await withDiagTestEnv(true, async ({ receiverId }) => {
+      let methodSeen = '';
+      let urlSeen = '';
+
+      binanceService.setFetchOverride(async (input: any, init?: any) => {
+        urlSeen = String(input);
+        methodSeen = String(init?.method || 'GET');
+        return {
+          status: 200,
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              code: '000000',
+              message: 'success',
+              data: [
+                {
+                  transactionId: '900123456789001',
+                  transactionTime: 1794582345000,
+                  orderType: 'C2C',
+                  amount: '0.2000',
+                  currency: 'USDT',
+                  payerInfo: { name: 'Secret Payer', binanceId: 'PAYER_SECRET_999' },
+                  receiverInfo: { binanceId: receiverId },
+                },
+              ],
+            }),
+        } as any;
+      });
+
+      // Instrument DB & financial methods to prove zero calls occur inside inspectPayHistoryReadOnly
+      const origQuery = db.query.bind(db);
+      const origQueryRow = db.queryRow.bind(db);
+      const origTx = db.withTransaction.bind(db);
+      const origExecMut = walletService.executeMutation.bind(walletService);
+      const origVerifyDep = binanceService.verifyDeposit.bind(binanceService);
+      const origCreateInv = binanceService.createInvoice.bind(binanceService);
+      const origApproveDep = manualPaymentService.approveDeposit.bind(manualPaymentService);
+
+      const sqlSeen: string[] = [];
+      let txCount = 0;
+      let walletMutCount = 0;
+      let verifyCount = 0;
+      let createInvCount = 0;
+      let approveCount = 0;
+
+      (db as any).query = async (text: string, params?: any[]) => {
+        sqlSeen.push(text);
+        return origQuery(text, params);
+      };
+      (db as any).queryRow = async (text: string, params?: any[]) => {
+        sqlSeen.push(text);
+        return origQueryRow(text, params);
+      };
+      (db as any).withTransaction = async (cb: any) => {
+        txCount++;
+        return origTx(cb);
+      };
+      (walletService as any).executeMutation = async (...args: any[]) => {
+        walletMutCount++;
+        return origExecMut(args[0]);
+      };
+      (binanceService as any).verifyDeposit = async (...args: any[]) => {
+        verifyCount++;
+        return origVerifyDep(args[0], args[1], args[2]);
+      };
+      (binanceService as any).createInvoice = async (...args: any[]) => {
+        createInvCount++;
+        return origCreateInv(args[0], args[1]);
+      };
+      (manualPaymentService as any).approveDeposit = async (...args: any[]) => {
+        approveCount++;
+        return origApproveDep(args[0], args[1], args[2]);
+      };
+
+      try {
+        const res = await binanceService.inspectPayHistoryReadOnly(
+          BINANCE_DIAGNOSTIC_FIXED_WINDOW.startTime,
+          BINANCE_DIAGNOSTIC_FIXED_WINDOW.endTime,
+          'CUSTOMER_ORDER_REF_465195606'
+        );
+
+        assert.strictEqual(methodSeen, 'GET');
+        const parsed = new URL(urlSeen);
+        assert.strictEqual(parsed.pathname, '/sapi/v1/pay/transactions');
+        assert.strictEqual(parsed.searchParams.get('startTime'), '1794581745000');
+        assert.strictEqual(parsed.searchParams.get('endTime'), '1794582945000');
+        assert.strictEqual(parsed.searchParams.get('limit'), '100');
+
+        assert.strictEqual(sqlSeen.length, 0, 'inspectPayHistoryReadOnly must execute ZERO SQL statements');
+        assert.strictEqual(txCount, 0);
+        assert.strictEqual(walletMutCount, 0);
+        assert.strictEqual(verifyCount, 0);
+        assert.strictEqual(createInvCount, 0);
+        assert.strictEqual(approveCount, 0);
+
+        assert.strictEqual(res.mode, 'READ_ONLY');
+        assert.strictEqual(res.walletMutation, 'IMPOSSIBLE');
+        assert.strictEqual(res.relevantRecordsCount, 1);
+        assert.strictEqual(res.candidates[0].maskedTransactionId, '900...001');
+        assert.strictEqual(res.candidates[0].orderIdPresent, 'NO');
+        assert.strictEqual(res.candidates[0].maskedOrderId, undefined);
+        assert.strictEqual(res.identifierConclusion, 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE');
+      } finally {
+        (db as any).query = origQuery;
+        (db as any).queryRow = origQueryRow;
+        (db as any).withTransaction = origTx;
+        (walletService as any).executeMutation = origExecMut;
+        (binanceService as any).verifyDeposit = origVerifyDep;
+        (binanceService as any).createInvoice = origCreateInv;
+        (manualPaymentService as any).approveDeposit = origApproveDep;
+      }
+    });
+  });
+
+  await it('Diag 4: Decimal-safe 0.2 USDT matching, identifier modes (TXID, orderId, orderNo, absent, mismatch) & zero fabrication', 'mock_integration', async () => {
+    await withDiagTestEnv(true, async ({ receiverId }) => {
+      // 1) MATCHED_ORDER_ID when orderId actually exists
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            message: 'success',
+            data: [
+              {
+                transactionId: '111222333444',
+                orderId: '465195606769819648',
+                transactionTime: 1794582345000,
+                orderType: 'C2C',
+                amount: '0.20', // Decimal-safe == 0.2
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+              {
+                transactionId: '999999999999',
+                transactionTime: 1794582345000,
+                orderType: 'PAYOUT', // Outgoing ignored
+                amount: '0.20',
+                currency: 'USDT',
+              },
+            ],
+          }),
+      }) as any);
+
+      const rOrdId = await binanceService.inspectPayHistoryReadOnly(1794581745000, 1794582945000, '465195606769819648');
+      assert.strictEqual(rOrdId.recordsReturned, 2);
+      assert.strictEqual(rOrdId.relevantRecordsCount, 1);
+      assert.strictEqual(rOrdId.candidates[0].orderIdPresent, 'YES');
+      assert.strictEqual(rOrdId.candidates[0].maskedOrderId, '465...648');
+      assert.strictEqual(rOrdId.identifierConclusion, 'MATCHED_ORDER_ID');
+
+      // 2) MATCHED_ORDER_NO when orderNo actually exists
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: 'TX_AAA_111',
+                orderNo: 'ORDNO_888999',
+                transactionTime: 1794582345000,
+                orderType: 'C2C',
+                amount: '0.2000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const rOrdNo = await binanceService.inspectPayHistoryReadOnly(1794581745000, 1794582945000, 'ORDNO_888999');
+      assert.strictEqual(rOrdNo.candidates[0].orderIdPresent, 'NO');
+      assert.strictEqual(rOrdNo.candidates[0].orderNoPresent, 'YES');
+      assert.strictEqual(rOrdNo.candidates[0].maskedOrderNo, 'ORD...999');
+      assert.strictEqual(rOrdNo.identifierConclusion, 'MATCHED_ORDER_NO');
+
+      // 3) MATCHED_TRANSACTION_ID
+      const rTx = await binanceService.inspectPayHistoryReadOnly(1794581745000, 1794582945000, 'TX_AAA_111');
+      assert.strictEqual(rTx.identifierConclusion, 'MATCHED_TRANSACTION_ID');
+
+      // 4) PAYMENT_RECORD_FOUND_BUT_NO_COMPARABLE_IDENTIFIER
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionTime: 1794582345000,
+                orderType: 'C2C',
+                amount: '0.20',
+                currency: 'USDT',
+              },
+            ],
+          }),
+      }) as any);
+      const rNoIds = await binanceService.inspectPayHistoryReadOnly(1794581745000, 1794582945000, 'ANY_REF');
+      assert.strictEqual(rNoIds.identifierConclusion, 'PAYMENT_RECORD_FOUND_BUT_NO_COMPARABLE_IDENTIFIER');
+      assert.strictEqual(rNoIds.candidates[0].transactionIdPresent, 'NO');
+      assert.strictEqual(rNoIds.candidates[0].orderIdPresent, 'NO');
+
+      // 5) NO_RELEVANT_0_2_USDT_RECORD
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({ code: '000000', data: [] }),
+      }) as any);
+      const rEmpty = await binanceService.inspectPayHistoryReadOnly(1794581745000, 1794582945000, 'ANY_REF');
+      assert.strictEqual(rEmpty.identifierConclusion, 'NO_RELEVANT_0_2_USDT_RECORD');
+    });
+  });
+
+  await it('Diag 5: timeout, API rejection, malformed JSON, Markdown 400 fallback, and end-to-end zero secrets/PII leakage', 'mock_integration', async () => {
+    await withDiagTestEnv(true, async ({ adminId, apiKey, apiSecret, receiverId }) => {
+      const sentMessages: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        if (method === 'sendMessage' && body.parse_mode === 'Markdown' && String(body.text).includes('BINANCE READ-ONLY DIAGNOSTIC')) {
+          // Force Markdown 400 parse failure on first send to test plain-text fallback retry
+          sentMessages.push({ method, phase: 'rejected_400', body: JSON.parse(JSON.stringify(body)) });
+          return { ok: false, error_code: 400, description: "Bad Request: can't parse entities: test forced error" };
+        }
+        if (method === 'sendMessage' || method === 'editMessageText') {
+          sentMessages.push({ method, phase: 'delivered', body: JSON.parse(JSON.stringify(body)) });
+        }
+        return { ok: true, result: { message_id: 9601 } };
+      });
+
+      // 1) Timeout returns BINANCE_API_TIMEOUT + terminal Telegram message
+      binanceService.setFetchOverride(async () => {
+        const err: any = new Error('timed out');
+        err.name = 'AbortError';
+        throw err;
+      });
+      const timeoutRes = await adminHandler.executeAdminBinanceDiagnostic(Number(adminId), adminId, '998877665544');
+      assert.strictEqual(timeoutRes.identifierConclusion, 'BINANCE_API_TIMEOUT');
+      assert.ok(sentMessages.some(m => m.phase === 'delivered' && String(m.body.text).includes('BINANCE_API_TIMEOUT')));
+
+      // 2) HTTP 401/malformed JSON returns BINANCE_API_REJECTED + terminal Telegram message
+      sentMessages.length = 0;
+      binanceService.setFetchOverride(async () => ({
+        status: 502,
+        ok: false,
+        text: async () => '<html>Bad Gateway</html>',
+      }) as any);
+      const rejRes = await adminHandler.executeAdminBinanceDiagnostic(Number(adminId), adminId, '998877665544');
+      assert.strictEqual(rejRes.identifierConclusion, 'BINANCE_API_REJECTED');
+      assert.ok(sentMessages.some(m => m.phase === 'delivered' && String(m.body.text).includes('BINANCE_API_REJECTED')));
+
+      // 3) Full FSM interactive flow + zero DB writes on deposits/wallets/ledger + zero credential/PII/full-ID leaks
+      sentMessages.length = 0;
+      const secretFullTx = '777111222333888';
+      const secretCustomerOrderRef = '465195606769819648';
+      const payerSecretName = 'JOHN_SECRET_PAYER_NAME';
+      const payerSecretId = 'PAYER_PRIVATE_999111';
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            message: 'success',
+            data: [
+              {
+                transactionId: secretFullTx,
+                transactionTime: 1794582345000,
+                orderType: 'C2C',
+                amount: '0.2000',
+                currency: 'USDT',
+                payerInfo: { name: payerSecretName, binanceId: payerSecretId },
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      // Admin opens diagnostic -> enters Order ID -> runs -> clears state
+      await telegramBotRouter.handleUpdate({
+        update_id: 60010,
+        callback_query: {
+          id: 'cb_diag_open',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:bin_diag',
+          message: { message_id: 9601, chat: { id: Number(adminId), type: 'private' as const }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+
+      const depositsBefore = await db.queryRow<{ c: string }>('SELECT COUNT(*)::text AS c FROM deposits');
+      const ledgerBefore = await db.queryRow<{ c: string }>('SELECT COUNT(*)::text AS c FROM ledger_entries');
+
+      await telegramBotRouter.handleUpdate({
+        update_id: 60011,
+        message: {
+          message_id: 9602,
+          chat: { id: Number(adminId), type: 'private' },
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          date: Math.floor(Date.now() / 1000),
+          text: secretCustomerOrderRef,
+        },
+      });
+
+      const depositsAfter = await db.queryRow<{ c: string }>('SELECT COUNT(*)::text AS c FROM deposits');
+      const ledgerAfter = await db.queryRow<{ c: string }>('SELECT COUNT(*)::text AS c FROM ledger_entries');
+      assert.strictEqual(depositsAfter?.c, depositsBefore?.c, 'Diagnostic must never create/modify deposits');
+      assert.strictEqual(ledgerAfter?.c, ledgerBefore?.c, 'Diagnostic must never write ledger entries');
+
+      const deliveredReport = sentMessages
+        .filter(m => m.phase === 'delivered')
+        .map(m => String(m.body.text))
+        .find(txt => txt.includes('BINANCE READ-ONLY DIAGNOSTIC'));
+      assert.ok(deliveredReport, 'Terminal diagnostic Telegram message must be delivered');
+
+      // Verify exact sanitization: NONE of secrets, receiver, payer PII, or full IDs appear
+      for (const forbidden of [apiKey, apiSecret, receiverId, secretFullTx, secretCustomerOrderRef, payerSecretName, payerSecretId]) {
+        assert.strictEqual(deliveredReport!.includes(forbidden), false, `Sensitive string leaked in Telegram report: ${forbidden.slice(0, 6)}`);
+      }
+      assert.ok(deliveredReport!.includes('777...888'), 'Masked transactionId must be displayed');
+      assert.ok(deliveredReport!.includes('CUSTOMER_REFERENCE_NOT_API_MATCHABLE'));
+
+      // Audit log created with sanitized fields only (no raw secrets/full IDs)
+      const aud = await db.queryRow<any>(
+        "SELECT * FROM admin_audit_logs WHERE action = 'BINANCE_READ_ONLY_DIAGNOSTIC_EXECUTED' ORDER BY created_at DESC LIMIT 1"
+      );
+      assert.ok(aud);
+      const audStr = JSON.stringify(aud);
+      for (const forbidden of [apiKey, apiSecret, receiverId, secretFullTx, secretCustomerOrderRef, payerSecretName, payerSecretId, adminId]) {
+        assert.strictEqual(audStr.includes(forbidden), false, `Sensitive string leaked in audit log: ${forbidden.slice(0, 6)}`);
+      }
+
+      // Clear state removes temporary Redis key
+      await telegramBotRouter.handleUpdate({
+        update_id: 60012,
+        callback_query: {
+          id: 'cb_diag_clr',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:bin_diag_clr',
+          message: { message_id: 9601, chat: { id: Number(adminId), type: 'private' as const }, date: Math.floor(Date.now() / 1000), text: 'Clear' },
+        },
+      });
+      const clearedVal = await redis.get(`adm_bin_diag_ref:${adminId}`);
+      assert.strictEqual(clearedVal, null, 'Clear diagnostic state button must erase temporary Redis reference');
     });
   });
 

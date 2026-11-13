@@ -110,7 +110,8 @@ export type FsmStep =
   | 'ADMIN_UI_EDIT_TEXT'
   | 'ADMIN_UI_EDIT_EMOJI'
   | 'ADMIN_UI_IMPORT_JSON'
-  | 'ADMIN_UI_CONFIRM_RESET_ALL';
+  | 'ADMIN_UI_CONFIRM_RESET_ALL'
+  | 'ADMIN_BINANCE_DIAG_ORDER_ID';
 
 export interface UserFsmState {
   step: FsmStep;
