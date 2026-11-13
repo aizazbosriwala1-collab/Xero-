@@ -11,14 +11,20 @@ import { binanceService, BinanceTransactionRecord } from '../src/services/binanc
 import { orderService } from '../src/services/order.js';
 import { referralService } from '../src/services/referral.js';
 import { giveawayService } from '../src/services/giveaway.js';
-import { telegramBotRouter, isRegisteredCallbackRoute } from '../src/telegram/bot.js';
+import {
+  telegramBotRouter,
+  isRegisteredCallbackRoute,
+  isRegisteredTextCommand,
+  REGISTERED_TEXT_COMMANDS,
+} from '../src/telegram/bot.js';
 import { telegramClient } from '../src/telegram/client.js';
 import { encryptionService, EncryptionService } from '../src/services/encryption.js';
 import { sanitizeObject } from '../src/services/logger.js';
 import { config } from '../src/config/env.js';
 import { adminHandler } from '../src/telegram/handlers/admin.js';
 import { customerHandler } from '../src/telegram/handlers/customer.js';
-import { uiConfigService } from '../src/services/uiConfig.js';
+import { uiConfigService, CUSTOMER_COMMAND_ORDER } from '../src/services/uiConfig.js';
+import { getUserLanguage, invalidateUserLanguageCache } from '../src/services/i18n.js';
 import { navigationService } from '../src/services/navigation.js';
 import { ButtonBuilder } from '../src/telegram/buttonBuilder.js';
 import { redis } from '../src/services/redis.js';
@@ -2017,11 +2023,15 @@ export async function runComprehensiveTests() {
     }
   });
 
-  await it('V2 Keyboards: minimal reply keyboard has ☰ MENU and inline main menu hides Admin button for customers', 'unit', async () => {
+  await it('V2 Keyboards: persistent bottom reply keyboard has 2 buttons [Deposit, Support] and hides Admin inline button for customers', 'unit', async () => {
     const replyKb = getCustomerMainReplyKeyboard('en');
     assert.strictEqual(replyKb.keyboard.length, 1);
-    assert.strictEqual(replyKb.keyboard[0].length, 1);
-    assert.strictEqual(replyKb.keyboard[0][0].text, '☰ MENU');
+    assert.strictEqual(replyKb.keyboard[0].length, 2);
+    assert.strictEqual(replyKb.keyboard[0][0].text, '➕ DEPOSIT');
+    assert.strictEqual(replyKb.keyboard[0][1].text, '🎧 SUPPORT');
+    assert.strictEqual(replyKb.resize_keyboard, true);
+    assert.strictEqual(replyKb.is_persistent, true);
+    assert.ok(replyKb.input_field_placeholder && replyKb.input_field_placeholder.length > 0);
 
     const custInline = getCustomerMainInlineKeyboard(false, 'en');
     const hasAdmin = custInline.inline_keyboard.some(r => r.some(b => b.callback_data === 'adm:main'));
@@ -2280,6 +2290,341 @@ export async function runComprehensiveTests() {
       }
     }
     assert.ok(inspectedButtons >= 75, `Expected at least 75 inspected buttons, got ${inspectedButtons}`);
+  });
+
+  // =========================================================================
+  // 12. V2 SURGICAL MENU PLACEMENT, SETMYCOMMANDS & RESPONSE-SPEED SUITE
+  // =========================================================================
+  currentCategory = 'V2 Menu Placement & Response Speed';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('A1. /start cleanliness: omits "MENU READY", renders welcome inline menu, attaches 2-button bar once per chat', 'mock_integration', async () => {
+    const sentMessages: any[] = [];
+    let nextMsgId = 9001;
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (method === 'sendMessage') {
+        sentMessages.push(JSON.parse(JSON.stringify(body)));
+        return { ok: true, result: { message_id: nextMsgId++ } };
+      }
+      return { ok: true, result: true };
+    });
+
+    try {
+      const chatId = 71001;
+      await db.query('DELETE FROM ui_navigation_states WHERE user_id = $1', [String(chatId)]);
+      await redis.del(`nav:${chatId}`);
+
+      // First /start attaches 2-button bottom reply keyboard silently + renders welcome inline menu
+      await telegramBotRouter.handleUpdate({
+        update_id: 40001,
+        message: {
+          message_id: 1,
+          chat: { id: chatId, type: 'private' },
+          from: { id: chatId, is_bot: false, first_name: 'SpeedTest' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/start',
+        },
+      });
+
+      assert.strictEqual(sentMessages.length, 2, 'First /start sends welcome inline menu + silent 2-button reply bar');
+      assert.strictEqual(
+        sentMessages.some(m => String(m.text).toUpperCase().includes('MENU READY')),
+        false,
+        'MENU READY message must NEVER be sent'
+      );
+      assert.ok(sentMessages[0].reply_markup?.inline_keyboard, 'Welcome message must contain main inline dashboard');
+      assert.ok(sentMessages[1].reply_markup?.keyboard, 'Second lightweight message attaches 2-button reply keyboard');
+      assert.strictEqual(sentMessages[1].disable_notification, true);
+      assert.strictEqual(sentMessages[1].reply_markup.keyboard[0].length, 2);
+
+      // Second /start sends ONLY 1 message (no duplicate reply-keyboard bar!)
+      sentMessages.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 40002,
+        message: {
+          message_id: 2,
+          chat: { id: chatId, type: 'private' },
+          from: { id: chatId, is_bot: false, first_name: 'SpeedTest' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/start',
+        },
+      });
+
+      assert.strictEqual(sentMessages.length, 1, 'Subsequent /start must send only the single welcome + inline dashboard');
+      assert.ok(sentMessages[0].reply_markup?.inline_keyboard);
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('A2. Persistent bottom keyboard localized in EN/UR/UR-RO & routing Deposit/Support cleanly', 'mock_integration', async () => {
+    const urKb = getCustomerMainReplyKeyboard('ur');
+    assert.strictEqual(urKb.keyboard[0].length, 2);
+    assert.strictEqual(urKb.keyboard[0][0].text, '➕ جمع کریں');
+    assert.strictEqual(urKb.keyboard[0][1].text, '🎧 سپورٹ');
+    assert.ok(urKb.input_field_placeholder && urKb.input_field_placeholder.length > 0);
+
+    const calls: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      calls.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9101 } };
+    });
+
+    try {
+      await telegramBotRouter.handleUpdate({
+        update_id: 40010,
+        message: {
+          message_id: 10,
+          chat: { id: 70001, type: 'private' },
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          date: Math.floor(Date.now() / 1000),
+          text: '➕ DEPOSIT',
+        },
+      });
+      const depCall = calls.find(c => c.method === 'sendMessage' || c.method === 'editMessageText');
+      assert.ok(depCall?.body?.reply_markup?.inline_keyboard?.flat().some((b: any) => b.callback_data === 'dep_m:binance'));
+
+      calls.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 40011,
+        message: {
+          message_id: 11,
+          chat: { id: 70001, type: 'private' },
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          date: Math.floor(Date.now() / 1000),
+          text: '🎧 SUPPORT',
+        },
+      });
+      const fsm = await redis.getFsmState<any>('70001');
+      assert.strictEqual(fsm?.step, 'AWAITING_SUPPORT_MESSAGE');
+      await redis.clearFsmState('70001');
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('B. Legacy reply keyboard inputs (☰ MENU, Products, Shop, Support, Deposit, Wallet) remain compatible', 'mock_integration', async () => {
+    const calls: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      calls.push({ method, body });
+      return { ok: true, result: { message_id: 9201 } };
+    });
+
+    try {
+      const legacyInputs = [
+        { text: '☰ MENU', expectedStatus: 'TEXT_PROCESSED', expectBtn: 'm:prod' },
+        { text: 'Products', expectedStatus: 'TEXT_PROCESSED', expectBtn: 'cat:all:1' },
+        { text: 'Shop', expectedStatus: 'TEXT_PROCESSED', expectBtn: 'cat:all:1' },
+        { text: '💰 WALLET', expectedStatus: 'TEXT_PROCESSED', expectBtn: 'w:hist' },
+      ];
+      let uid = 40020;
+      for (const item of legacyInputs) {
+        calls.length = 0;
+        const res = await telegramBotRouter.handleUpdate({
+          update_id: uid++,
+          message: {
+            message_id: uid,
+            chat: { id: 70001, type: 'private' },
+            from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+            date: Math.floor(Date.now() / 1000),
+            text: item.text,
+          },
+        });
+        assert.strictEqual(res.status, item.expectedStatus);
+        const lastMarkup = calls[calls.length - 1]?.body?.reply_markup;
+        assert.ok(
+          lastMarkup?.inline_keyboard?.flat().some((b: any) => b.callback_data === item.expectBtn),
+          `Legacy text "${item.text}" should route to screen containing callback "${item.expectBtn}"`
+        );
+      }
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('C. Telegram setMyCommands: registers default/en/ur without /admin, and registers /admin ONLY for admin chat scopes', 'mock_integration', async () => {
+    const adminId = '123456789';
+    if (!config.telegram.adminIds.includes(adminId)) config.telegram.adminIds.push(adminId);
+
+    const setCmdCalls: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (method === 'setMyCommands') {
+        setCmdCalls.push(JSON.parse(JSON.stringify(body)));
+      }
+      return { ok: true, result: true };
+    });
+
+    try {
+      const res = await telegramClient.registerBotCommandsSafely();
+      assert.strictEqual(res.registered, true);
+      assert.ok(res.scopes.includes('default'));
+      assert.ok(res.scopes.includes('en'));
+      assert.ok(res.scopes.includes('ur'));
+      assert.strictEqual(res.scopes.includes('ur-ro'), false, 'Unsupported Telegram language_code ur-ro must NOT be sent');
+      assert.ok(res.scopes.includes(`chat:${adminId}`), 'Admin chat scope must be registered');
+
+      const defaultPayload = setCmdCalls.find(c => c.scope?.type === 'default' && !c.language_code);
+      assert.ok(defaultPayload);
+      assert.strictEqual(defaultPayload.commands.length, CUSTOMER_COMMAND_ORDER.length);
+      assert.strictEqual(
+        defaultPayload.commands.some((c: any) => c.command === 'admin'),
+        false,
+        '/admin must NOT appear in customer default command list'
+      );
+      for (const c of defaultPayload.commands) {
+        assert.ok(/^[a-z0-9_]{1,32}$/.test(c.command), `Invalid command format: ${c.command}`);
+        assert.ok(c.description.length >= 3 && c.description.length <= 256);
+      }
+
+      const urPayload = setCmdCalls.find(c => c.language_code === 'ur');
+      assert.ok(urPayload);
+      assert.strictEqual(urPayload.commands.some((c: any) => c.command === 'admin'), false);
+
+      const adminPayload = setCmdCalls.find(c => c.scope?.type === 'chat' && c.scope?.chat_id === Number(adminId));
+      assert.ok(adminPayload);
+      assert.strictEqual(adminPayload.commands.some((c: any) => c.command === 'admin'), true, '/admin must appear in admin chat scope');
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('D. Command-Route Audit & Slash Commands (/shop, /refer, /api, @BotName suffix) route cleanly', 'mock_integration', async () => {
+    // 1. Audit 100% of CUSTOMER_COMMAND_ORDER + admin are registered in router
+    for (const cmd of CUSTOMER_COMMAND_ORDER) {
+      assert.strictEqual(isRegisteredTextCommand(cmd), true, `Missing router support for /${cmd}`);
+    }
+    for (const cmd of REGISTERED_TEXT_COMMANDS) {
+      assert.strictEqual(isRegisteredTextCommand(cmd), true);
+    }
+
+    // 2. Test /shop, /refer, /api@XeroKhanBot live routing via TelegramBotRouter
+    const calls: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      calls.push({ method, body });
+      return { ok: true, result: { message_id: 9301 } };
+    });
+
+    try {
+      const rShop = await telegramBotRouter.handleUpdate({
+        update_id: 40030,
+        message: {
+          message_id: 30,
+          chat: { id: 70001, type: 'private' },
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/shop',
+        },
+      });
+      assert.strictEqual(rShop.status, 'PRODUCTS_PROCESSED');
+
+      const rRefer = await telegramBotRouter.handleUpdate({
+        update_id: 40031,
+        message: {
+          message_id: 31,
+          chat: { id: 70001, type: 'private' },
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/refer',
+        },
+      });
+      assert.strictEqual(rRefer.status, 'REFERRAL_PROCESSED');
+
+      calls.length = 0;
+      const rApi = await telegramBotRouter.handleUpdate({
+        update_id: 40032,
+        message: {
+          message_id: 32,
+          chat: { id: 70001, type: 'private' },
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/api@XeroKhanBot',
+        },
+      });
+      assert.strictEqual(rApi.status, 'API_PROCESSED');
+      assert.ok(String(calls[0]?.body?.text).includes('RESELLER API'));
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('E. Response Reliability: immediate answerCallbackQuery first + short-TTL capability failure cache', 'mock_integration', async () => {
+    telegramClient.clearCapabilityCacheForTests();
+    const callOrder: string[] = [];
+
+    telegramClient.setTransportOverride(async (method, body) => {
+      callOrder.push(method);
+      const btn = body.reply_markup?.inline_keyboard?.[0]?.[0];
+      if (btn?.icon_custom_emoji_id === '598765432109876543') {
+        return { ok: false, error_code: 400, description: 'Bad Request: DOCUMENT_INVALID custom_emoji' };
+      }
+      return { ok: true, result: { message_id: 9401 } };
+    });
+
+    try {
+      // 1. Verify answerCallbackQuery is invoked as the very first Telegram API call on callback
+      await customerHandler.handleCallback({
+        id: 'cb_fast_ack_1',
+        from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+        data: 'm:wall',
+        message: {
+          message_id: 9401,
+          chat: { id: 70001, type: 'private' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'Prev',
+        },
+      });
+      assert.strictEqual(callOrder[0], 'answerCallbackQuery', 'answerCallbackQuery must be dispatched immediately first');
+
+      // 2. Verify short-TTL capability cache avoids repeated failing roundtrips on subsequent sendMessage
+      callOrder.length = 0;
+      const badEmojiBtn = ButtonBuilder.buildButton({
+        text: 'PRODUCTS',
+        fallbackEmoji: '🛍️',
+        customEmojiId: '598765432109876543',
+        style: 'primary',
+        callbackData: 'm:prod',
+      })!;
+
+      // Call 1: 1 failed attempt + 1 fallback retry = 2 calls
+      await telegramClient.sendMessage(70001, 'Cache Prime', { reply_markup: { inline_keyboard: [[badEmojiBtn]] } });
+      assert.strictEqual(callOrder.length, 2);
+
+      // Call 2: pre-stripped immediately from capability cache = ONLY 1 call!
+      callOrder.length = 0;
+      const res2 = await telegramClient.sendMessage(70001, 'Cache Hit', { reply_markup: { inline_keyboard: [[badEmojiBtn]] } });
+      assert.strictEqual(res2.ok, true);
+      assert.strictEqual(callOrder.length, 1, 'Capability cache must skip failed custom emoji retry on second send');
+    } finally {
+      telegramClient.clearCapabilityCacheForTests();
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('F. Speed & Caching: single-item lookup matches catalog, Redis language cache works & invalidates safely', 'unit', async () => {
+    // 1. Single-product lookup matches full catalog result without scanning 250 items
+    const t0 = performance.now();
+    const single = await pricingService.getCatalogItemById('sp_nav_bulk_042');
+    const singleMs = performance.now() - t0;
+
+    const fullCatalog = await pricingService.getCatalog({ page: 1, pageSize: 250 });
+    const fromFull = fullCatalog.items.find(i => i.id === 'sp_nav_bulk_042');
+
+    assert.ok(single);
+    assert.ok(fromFull);
+    assert.strictEqual(single.id, fromFull.id);
+    assert.strictEqual(single.sellingPrice, fromFull.sellingPrice);
+    assert.strictEqual(single.supplierCost, fromFull.supplierCost);
+    assert.strictEqual(single.pricingRule, fromFull.pricingRule);
+    assert.ok(singleMs < 200, `Single item lookup expected fast (<200ms), took ${singleMs.toFixed(2)}ms`);
+
+    // 2. Language cache & invalidation
+    await invalidateUserLanguageCache('70001');
+    const l1 = await getUserLanguage('70001');
+    const cachedVal = await redis.get('userlang:70001');
+    assert.strictEqual(cachedVal, l1);
+    await invalidateUserLanguageCache('70001');
+    const afterInvalidation = await redis.get('userlang:70001');
+    assert.strictEqual(afterInvalidation, null);
   });
 
   // SUMMARY & STATS DYNAMIC COMPUTATION

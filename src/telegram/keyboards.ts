@@ -4,7 +4,7 @@ import {
   TelegramReplyKeyboardMarkup,
 } from './types.js';
 import { ButtonBuilder } from './buttonBuilder.js';
-import { SupportedLanguage } from '../services/i18n.js';
+import { SupportedLanguage, t } from '../services/i18n.js';
 import { uiConfigService, UISection, UISettingRecord } from '../services/uiConfig.js';
 
 function filterNonEmptyRows(rows: TelegramInlineKeyboardButton[][]): TelegramInlineKeyboardButton[][] {
@@ -12,13 +12,24 @@ function filterNonEmptyRows(rows: TelegramInlineKeyboardButton[][]): TelegramInl
 }
 
 /**
- * Minimal Customer Persistent Reply Keyboard (Single ☰ MENU anchor)
+ * Customer Persistent 2-Button Bottom Quick-Action Bar: [ ➕ DEPOSIT ] [ 🎧 SUPPORT ]
  */
 export function getCustomerMainReplyKeyboard(lang: SupportedLanguage = 'en'): TelegramReplyKeyboardMarkup {
+  const placeholder = (uiConfigService.getText('msg.input_placeholder', lang) || t('input_placeholder', lang))
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim()
+    .slice(0, 64);
+
   return {
-    keyboard: [[ButtonBuilder.buildReplyButton({ settingKey: 'btn.reply.menu', lang })]],
+    keyboard: [
+      [
+        ButtonBuilder.buildReplyButton({ settingKey: 'btn.reply.deposit', lang }),
+        ButtonBuilder.buildReplyButton({ settingKey: 'btn.reply.support', lang }),
+      ],
+    ],
     resize_keyboard: true,
     is_persistent: true,
+    input_field_placeholder: placeholder || undefined,
   };
 }
 
@@ -610,6 +621,9 @@ export function getAdminUiCenterKeyboard(): TelegramInlineKeyboardMarkup {
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ text: 'Nav & Language', fallbackEmoji: '🧭', style: 'primary', callbackData: 'adm:uis:navigation:1' }),
         ButtonBuilder.buildButton({ text: 'Texts & Messages', fallbackEmoji: '📝', style: 'primary', callbackData: 'adm:uis:messages:1' }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Slash Commands', fallbackEmoji: '⌨️', style: 'primary', callbackData: 'adm:uis:commands:1' }),
       ]),
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ text: 'Export UI JSON', fallbackEmoji: '📤', style: 'default', callbackData: 'adm:ui_exp' }),

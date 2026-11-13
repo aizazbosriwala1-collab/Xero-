@@ -45,7 +45,6 @@ export class AdminHandler {
 
   public async handleCallback(cb: TelegramCallbackQuery) {
     if (!cb.message || !cb.data) return;
-    await uiConfigService.ensureLoaded();
 
     const chatId = cb.message.chat.id;
     const messageId = cb.message.message_id;
@@ -57,9 +56,13 @@ export class AdminHandler {
       return;
     }
 
-    if (cb.id && cb.id !== '0') {
-      await telegramClient.answerCallbackQuery(cb.id);
-    }
+    const ackPromise =
+      cb.id && cb.id !== '0'
+        ? telegramClient.answerCallbackQuery(cb.id).catch(() => {})
+        : Promise.resolve();
+
+    await uiConfigService.ensureLoaded();
+    await ackPromise;
 
     // Admin Main Menu
     if (data === 'adm:main') {

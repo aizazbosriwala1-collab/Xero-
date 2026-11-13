@@ -1,6 +1,6 @@
 import { db } from '../db/index.js';
 import { redis } from './redis.js';
-import { ButtonStyle } from '../telegram/types.js';
+import { ButtonStyle, TelegramBotCommand } from '../telegram/types.js';
 import { SupportedLanguage, SUPPORTED_LANGUAGES, translations } from './i18n.js';
 import { createLogger } from './logger.js';
 
@@ -13,6 +13,7 @@ export type UISection =
   | 'wallet_dep'
   | 'navigation'
   | 'messages'
+  | 'commands'
   | 'admin';
 
 export interface UISettingRecord {
@@ -44,14 +45,34 @@ export interface DefaultUISettingSpec {
 export const ALLOWED_BUTTON_STYLES: ButtonStyle[] = ['primary', 'success', 'danger', 'default'];
 
 export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
-  // Persistent Reply Keyboard
+  // Persistent Bottom Quick-Action Reply Keyboard (Exactly 2 buttons: Deposit & Support)
   {
-    settingKey: 'btn.reply.menu',
+    settingKey: 'btn.reply.deposit',
     section: 'main_menu',
-    textValue: 'MENU',
-    fallbackEmoji: '☰',
+    textValue: 'DEPOSIT',
+    fallbackEmoji: '➕',
+    buttonStyle: 'success',
+    localizedText: { en: 'DEPOSIT', ur: 'جمع کریں', 'ur-ro': 'DEPOSIT' },
+  },
+  {
+    settingKey: 'btn.reply.support',
+    section: 'main_menu',
+    textValue: 'SUPPORT',
+    fallbackEmoji: '🎧',
     buttonStyle: 'primary',
-    localizedText: { en: 'MENU', ur: 'مینو', 'ur-ro': 'MENU' },
+    localizedText: { en: 'SUPPORT', ur: 'سپورٹ', 'ur-ro': 'SUPPORT' },
+  },
+  {
+    settingKey: 'msg.input_placeholder',
+    section: 'messages',
+    textValue: translations.en.input_placeholder,
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: {
+      en: translations.en.input_placeholder,
+      ur: translations.ur.input_placeholder,
+      'ur-ro': translations['ur-ro'].input_placeholder,
+    },
   },
 
   // Main Menu Inline Buttons
@@ -490,7 +511,137 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
     fallbackEmoji: '🚪',
     buttonStyle: 'danger',
   },
+
+  // Built-in Telegram Slash-Command Menu Descriptions (DB-backed)
+  {
+    settingKey: 'cmd.start',
+    section: 'commands',
+    textValue: 'Open the XERO KHAN home screen',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Open the XERO KHAN home screen', ur: 'زیرو خان ہوم اسکرین کھولیں' },
+  },
+  {
+    settingKey: 'cmd.shop',
+    section: 'commands',
+    textValue: 'Browse all products',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Browse all products', ur: 'تمام پروڈکٹس دیکھیں' },
+  },
+  {
+    settingKey: 'cmd.featured',
+    section: 'commands',
+    textValue: 'View featured products',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'View featured products', ur: 'نمایاں پروڈکٹس دیکھیں' },
+  },
+  {
+    settingKey: 'cmd.search',
+    section: 'commands',
+    textValue: 'Search the catalogue',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Search the catalogue', ur: 'کیٹلاگ میں تلاش کریں' },
+  },
+  {
+    settingKey: 'cmd.wallet',
+    section: 'commands',
+    textValue: 'View your wallet',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'View your wallet', ur: 'اپنا والٹ دیکھیں' },
+  },
+  {
+    settingKey: 'cmd.deposit',
+    section: 'commands',
+    textValue: 'Add funds to your wallet',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Add funds to your wallet', ur: 'والٹ میں رقم جمع کریں' },
+  },
+  {
+    settingKey: 'cmd.orders',
+    section: 'commands',
+    textValue: 'View your orders',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'View your orders', ur: 'اپنے آرڈرز دیکھیں' },
+  },
+  {
+    settingKey: 'cmd.giveaways',
+    section: 'commands',
+    textValue: 'View active giveaways',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'View active giveaways', ur: 'فعال گیو اوے دیکھیں' },
+  },
+  {
+    settingKey: 'cmd.refer',
+    section: 'commands',
+    textValue: 'Refer friends and earn',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Refer friends and earn', ur: 'دوستوں کو مدعو کریں اور کمائیں' },
+  },
+  {
+    settingKey: 'cmd.support',
+    section: 'commands',
+    textValue: 'Contact support',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Contact support', ur: 'سپورٹ سے رابطہ کریں' },
+  },
+  {
+    settingKey: 'cmd.profile',
+    section: 'commands',
+    textValue: 'View your account',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'View your account', ur: 'اپنا اکاؤنٹ دیکھیں' },
+  },
+  {
+    settingKey: 'cmd.language',
+    section: 'commands',
+    textValue: 'Change language',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Change language', ur: 'زبان تبدیل کریں' },
+  },
+  {
+    settingKey: 'cmd.api',
+    section: 'commands',
+    textValue: 'Reseller API access',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Reseller API access', ur: 'ری سیلر API رسائی' },
+  },
+  {
+    settingKey: 'cmd.admin',
+    section: 'commands',
+    textValue: 'Open Admin Control Center',
+    fallbackEmoji: '',
+    buttonStyle: 'default',
+    localizedText: { en: 'Open Admin Control Center', ur: 'ایڈمن کنٹرول سینٹر کھولیں' },
+  },
 ];
+
+export const CUSTOMER_COMMAND_ORDER = [
+  'start',
+  'shop',
+  'featured',
+  'search',
+  'wallet',
+  'deposit',
+  'orders',
+  'giveaways',
+  'refer',
+  'support',
+  'profile',
+  'language',
+  'api',
+] as const;
 
 const DEFAULT_SPEC_MAP = new Map<string, DefaultUISettingSpec>(
   DEFAULT_UI_SETTINGS.map(spec => [spec.settingKey, spec])
@@ -499,6 +650,53 @@ const DEFAULT_SPEC_MAP = new Map<string, DefaultUISettingSpec>(
 export class UISettingService {
   private cache: Map<string, UISettingRecord> = new Map();
   private loaded = false;
+  private commandChangeListener: (() => void) | null = null;
+  private commandSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+  public setCommandsChangeListener(fn: (() => void) | null): void {
+    this.commandChangeListener = fn;
+  }
+
+  private scheduleCommandRefresh(): void {
+    if (!this.commandChangeListener) return;
+    if (this.commandSyncTimer) {
+      clearTimeout(this.commandSyncTimer);
+    }
+    this.commandSyncTimer = setTimeout(() => {
+      this.commandSyncTimer = null;
+      try {
+        this.commandChangeListener?.();
+      } catch (err: any) {
+        logger.warn('Debounced command refresh callback failed', { error: err.message });
+      }
+    }, 1500);
+    if (typeof (this.commandSyncTimer as any).unref === 'function') {
+      (this.commandSyncTimer as any).unref();
+    }
+  }
+
+  /**
+   * Build validated, deduplicated Telegram BotCommand[] list from DB-backed settings.
+   */
+  public getBotCommands(lang: SupportedLanguage = 'en', includeAdmin = false): TelegramBotCommand[] {
+    const names: string[] = [...CUSTOMER_COMMAND_ORDER];
+    if (includeAdmin) {
+      names.push('admin');
+    }
+    const seen = new Set<string>();
+    const list: TelegramBotCommand[] = [];
+    for (const cmd of names) {
+      if (!/^[a-z0-9_]{1,32}$/.test(cmd) || seen.has(cmd)) continue;
+      seen.add(cmd);
+      const rawDesc = this.getText(`cmd.${cmd}`, lang) || `/${cmd}`;
+      const cleanDesc = rawDesc.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 256);
+      list.push({
+        command: cmd,
+        description: cleanDesc.length >= 3 ? cleanDesc : `Run /${cmd}`,
+      });
+    }
+    return list;
+  }
 
   private cacheKey(settingKey: string, lang: SupportedLanguage): string {
     return `${settingKey}::${lang}`;
@@ -797,6 +995,9 @@ export class UISettingService {
     await this.reloadCache();
 
     const updated = this.getCachedSetting(params.settingKey, lang)!;
+    if (params.settingKey.startsWith('cmd.')) {
+      this.scheduleCommandRefresh();
+    }
     logger.info('UI setting updated by admin', {
       settingKey: params.settingKey,
       lang,
@@ -856,6 +1057,7 @@ export class UISettingService {
       [`log_${Date.now()}`, adminId]
     );
     logger.info('All UI settings reset to factory defaults', { adminId });
+    this.scheduleCommandRefresh();
     return DEFAULT_UI_SETTINGS.length * SUPPORTED_LANGUAGES.length;
   }
 
@@ -915,6 +1117,7 @@ export class UISettingService {
       'wallet_dep',
       'navigation',
       'messages',
+      'commands',
       'admin',
     ];
 

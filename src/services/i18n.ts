@@ -1,4 +1,5 @@
 import { db } from '../db/index.js';
+import { redis } from './redis.js';
 
 export type SupportedLanguage = 'en' | 'ur' | 'ur-ro';
 
@@ -12,20 +13,41 @@ export function resolveLanguage(lang?: string | null): SupportedLanguage {
   return 'en';
 }
 
+export async function invalidateUserLanguageCache(userId: string): Promise<void> {
+  try {
+    await redis.del(`userlang:${userId}`);
+  } catch {
+    // Non-fatal
+  }
+}
+
 export async function getUserLanguage(userId: string): Promise<SupportedLanguage> {
+  try {
+    const cached = await redis.get(`userlang:${userId}`);
+    if (cached) {
+      return resolveLanguage(cached);
+    }
+  } catch {
+    // Safe fallback to PostgreSQL
+  }
+
   try {
     const profile = await db.queryRow<{ preferred_language?: string }>(
       'SELECT preferred_language FROM user_profiles WHERE user_id = $1',
       [userId]
     );
     if (profile?.preferred_language) {
-      return resolveLanguage(profile.preferred_language);
+      const lang = resolveLanguage(profile.preferred_language);
+      await redis.set(`userlang:${userId}`, lang, 300).catch(() => {});
+      return lang;
     }
     const user = await db.queryRow<{ language_code?: string }>(
       'SELECT language_code FROM users WHERE id = $1',
       [userId]
     );
-    return resolveLanguage(user?.language_code);
+    const lang = resolveLanguage(user?.language_code);
+    await redis.set(`userlang:${userId}`, lang, 300).catch(() => {});
+    return lang;
   } catch {
     return 'en';
   }
@@ -94,6 +116,9 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     menu_support: '🎧 SUPPORT',
     menu_profile: '👤 PROFILE',
     menu_language: '🌐 LANGUAGE',
+    input_placeholder: 'Choose an option or type a message…',
+    api_info:
+      '🔌 *RESELLER API ACCESS*\n\nAutomated reseller API integration is available for verified partners using wallet-funded instant fulfillment.\n\n• API Docs & Key Onboarding: Contact Support below\n• Endpoint Auth: Partner-provisioned server credentials only',
     btn_back: '⬅️ BACK',
     btn_home: '🏠 HOME',
     btn_buy: '🛒 BUY NOW',
@@ -161,6 +186,9 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     menu_support: '🎧 سپورٹ',
     menu_profile: '👤 پروفائل',
     menu_language: '🌐 زبان',
+    input_placeholder: 'کوئی آپشن منتخب کریں یا پیغام لکھیں…',
+    api_info:
+      '🔌 *ری سیلر API رسائی*\n\nتصدیق شدہ پارٹنرز کے لیے خودکار ری سیلر API دستیاب ہے۔\n\n• API آن بورڈنگ کے لیے نیچے سپورٹ سے رابطہ کریں۔',
     btn_back: '⬅️ واپس',
     btn_home: '🏠 ہوم',
     btn_buy: '🛒 خریدیں',
@@ -228,6 +256,9 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     menu_support: '🎧 SUPPORT',
     menu_profile: '👤 PROFILE',
     menu_language: '🌐 ZUBAN',
+    input_placeholder: 'Option chunen ya message likhein…',
+    api_info:
+      '🔌 *RESELLER API ACCESS*\n\nVerified partners ke liye automated Reseller API integration dastiyab hai.\n\n• Onboarding ke liye neeche Support se rabta karein.',
     btn_back: '⬅️ WAPAS',
     btn_home: '🏠 HOME',
     btn_buy: '🛒 KHAREEDEIN',

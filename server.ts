@@ -49,6 +49,9 @@ async function startServer() {
     }
     const { uiConfigService } = await import('./src/services/uiConfig.js');
     await uiConfigService.ensureLoaded();
+    uiConfigService.setCommandsChangeListener(() => {
+      void telegramClient.registerBotCommandsSafely();
+    });
   } catch (err: any) {
     logger.error('Database migration/verification error', { error: err.message });
   }
@@ -91,7 +94,7 @@ async function startServer() {
     });
   });
 
-  // 6. Register Telegram Webhook (non-blocking, bounded timeout)
+  // 6. Register Telegram Webhook & Built-in Slash Command Menu (non-blocking, bounded timeout)
   if (config.telegram.webhookUrl && config.telegram.botToken) {
     logger.info('Registering Telegram Webhook with bounded timeout...', { url: config.telegram.webhookUrl });
     telegramClient.setWebhook(config.telegram.webhookUrl, config.telegram.webhookSecret)
@@ -107,6 +110,10 @@ async function startServer() {
       });
   } else {
     logger.info('Telegram webhook URL not configured. Operating in simulation / webhook-ready mode');
+  }
+
+  if (config.telegram.botToken) {
+    void telegramClient.registerBotCommandsSafely();
   }
 
   // 7. Non-blocking initial catalogue sync in background

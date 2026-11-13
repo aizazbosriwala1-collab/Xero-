@@ -214,6 +214,61 @@ export class PricingService {
   }
 
   /**
+   * Fetch a single product with resolved retail pricing (avoids scanning the full catalogue on product clicks).
+   */
+  public async getCatalogItemById(productId: string): Promise<ProductCatalogItem | null> {
+    const row = await db.queryRow<any>(
+      `SELECT sp.id, sp.supplier_product_id as "supplierProductId",
+              sp.original_name as "originalName",
+              sp.original_description as "originalDescription",
+              sp.latest_cost as "latestCost",
+              sp.latest_stock as "latestStock",
+              sp.is_unlimited as "isUnlimited",
+              sp.requires_email as "requiresEmail",
+              sp.supplier_type as "supplierType",
+              sp.duration, sp.warranty_summary as "warrantySummary",
+              sp.is_available as "isAvailable",
+              po.display_name_override as "displayNameOverride",
+              po.description_override as "descriptionOverride",
+              po.is_hidden as "isHidden",
+              po.is_featured as "isFeatured",
+              pc.id as "catId", pc.slug as "catSlug", pc.name as "catName"
+       FROM supplier_products sp
+       LEFT JOIN product_overrides po ON sp.id = po.product_id
+       LEFT JOIN product_categories pc ON po.category_id = pc.id
+       WHERE sp.id = $1`,
+      [productId]
+    );
+    if (!row) return null;
+
+    const priceCalc = await this.calculatePrice(row.id);
+    return {
+      id: row.id,
+      supplierProductId: row.supplierProductId,
+      name: row.displayNameOverride || row.originalName,
+      description: row.descriptionOverride || row.originalDescription || '',
+      category: {
+        id: row.catId || 'cat_ai-tools',
+        slug: row.catSlug || 'ai-tools',
+        name: row.catName || 'AI Tools',
+      },
+      supplierCost: priceCalc.supplierCost.toFixed(4),
+      sellingPrice: priceCalc.customerUnitPrice.toFixed(2),
+      markup: priceCalc.markup.toFixed(4),
+      pricingRule: priceCalc.ruleApplied,
+      stock: row.latestStock || 0,
+      isUnlimited: Boolean(row.isUnlimited),
+      requiresEmail: Boolean(row.requiresEmail),
+      supplierType: row.supplierType || 'account',
+      duration: row.duration || '1 Month',
+      warrantySummary: row.warrantySummary || 'Full duration warranty',
+      isAvailable: Boolean(row.isAvailable),
+      isFeatured: Boolean(row.isFeatured),
+      isHidden: Boolean(row.isHidden),
+    };
+  }
+
+  /**
    * Get all active catalogue products for customer view (respecting filters, categories, search).
    */
   public async getCatalog(params: {

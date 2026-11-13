@@ -30,6 +30,7 @@ export const REGISTERED_CUSTOMER_CALLBACKS = {
     'm:supp',
     'm:prof',
     'm:lang',
+    'm:api',
   ]),
   prefixes: ['nav:', 'catp:', 'feat:', 'srch:', 'cat:', 'p:', 'qty:', 'buy:', 'buyc:', 'det:', 'bin_tx:', 'gw_cl:', 'lang:'],
 };
@@ -72,6 +73,36 @@ export const REGISTERED_ADMIN_CALLBACKS = {
   ],
 };
 
+/**
+ * Authoritative registry of all Telegram slash commands supported by the router.
+ */
+export const REGISTERED_TEXT_COMMANDS = [
+  'start',
+  'shop',
+  'featured',
+  'search',
+  'wallet',
+  'deposit',
+  'orders',
+  'giveaways',
+  'refer',
+  'support',
+  'profile',
+  'language',
+  'api',
+  'admin',
+] as const;
+
+export const LEGACY_COMMAND_ALIASES = ['products', 'referral', 'menu', 'help'] as const;
+
+export function isRegisteredTextCommand(command: string): boolean {
+  const norm = command.replace(/^\//, '').split('@')[0].trim().toLowerCase();
+  return (
+    (REGISTERED_TEXT_COMMANDS as readonly string[]).includes(norm) ||
+    (LEGACY_COMMAND_ALIASES as readonly string[]).includes(norm)
+  );
+}
+
 export function isRegisteredCallbackRoute(data: string): boolean {
   if (!data) return false;
   if (data.startsWith('adm')) {
@@ -88,9 +119,11 @@ export function isRegisteredCallbackRoute(data: string): boolean {
 
 export class TelegramBotRouter {
   /**
-   * Process incoming Telegram update with duplicate update idempotency.
+   * Process incoming Telegram update with duplicate update idempotency & sanitized phase timing.
    */
   public async handleUpdate(update: TelegramUpdate, secretHeader?: string): Promise<{ ok: boolean; status: string }> {
+    const updateStartedAt = Date.now();
+
     // 1. Verify Telegram Webhook Secret Token if configured
     if (config.telegram.webhookSecret && secretHeader !== config.telegram.webhookSecret) {
       logger.warn('Unauthorized webhook request: secret token mismatch');
@@ -102,6 +135,7 @@ export class TelegramBotRouter {
     }
 
     // 2. Duplicate update protection (idempotency)
+    const dedupStartedAt = Date.now();
     try {
       const existing = await db.queryRow<any>(
         'SELECT update_id FROM telegram_processed_updates WHERE update_id = $1',
@@ -120,10 +154,16 @@ export class TelegramBotRouter {
     } catch (err: any) {
       logger.error('Error recording processed update', { error: err.message, updateId: update.update_id });
     }
+    const dedupMs = Date.now() - dedupStartedAt;
+
+    let route = 'unknown';
+    let status = 'IGNORED';
+    const handlerStartedAt = Date.now();
 
     // 3. Route Callback Query
     if (update.callback_query) {
       const cb = update.callback_query;
+      route = cb.data ? cb.data.split(':').slice(0, 2).join(':') : 'callback:empty';
       try {
         if (cb.data?.startsWith('adm')) {
           await adminHandler.handleCallback(cb);
@@ -131,109 +171,110 @@ export class TelegramBotRouter {
           await customerHandler.handleCallback(cb);
         }
       } catch (err: any) {
-        logger.error('Error handling callback query', { error: err.message, data: cb.data });
+        logger.error('Error handling callback query', { error: err.message, route });
       }
-      return { ok: true, status: 'CALLBACK_PROCESSED' };
-    }
-
-    // 4. Route Message
-    if (update.message) {
+      status = 'CALLBACK_PROCESSED';
+    } else if (update.message) {
+      // 4. Route Message
       const msg = update.message;
       const text = msg.text?.trim() || '';
+      const cmdMatch = text.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+(.*))?$/);
+      const command = cmdMatch ? cmdMatch[1].toLowerCase() : null;
+      const commandArg = cmdMatch?.[2]?.trim();
 
       try {
-        if (text.startsWith('/start')) {
-          const parts = text.split(' ');
-          const refCode = parts[1];
-          await customerHandler.handleStart(msg, refCode);
-          return { ok: true, status: 'START_PROCESSED' };
-        }
-
-        if (text === '/menu') {
+        if (command === 'start') {
+          route = '/start';
+          await customerHandler.handleStart(msg, commandArg);
+          status = 'START_PROCESSED';
+        } else if (command === 'menu') {
+          route = '/menu';
           await customerHandler.handleTextMessage(msg);
-          return { ok: true, status: 'MENU_PROCESSED' };
-        }
-
-        if (text === '/admin') {
+          status = 'MENU_PROCESSED';
+        } else if (command === 'admin') {
+          route = '/admin';
           await adminHandler.handleAdminCommand(msg);
-          return { ok: true, status: 'ADMIN_PROCESSED' };
-        }
-
-        if (text === '/products') {
+          status = 'ADMIN_PROCESSED';
+        } else if (command === 'shop' || command === 'products') {
+          route = `/${command}`;
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:prod' });
-          return { ok: true, status: 'PRODUCTS_PROCESSED' };
-        }
-
-        if (text === '/featured') {
+          status = 'PRODUCTS_PROCESSED';
+        } else if (command === 'featured') {
+          route = '/featured';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:feat' });
-          return { ok: true, status: 'FEATURED_PROCESSED' };
-        }
-
-        if (text === '/search') {
+          status = 'FEATURED_PROCESSED';
+        } else if (command === 'search') {
+          route = '/search';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:srch' });
-          return { ok: true, status: 'SEARCH_PROCESSED' };
-        }
-
-        if (text === '/wallet') {
+          status = 'SEARCH_PROCESSED';
+        } else if (command === 'wallet') {
+          route = '/wallet';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:wall' });
-          return { ok: true, status: 'WALLET_PROCESSED' };
-        }
-
-        if (text === '/deposit') {
+          status = 'WALLET_PROCESSED';
+        } else if (command === 'deposit') {
+          route = '/deposit';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:dep' });
-          return { ok: true, status: 'DEPOSIT_PROCESSED' };
-        }
-
-        if (text === '/orders') {
+          status = 'DEPOSIT_PROCESSED';
+        } else if (command === 'orders') {
+          route = '/orders';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:ord' });
-          return { ok: true, status: 'ORDERS_PROCESSED' };
-        }
-
-        if (text === '/giveaways') {
+          status = 'ORDERS_PROCESSED';
+        } else if (command === 'giveaways') {
+          route = '/giveaways';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:give' });
-          return { ok: true, status: 'GIVEAWAYS_PROCESSED' };
-        }
-
-        if (text === '/referral') {
+          status = 'GIVEAWAYS_PROCESSED';
+        } else if (command === 'refer' || command === 'referral') {
+          route = `/${command}`;
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:ref' });
-          return { ok: true, status: 'REFERRAL_PROCESSED' };
-        }
-
-        if (text === '/support') {
+          status = 'REFERRAL_PROCESSED';
+        } else if (command === 'support') {
+          route = '/support';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:supp' });
-          return { ok: true, status: 'SUPPORT_PROCESSED' };
-        }
-
-        if (text === '/profile') {
+          status = 'SUPPORT_PROCESSED';
+        } else if (command === 'profile') {
+          route = '/profile';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:prof' });
-          return { ok: true, status: 'PROFILE_PROCESSED' };
-        }
-
-        if (text === '/language') {
+          status = 'PROFILE_PROCESSED';
+        } else if (command === 'language') {
+          route = '/language';
           await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:lang' });
-          return { ok: true, status: 'LANGUAGE_PROCESSED' };
-        }
-
-        if (text === '/help') {
+          status = 'LANGUAGE_PROCESSED';
+        } else if (command === 'api') {
+          route = '/api';
+          await customerHandler.handleCallback({ id: '0', from: msg.from!, message: msg, data: 'm:api' });
+          status = 'API_PROCESSED';
+        } else if (command === 'help') {
+          route = '/help';
           await customerHandler.handleStart(msg);
-          return { ok: true, status: 'HELP_PROCESSED' };
-        }
-
-        if (msg.photo && msg.photo.length > 0) {
+          status = 'HELP_PROCESSED';
+        } else if (msg.photo && msg.photo.length > 0) {
+          route = 'photo';
           await customerHandler.handlePhoto(msg);
-          return { ok: true, status: 'PHOTO_PROCESSED' };
-        }
-
-        if (text) {
+          status = 'PHOTO_PROCESSED';
+        } else if (text) {
+          route = 'text_or_reply_button';
           await customerHandler.handleTextMessage(msg);
-          return { ok: true, status: 'TEXT_PROCESSED' };
+          status = 'TEXT_PROCESSED';
         }
       } catch (err: any) {
-        logger.error('Error processing message update', { error: err.message, text });
+        logger.error('Error processing message update', { error: err.message, route });
       }
     }
 
-    return { ok: true, status: 'IGNORED' };
+    const handlerMs = Date.now() - handlerStartedAt;
+    const totalMs = Date.now() - updateStartedAt;
+    if (status !== 'IGNORED') {
+      logger.debug('Telegram update timing', {
+        updateId: update.update_id,
+        route,
+        status,
+        dedupMs,
+        handlerMs,
+        totalMs,
+      });
+    }
+
+    return { ok: true, status };
   }
 }
 

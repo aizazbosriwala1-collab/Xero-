@@ -11,7 +11,7 @@ import { giveawayService } from '../../services/giveaway.js';
 import { supportService } from '../../services/support.js';
 import { uiConfigService } from '../../services/uiConfig.js';
 import { navigationService } from '../../services/navigation.js';
-import { t, SupportedLanguage, resolveLanguage, getUserLanguage } from '../../services/i18n.js';
+import { t, SupportedLanguage, resolveLanguage, getUserLanguage, invalidateUserLanguageCache } from '../../services/i18n.js';
 import { config } from '../../config/env.js';
 import {
   getCustomerMainInlineKeyboard,
@@ -79,30 +79,41 @@ export class CustomerHandler {
    */
   public async handleStart(msg: TelegramMessage, referrerCode?: string) {
     if (!msg.from) return;
-    await uiConfigService.ensureLoaded();
-    const { userId, isAdmin, lang } = await this.ensureUser(msg.from);
+    const [, userInfo] = await Promise.all([uiConfigService.ensureLoaded(), this.ensureUser(msg.from)]);
+    const { userId, isAdmin, lang } = userInfo;
 
-    if (referrerCode && referrerCode.startsWith('ref_')) {
-      const referrerId = referrerCode.replace('ref_', '').trim();
-      await referralService.registerReferral(referrerId, userId);
-    }
+    const [navState] = await Promise.all([
+      navigationService.getState(userId),
+      redis.clearFsmState(userId),
+      referrerCode && referrerCode.startsWith('ref_')
+        ? referralService.registerReferral(referrerCode.replace('ref_', '').trim(), userId)
+        : Promise.resolve(false),
+    ]);
 
-    await redis.clearFsmState(userId);
     const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
 
-    // Send minimal persistent reply keyboard (☰ MENU)
-    await telegramClient.sendMessage(msg.chat.id, t('menu_ready', lang), {
-      reply_markup: getCustomerMainReplyKeyboard(lang),
-    });
-
-    // Send styled interactive inline menu
+    // Send single polished welcome screen + colored inline dashboard
     const sent = await telegramClient.sendMessage(msg.chat.id, welcomeText, {
       reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
     });
 
+    // Attach/upgrade persistent 2-button bottom reply keyboard ([ Deposit ] [ Support ]) cleanly without duplicating home screen
+    const needsReplyKbAttach = navState?.filters?.replyKbVersion !== 'v2_2btn';
+    if (needsReplyKbAttach) {
+      const quickBarHint =
+        lang === 'ur'
+          ? '⚡ فوری رسائی نیچے فعال ہے: رقم جمع کریں یا سپورٹ۔'
+          : '⚡ Quick actions enabled below: Deposit or Support.';
+      await telegramClient.sendMessage(msg.chat.id, quickBarHint, {
+        disable_notification: true,
+        reply_markup: getCustomerMainReplyKeyboard(lang),
+      });
+    }
+
     await navigationService.saveState(userId, {
       screen: 'home',
       activeMessageId: sent?.result?.message_id,
+      filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' },
       rotateToken: true,
     });
   }
@@ -133,20 +144,23 @@ export class CustomerHandler {
    */
   public async handleCallback(cb: TelegramCallbackQuery) {
     if (!cb.data) return;
-    await uiConfigService.ensureLoaded();
+
+    // Immediate callback acknowledgment before DB/UI lookups so Telegram stops spinner immediately
+    const ackPromise =
+      cb.id && cb.id !== '0'
+        ? telegramClient.answerCallbackQuery(cb.id).catch(() => {})
+        : Promise.resolve();
 
     const chatId = cb.message?.chat.id ?? cb.from.id;
     const messageId = cb.message?.message_id;
     const userId = String(cb.from.id);
-    const data = cb.data;
+    let data = cb.data;
     const isAdmin = config.telegram.adminIds.includes(userId);
-    const lang = await getUserLanguage(userId);
 
-    if (cb.id && cb.id !== '0') {
-      await telegramClient.answerCallbackQuery(cb.id);
-    }
+    const [, lang] = await Promise.all([uiConfigService.ensureLoaded(), getUserLanguage(userId)]);
 
     if (data === 'noop') {
+      await ackPromise;
       return;
     }
 
@@ -156,17 +170,21 @@ export class CustomerHandler {
       const check = await navigationService.validateToken(userId, token);
       if (!check.valid) {
         await this.renderMenu(chatId, messageId, userId, t('stale_menu', lang), getStaleMenuKeyboard(lang));
+        await ackPromise;
         return;
       }
-      data === 'm:home';
+      data = 'm:home';
     }
 
     // Navigation: Home
     if (data === 'm:home') {
-      await redis.clearFsmState(userId);
-      await navigationService.saveState(userId, { screen: 'home', categoryId: 'all', page: 1 });
+      await Promise.all([
+        redis.clearFsmState(userId),
+        navigationService.saveState(userId, { screen: 'home', categoryId: 'all', page: 1 }),
+      ]);
       const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
       await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, lang));
+      await ackPromise;
       return;
     }
 
@@ -617,8 +635,10 @@ export class CustomerHandler {
 
     // Profile
     if (data === 'm:prof') {
-      const { balance } = await walletService.getBalance(userId);
-      const stats = await referralService.getStats(userId);
+      const [{ balance }, stats] = await Promise.all([
+        walletService.getBalance(userId),
+        referralService.getStats(userId),
+      ]);
       const langLabel = lang === 'ur' ? 'اردو' : lang === 'ur-ro' ? 'Roman Urdu' : 'English';
       const template = uiConfigService.getText('msg.profile_header', lang) || t('profile_header', lang);
       const text = template
@@ -627,6 +647,14 @@ export class CustomerHandler {
         .replace(/\{qualified\}/g, String(stats.qualifiedCount))
         .replace(/\{langLabel\}/g, langLabel);
       await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
+      await ackPromise;
+      return;
+    }
+
+    // Reseller API info
+    if (data === 'm:api') {
+      await this.renderMenu(chatId, messageId, userId, t('api_info', lang), getBackHomeKeyboard('m:home', lang));
+      await ackPromise;
       return;
     }
 
@@ -634,52 +662,85 @@ export class CustomerHandler {
     if (data === 'm:lang') {
       const text = uiConfigService.getText('msg.language_select', lang) || t('language_select', lang);
       await this.renderMenu(chatId, messageId, userId, text, getLanguageKeyboard(lang));
+      await ackPromise;
       return;
     }
 
-    // Apply Language Selection & Immediately Refresh Menu
+    // Apply Language Selection & Immediately Refresh Menu + Localized Bottom Bar
     if (data.startsWith('lang:')) {
       const selected = resolveLanguage(data.split(':')[1]);
-      await db.query('UPDATE users SET language_code = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [selected, userId]);
-      await db.query(
-        `INSERT INTO user_profiles (user_id, preferred_language, created_at, updated_at)
-         VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-         ON CONFLICT (user_id) DO UPDATE SET preferred_language = $2, updated_at = CURRENT_TIMESTAMP`,
-        [userId, selected]
-      );
+      await Promise.all([
+        db.query('UPDATE users SET language_code = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [selected, userId]),
+        db.query(
+          `INSERT INTO user_profiles (user_id, preferred_language, created_at, updated_at)
+           VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+           ON CONFLICT (user_id) DO UPDATE SET preferred_language = $2, updated_at = CURRENT_TIMESTAMP`,
+          [userId, selected]
+        ),
+      ]);
+      await invalidateUserLanguageCache(userId);
       await telegramClient.sendMessage(chatId, t('language_updated', selected), {
+        disable_notification: true,
         reply_markup: getCustomerMainReplyKeyboard(selected),
+      });
+      const existingNav = await navigationService.getState(userId);
+      await navigationService.saveState(userId, {
+        filters: { ...(existingNav?.filters || {}), replyKbVersion: 'v2_2btn' },
       });
       const welcomeText = uiConfigService.getText('msg.welcome', selected) || t('welcome', selected);
       await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, selected));
+      await ackPromise;
       return;
     }
 
     // Unrecognized / expired callback safe recovery
     await this.renderMenu(chatId, messageId, userId, t('stale_menu', lang), getStaleMenuKeyboard(lang));
+    await ackPromise;
   }
 
   /**
-   * Handle text messages according to active FSM State and persistent reply keyboard
+   * Handle text messages according to active FSM State and persistent/legacy reply keyboard
    */
   public async handleTextMessage(msg: TelegramMessage) {
     if (!msg.from || !msg.text) return;
-    await uiConfigService.ensureLoaded();
 
     const userId = String(msg.from.id);
     const chatId = msg.chat.id;
     const text = msg.text.trim();
+    const norm = text.toLowerCase();
     const isAdmin = config.telegram.adminIds.includes(userId);
-    const lang = await getUserLanguage(userId);
 
-    // Persistent minimal reply keyboard (☰ MENU / localized / /menu)
-    const configuredMenuLabel = ButtonBuilder.buildReplyButton({ settingKey: 'btn.reply.menu', lang }).text;
+    const [, lang] = await Promise.all([uiConfigService.ensureLoaded(), getUserLanguage(userId)]);
+
+    const depBtnText = ButtonBuilder.buildReplyButton({ settingKey: 'btn.reply.deposit', lang }).text.trim().toLowerCase();
+    const supBtnText = ButtonBuilder.buildReplyButton({ settingKey: 'btn.reply.support', lang }).text.trim().toLowerCase();
+
+    // Persistent 2-button bottom bar: Deposit & Support (plus legacy variants)
     if (
-      text === '☰ MENU' ||
-      text === configuredMenuLabel ||
-      text === '☰ مینو' ||
-      text === '/menu'
+      norm === depBtnText ||
+      norm === '➕ deposit' ||
+      norm === 'deposit' ||
+      norm === '➕ add funds' ||
+      norm === 'add funds' ||
+      norm === '➕ جمع کریں'
     ) {
+      await redis.clearFsmState(userId);
+      return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:dep' });
+    }
+
+    if (
+      norm === supBtnText ||
+      norm === '🎧 support' ||
+      norm === 'support' ||
+      norm === '🛟 support' ||
+      norm === '🎧 سپورٹ'
+    ) {
+      await redis.clearFsmState(userId);
+      return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:supp' });
+    }
+
+    // Backward-compatible legacy reply keyboard button triggers (☰ MENU, Products, Shop, etc.)
+    if (norm === '☰ menu' || norm === '☰ مینو' || norm === 'menu' || norm === '/menu') {
       await redis.clearFsmState(userId);
       const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
       const sent = await telegramClient.sendMessage(chatId, welcomeText, {
@@ -692,18 +753,17 @@ export class CustomerHandler {
       return;
     }
 
-    // Backward-compatible legacy reply keyboard button triggers
-    if (text === '🛍️ PRODUCTS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:prod' });
-    if (text === '🔥 FEATURED') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:feat' });
-    if (text === '🔎 SEARCH') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:srch' });
-    if (text === '💰 WALLET' || text === '💳 WALLET') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:wall' });
-    if (text === '➕ ADD FUNDS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:dep' });
-    if (text === '📦 MY ORDERS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:ord' });
-    if (text === '🎁 GIVEAWAYS') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:give' });
-    if (text === '👥 REFER & EARN') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:ref' });
-    if (text === '🛟 SUPPORT' || text === '🎧 SUPPORT') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:supp' });
-    if (text === '👤 PROFILE') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:prof' });
-    if (text === '🌐 LANGUAGE') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:lang' });
+    if (norm === '🛍️ products' || norm === 'products' || norm === 'shop' || norm === '🛍️ پروڈکٹس') {
+      return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:prod' });
+    }
+    if (norm === '🔥 featured') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:feat' });
+    if (norm === '🔎 search') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:srch' });
+    if (norm === '💰 wallet' || norm === '💳 wallet') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:wall' });
+    if (norm === '📦 my orders') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:ord' });
+    if (norm === '🎁 giveaways') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:give' });
+    if (norm === '👥 refer & earn') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:ref' });
+    if (norm === '👤 profile') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:prof' });
+    if (norm === '🌐 language') return this.handleCallback({ id: '0', from: msg.from, message: msg, data: 'm:lang' });
 
     const fsm = await redis.getFsmState<UserFsmState>(userId);
     if (!fsm) return;
@@ -1056,19 +1116,10 @@ export class CustomerHandler {
     page = 1,
     lang: SupportedLanguage = 'en'
   ): Promise<void> {
-    const isAll = catId === 'all';
-    const catalog = await pricingService.getCatalog({
-      categoryId: isAll ? undefined : catId,
-      page: 1,
-      pageSize: 250,
-      includeHidden: true,
-    });
-
-    let product = catalog.items.find(item => item.id === productId);
-    if (!product) {
-      const searchRes = await pricingService.getCatalog({ includeHidden: true, pageSize: 250 });
-      product = searchRes.items.find(item => item.id === productId);
-    }
+    const [product, adj] = await Promise.all([
+      pricingService.getCatalogItemById(productId),
+      this.getAdjacentProducts(productId, catId, 6),
+    ]);
 
     if (!product) {
       const notFoundMsg = '⚠️ Product is no longer available in the catalogue.';
@@ -1084,7 +1135,6 @@ export class CustomerHandler {
       return;
     }
 
-    const adj = await this.getAdjacentProducts(productId, catId, 6);
     const text = this.formatProductCard(product, quantity);
 
     const keyboard = getProductDetailKeyboard({

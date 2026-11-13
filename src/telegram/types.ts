@@ -41,7 +41,18 @@ export interface TelegramReplyKeyboardMarkup {
   resize_keyboard?: boolean;
   one_time_keyboard?: boolean;
   is_persistent?: boolean;
+  input_field_placeholder?: string;
 }
+
+export interface TelegramBotCommand {
+  command: string;
+  description: string;
+}
+
+export type TelegramBotCommandScope =
+  | { type: 'default' }
+  | { type: 'all_private_chats' }
+  | { type: 'chat'; chat_id: number | string };
 
 export interface TelegramPhotoSize {
   file_id: string;
