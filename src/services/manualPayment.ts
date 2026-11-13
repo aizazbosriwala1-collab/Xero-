@@ -183,6 +183,7 @@ export class ManualPaymentService {
           txid: deposit.txid,
           notes,
         },
+        client,
       });
 
       // 5. Admin audit log

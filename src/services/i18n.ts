@@ -77,7 +77,7 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     choose_payment:
       '➕ *ADD FUNDS TO WALLET*\n\nSelect your preferred deposit method below:',
     binance_desc:
-      '⚡ *BINANCE PAY USDT*\n\nInstant TXID verification. No screenshot required.',
+      '⚡ *BINANCE PAY USDT*\n\nInstant Order ID verification. No screenshot required.',
     manual_desc:
       '📱 *LOCAL MOBILE PAYMENT*\n\nManual verification by admin within 5–30 minutes.',
     order_success:
@@ -148,7 +148,7 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     wallet_history_empty: '📜 *والٹ لین دین*\n\nابھی تک کوئی لین دین ریکارڈ نہیں ہوا۔',
     choose_payment:
       '➕ *والٹ میں رقم جمع کریں*\n\nنیچے سے ادائیگی کا طریقہ منتخب کریں:',
-    binance_desc: '⚡ *بائننس پے USDT*\n\nفوری ٹرانزیکشن آئی ڈی تصدیق۔',
+    binance_desc: '⚡ *بائننس پے USDT*\n\nفوری آرڈر آئی ڈی تصدیق۔ اسکرین شاٹ درکار نہیں۔',
     manual_desc: '📱 *ایزی پیسہ / جاز کیش*\n\nایڈمن کی تصدیق 5 سے 30 منٹ میں۔',
     order_success:
       '🎉 *آرڈر مکمل ہو گیا!*\n\nآپ کا آرڈر `{orderId}` کامیابی سے ڈیلیور ہو چکا ہے۔\n\n*تفصیلات / اسناد:*',
@@ -218,7 +218,7 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     wallet_history_empty: '📜 *WALLET TRANSACTIONS*\n\nAbhi tak koi transaction record nahi hui.',
     choose_payment:
       '➕ *WALLET MEIN FUNDS ADD KAREIN*\n\nApna pasandeeda payment method chunen:',
-    binance_desc: '⚡ *BINANCE PAY USDT*\n\nForan TXID verification. Screenshot zaroori nahi.',
+    binance_desc: '⚡ *BINANCE PAY USDT*\n\nForan Order ID verification. Screenshot zaroori nahi.',
     manual_desc: '📱 *EASYPAISA / JAZZCASH*\n\nAdmin verification 5–30 minutes mein.',
     order_success:
       '🎉 *ORDER MUKAMMAL HOGAYA!*\n\nAap ka order `{orderId}` kamyabi se deliver kardiya gaya hai.\n\n*Credentials / Details:*',

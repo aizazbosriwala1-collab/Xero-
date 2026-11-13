@@ -43,6 +43,7 @@ export interface WalletOperationParams {
   source: string;
   actor: string;
   metadata?: Record<string, unknown>;
+  client?: DbClient;
 }
 
 export class WalletService {
@@ -130,8 +131,7 @@ export class WalletService {
       throw new Error(`Invalid amount for wallet mutation: ${params.amount}`);
     }
 
-    return await this.withUserLock(params.userId, async () => {
-      return await db.withTransaction(async (client) => {
+    const runWithClient = async (client: DbClient) => {
         // 1. Idempotency Check: Verify if this operation_ref already exists in ledger
         const existingLedger = await client.queryRow<any>(
           'SELECT * FROM ledger_entries WHERE operation_ref = $1',
@@ -248,7 +248,13 @@ export class WalletService {
         });
 
         return { wallet: updatedWallet, ledger: ledgerRecord };
-      });
+    };
+
+    return await this.withUserLock(params.userId, async () => {
+      if (params.client) {
+        return await runWithClient(params.client);
+      }
+      return await db.withTransaction(runWithClient);
     });
   }
 

@@ -369,9 +369,14 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
   {
     settingKey: 'btn.dep.bin_submit',
     section: 'wallet_dep',
-    textValue: 'SUBMIT TRANSACTION ID',
+    textValue: 'SUBMIT ORDER ID',
     fallbackEmoji: '🔎',
     buttonStyle: 'success',
+    localizedText: {
+      en: 'SUBMIT ORDER ID',
+      ur: 'آرڈر آئی ڈی جمع کریں',
+      'ur-ro': 'ORDER ID SUBMIT KAREIN',
+    },
   },
   {
     settingKey: 'btn.dep.cancel',
@@ -813,6 +818,25 @@ export class UISettingService {
         );
       }
     }
+
+    // Safely migrate unmodified factory default label from Transaction ID -> Order ID
+    // without touching any admin-customized UI text.
+    const binSubmitSpec = DEFAULT_SPEC_MAP.get('btn.dep.bin_submit');
+    if (binSubmitSpec) {
+      for (const lang of SUPPORTED_LANGUAGES) {
+        const nextText = binSubmitSpec.localizedText?.[lang] || binSubmitSpec.textValue;
+        await db.query(
+          `UPDATE ui_settings
+           SET text_value = $1, updated_at = CURRENT_TIMESTAMP
+           WHERE setting_key = 'btn.dep.bin_submit'
+             AND language_code = $2
+             AND updated_by = 'SYSTEM_DEFAULT'
+             AND text_value IN ('SUBMIT TRANSACTION ID', 'SUBMIT TRANSACTION ID ')`,
+          [nextText, lang]
+        );
+      }
+    }
+
     await this.reloadCache();
   }
 

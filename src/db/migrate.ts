@@ -11,6 +11,7 @@ const MIGRATION_LOCK_ID = 987654321;
 const MIGRATIONS: Array<{ version: number; name: string; filename: string }> = [
   { version: 1, name: '001_initial_schema', filename: '001_initial_schema.sql' },
   { version: 2, name: '002_ui_customization', filename: '002_ui_customization.sql' },
+  { version: 3, name: '003_binance_order_id', filename: '003_binance_order_id.sql' },
 ];
 
 function readMigrationSql(filename: string): string {
@@ -63,6 +64,30 @@ export async function runMigrations(): Promise<void> {
     for (const mig of MIGRATIONS) {
       if (!appliedVersions.has(mig.version)) {
         logger.info(`Applying migration ${mig.filename}...`);
+
+        if (mig.version === 3) {
+          try {
+            const dupCheck = await client.queryRow<{ dup_count: string }>(
+              `SELECT COUNT(*)::text AS dup_count
+               FROM (
+                 SELECT binance_order_id
+                 FROM deposits
+                 WHERE binance_order_id IS NOT NULL
+                 GROUP BY binance_order_id
+                 HAVING COUNT(*) > 1
+               ) dups`
+            );
+            if (Number(dupCheck?.dup_count || 0) > 0) {
+              throw new Error('Duplicate binance_order_id values detected prior to unique index creation');
+            }
+          } catch (preflightErr: any) {
+            if (preflightErr?.message?.includes('Duplicate binance_order_id')) {
+              throw preflightErr;
+            }
+            // Expected when column binance_order_id does not yet exist before ALTER TABLE
+          }
+        }
+
         const sqlContent = readMigrationSql(mig.filename);
 
         const statements = sqlContent

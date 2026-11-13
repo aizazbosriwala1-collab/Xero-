@@ -24,7 +24,7 @@ import {
 import { telegramClient } from '../src/telegram/client.js';
 import { encryptionService, EncryptionService } from '../src/services/encryption.js';
 import { sanitizeObject } from '../src/services/logger.js';
-import { config } from '../src/config/env.js';
+import { config, parseBoundedClockToleranceSeconds, getSanitizedConfig } from '../src/config/env.js';
 import { adminHandler } from '../src/telegram/handlers/admin.js';
 import { customerHandler } from '../src/telegram/handlers/customer.js';
 import { uiConfigService, CUSTOMER_COMMAND_ORDER } from '../src/services/uiConfig.js';
@@ -32,6 +32,7 @@ import { getUserLanguage, invalidateUserLanguageCache } from '../src/services/i1
 import { navigationService } from '../src/services/navigation.js';
 import { ButtonBuilder } from '../src/telegram/buttonBuilder.js';
 import { redis } from '../src/services/redis.js';
+import { supportService } from '../src/services/support.js';
 import {
   getCustomerMainReplyKeyboard,
   getCustomerMainInlineKeyboard,
@@ -43,6 +44,7 @@ import {
   getWalletKeyboard,
   getDepositMethodsKeyboard,
   getBinanceInvoiceKeyboard,
+  getPaymentBeforeInvoiceKeyboard,
   getLanguageKeyboard,
   getStaleMenuKeyboard,
   getAdminMainMenuKeyboard,
@@ -1091,15 +1093,15 @@ export async function runComprehensiveTests() {
     config.binance.receiverId = 'BINANCE_TEST_REC_777';
     try {
       const inv = await binanceService.createInvoice('usr_tx_guard', '1.00');
-      // Customer mistakenly pastes the deposit/invoice ID as the transaction ID
+      // Customer mistakenly pastes the deposit/invoice ID as the Order ID
       const resInv = await binanceService.verifyDeposit(inv.id, inv.id, 'usr_tx_guard');
       assert.strictEqual(resInv.verified, false);
-      assert.strictEqual(resInv.classification, 'TXID_NOT_FOUND');
+      assert.strictEqual(resInv.classification, 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE');
 
-      // Customer mistakenly pastes the receiver ID as the transaction ID
+      // Customer mistakenly pastes the receiver ID as the Order ID
       const resRec = await binanceService.verifyDeposit(inv.id, 'BINANCE_TEST_REC_777', 'usr_tx_guard');
       assert.strictEqual(resRec.verified, false);
-      assert.strictEqual(resRec.classification, 'TXID_NOT_FOUND');
+      assert.strictEqual(resRec.classification, 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE');
     } finally {
       config.binance.receiverId = origReceiver;
     }
@@ -1129,10 +1131,10 @@ export async function runComprehensiveTests() {
     assert.strictEqual(d.status, 'PENDING', 'Deposit status must remain PENDING with zero credit');
   });
 
-  await it('Binance TXID-only UX: invoice displays exactly two buttons and removes automatic verify button', 'unit', async () => {
+  await it('Binance Order-ID UX: invoice displays exactly two buttons and removes automatic verify button', 'unit', async () => {
     const kb = getBinanceInvoiceKeyboard('dep_test_two_buttons');
     assert.strictEqual(kb.inline_keyboard.length, 2, 'Must have exactly two button rows');
-    assert.strictEqual(kb.inline_keyboard[0][0].text, '🔎 SUBMIT TRANSACTION ID');
+    assert.strictEqual(kb.inline_keyboard[0][0].text, '🔎 SUBMIT ORDER ID');
     assert.strictEqual(kb.inline_keyboard[0][0].callback_data, 'bin_tx:dep_test_two_buttons');
     assert.strictEqual(kb.inline_keyboard[1][0].text, '❌ CANCEL');
     assert.strictEqual(kb.inline_keyboard[1][0].callback_data, 'm:dep');
@@ -2264,6 +2266,7 @@ export async function runComprehensiveTests() {
       getWalletKeyboard('en'),
       getDepositMethodsKeyboard('en'),
       getBinanceInvoiceKeyboard('dep_audit_1', 'en'),
+      getPaymentBeforeInvoiceKeyboard('en', 'dep_audit_1'),
       getLanguageKeyboard('en'),
       getStaleMenuKeyboard('en'),
       getAdminMainMenuKeyboard('en'),
@@ -3630,6 +3633,543 @@ export async function runComprehensiveTests() {
       });
       const clearedVal = await redis.get(`adm_bin_diag_ref:${adminId}`);
       assert.strictEqual(clearedVal, null, 'Clear diagnostic state button must erase temporary Redis reference');
+    });
+  });
+
+  // =========================================================================
+  // 15. FINAL PRODUCTION BINANCE ORDER-ID VERIFICATION SUITE (A - G)
+  // =========================================================================
+  currentCategory = 'Production Binance Order-ID Verification';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('A1. Schema & Migration 003: binance_order_id, binance_match_type columns, clock tolerance bounds & UI default upgrade work cleanly', 'unit', async () => {
+    assert.strictEqual(parseBoundedClockToleranceSeconds(undefined), 60);
+    assert.strictEqual(parseBoundedClockToleranceSeconds('invalid'), 60);
+    assert.strictEqual(parseBoundedClockToleranceSeconds('-50'), 0);
+    assert.strictEqual(parseBoundedClockToleranceSeconds('999999'), 300);
+    assert.strictEqual(parseBoundedClockToleranceSeconds('45'), 45);
+    assert.strictEqual((getSanitizedConfig().binance as any).paymentClockToleranceSeconds, config.binance.paymentClockToleranceSeconds);
+
+    // Check migration 003 applied and columns exist on deposits
+    const latestMig = await db.queryRow<any>('SELECT MAX(version) AS v FROM schema_migrations');
+    assert.ok(Number(latestMig?.v) >= 3, 'Migration 003 must be applied');
+    await db.query('SELECT binance_order_id, binance_match_type FROM deposits LIMIT 1');
+
+    // Verify unmodified SYSTEM_DEFAULT upgrades SUBMIT TRANSACTION ID -> SUBMIT ORDER ID non-destructively
+    await db.query(
+      `UPDATE ui_settings SET text_value = 'SUBMIT TRANSACTION ID', updated_by = 'SYSTEM_DEFAULT'
+       WHERE setting_key = 'btn.dep.bin_submit' AND language_code = 'en'`
+    );
+    await uiConfigService.seedDefaults();
+    assert.strictEqual(uiConfigService.getText('btn.dep.bin_submit', 'en'), 'SUBMIT ORDER ID');
+    assert.strictEqual(getBinanceInvoiceKeyboard('dep_ur', 'ur').inline_keyboard[0][0].text, '🔎 آرڈر آئی ڈی جمع کریں');
+    assert.strictEqual(getBinanceInvoiceKeyboard('dep_ro', 'ur-ro').inline_keyboard[0][0].text, '🔎 ORDER ID SUBMIT KAREIN');
+  });
+
+  await it('A2. Customer UX: invoice & prompt use Order ID wording, display receiver ID, and 2-button keyboard', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      const sentMessages: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        if (method === 'sendMessage' || method === 'editMessageText') {
+          sentMessages.push(JSON.parse(JSON.stringify(body)));
+        }
+        return { ok: true, result: { message_id: 9701 } };
+      });
+
+      const userId = '70001';
+      await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_AMOUNT' });
+      await telegramBotRouter.handleUpdate({
+        update_id: 70001,
+        message: {
+          message_id: 701,
+          chat: { id: 70001, type: 'private' },
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          date: Math.floor(Date.now() / 1000),
+          text: '0.20',
+        },
+      });
+
+      const invoiceSend = sentMessages.find(m => String(m.text).includes('BINANCE PAY INVOICE'));
+      assert.ok(invoiceSend, 'Invoice message must be sent');
+      assert.ok(String(invoiceSend.text).includes('`0.2000 USDT`'));
+      assert.ok(String(invoiceSend.text).includes(`\`${receiverId}\``));
+      assert.ok(String(invoiceSend.text).includes('SUBMIT ORDER ID'));
+      assert.strictEqual(invoiceSend.reply_markup.inline_keyboard.length, 2);
+      const submitBtn = invoiceSend.reply_markup.inline_keyboard[0][0];
+      assert.strictEqual(submitBtn.text, '🔎 SUBMIT ORDER ID');
+      assert.ok(submitBtn.callback_data.startsWith('bin_tx:'));
+
+      sentMessages.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 70002,
+        callback_query: {
+          id: 'cb_bin_tx_prompt',
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          data: submitBtn.callback_data,
+          message: { message_id: 9701, chat: { id: 70001, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Inv' },
+        },
+      });
+
+      const promptSend = sentMessages.find(m => String(m.text).includes('SUBMIT BINANCE ORDER ID'));
+      assert.ok(promptSend, 'Order ID prompt must guide customer to Pay -> History -> Payment Details -> Order ID');
+      assert.ok(String(promptSend.text).includes('Order ID'));
+      assert.ok(String(promptSend.text).includes('Payment Details'));
+      assert.ok(String(promptSend.text).includes('after'));
+      await redis.clearFsmState(userId);
+    });
+  });
+
+  await it('A3. Proven Production Flow: verifies by official orderId (MATCHED_ORDER_ID), credits once, persists columns & accepts transactionId fallback', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({ code: '000000', data: [] }),
+      }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      // 1) Customer submits Binance App Order ID matching record.orderId
+      const userId = `usr_prod_ord_${Date.now()}`;
+      const inv1 = await binanceService.createInvoice(userId, '0.20');
+      const liveTxId = `BIN_TX_LIVE_${Date.now()}`;
+      const liveOrderId = `465195606769819${String(Date.now()).slice(-3)}`;
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            message: 'success',
+            data: [
+              {
+                transactionId: liveTxId,
+                orderId: liveOrderId,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '0.2000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const v1 = await binanceService.verifyDeposit(inv1.id, liveOrderId, userId);
+      assert.strictEqual(v1.verified, true);
+      assert.strictEqual(v1.classification, 'VERIFIED');
+      assert.strictEqual(v1.sanitizedDetails?.identifierMatchField, 'MATCHED_ORDER_ID');
+
+      const dep1 = await db.queryRow<any>('SELECT * FROM deposits WHERE id = $1', [inv1.id]);
+      assert.strictEqual(dep1.status, 'VERIFIED');
+      assert.strictEqual(dep1.binance_transaction_id, liveTxId);
+      assert.strictEqual(dep1.binance_order_id, liveOrderId);
+      assert.strictEqual(dep1.binance_match_type, 'MATCHED_ORDER_ID');
+
+      const bal1 = (await walletService.getBalance(userId)).available;
+      assert.strictEqual(bal1.toFixed(4), '0.2000');
+
+      // Re-submit same invoice -> ALREADY_VERIFIED, zero second credit
+      const reSubmit = await binanceService.verifyDeposit(inv1.id, liveOrderId, userId);
+      assert.strictEqual(reSubmit.verified, true);
+      assert.strictEqual(reSubmit.classification, 'ALREADY_VERIFIED');
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.2000');
+
+      // 2) Compatibility fallback when official transactionId is submitted
+      const inv2 = await binanceService.createInvoice(userId, '0.50');
+      const txOnlyId = `BIN_TX_COMPAT_${Date.now()}`;
+      const ord2Id = `465195606769820${String(Date.now()).slice(-3)}`;
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: txOnlyId,
+                orderId: ord2Id,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '0.5000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+      const v2 = await binanceService.verifyDeposit(inv2.id, txOnlyId, userId);
+      assert.strictEqual(v2.verified, true);
+      assert.strictEqual(v2.sanitizedDetails?.identifierMatchField, 'MATCHED_TRANSACTION_ID');
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.7000');
+    });
+  });
+
+  await it('B. Pre-Invoice Payment Protection (PAYMENT_BEFORE_INVOICE), Clock Tolerance & Support Flow', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      config.safety.recoveryMode = false;
+      const origTol = config.binance.paymentClockToleranceSeconds;
+      config.binance.paymentClockToleranceSeconds = 60;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      try {
+        const userId = `usr_pre_inv_${Date.now()}`;
+        const inv = await binanceService.createInvoice(userId, '0.20');
+        const createdMs = new Date(inv.createdAt).getTime();
+        const historicalOrderId = `ORD_HISTORICAL_46M_${Date.now()}`;
+        const historicalTxId = `TX_HISTORICAL_46M_${Date.now()}`;
+        const paid46MinsEarlierMs = createdMs - 46 * 60 * 1000;
+
+        // 1) Simulate Binance filtering server-side by startTime (primary window returns [], pre-invoice window returns the earlier 0.2 USDT record)
+        binanceService.setFetchOverride(async (input: any) => {
+          const u = new URL(String(input));
+          const qStart = Number(u.searchParams.get('startTime') || 0);
+          const qEnd = Number(u.searchParams.get('endTime') || 0);
+          const inQuery = paid46MinsEarlierMs >= qStart && paid46MinsEarlierMs <= qEnd;
+          return {
+            status: 200,
+            ok: true,
+            text: async () =>
+              JSON.stringify({
+                code: '000000',
+                data: inQuery
+                  ? [
+                      {
+                        transactionId: historicalTxId,
+                        orderId: historicalOrderId,
+                        transactionTime: paid46MinsEarlierMs,
+                        orderType: 'C2C',
+                        amount: '0.2000',
+                        currency: 'USDT',
+                        receiverInfo: { binanceId: receiverId },
+                      },
+                    ]
+                  : [],
+              }),
+          } as any;
+        });
+
+        const sentMessages: any[] = [];
+        telegramClient.setTransportOverride(async (method, body) => {
+          if (method === 'sendMessage') sentMessages.push(JSON.parse(JSON.stringify(body)));
+          return { ok: true, result: { message_id: 9750 } };
+        });
+
+        const resPre = await customerHandler.executeBinanceTxVerification(97501, userId, inv.id, historicalOrderId, 'en');
+        assert.strictEqual(resPre.verified, false);
+        assert.strictEqual(resPre.classification, 'PAYMENT_BEFORE_INVOICE');
+        assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.0000', 'Pre-invoice payment must NEVER credit wallet');
+        assert.strictEqual((await db.queryRow<any>('SELECT status FROM deposits WHERE id = $1', [inv.id])).status, 'PENDING');
+
+        const tgPreMsg = sentMessages.find(m => String(m.text).includes('completed before this invoice was created'));
+        assert.ok(tgPreMsg, 'Customer must receive exact pre-invoice warning copy');
+        const cbs = tgPreMsg.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+        assert.deepStrictEqual(cbs, [`bin_sup:${inv.id}`, 'dep_m:binance', 'm:home']);
+
+        // Tapping CONTACT SUPPORT seeds pre-invoice support ticket cleanly
+        await telegramBotRouter.handleUpdate({
+          update_id: 70050,
+          callback_query: {
+            id: 'cb_bin_sup_1',
+            from: { id: 97501, is_bot: false, first_name: 'PreUser' },
+            data: `bin_sup:${inv.id}`,
+            message: { message_id: 9750, chat: { id: 97501, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'x' },
+          },
+        });
+        await telegramBotRouter.handleUpdate({
+          update_id: 70051,
+          message: {
+            message_id: 9751,
+            chat: { id: 97501, type: 'private' },
+            from: { id: 97501, is_bot: false, first_name: 'PreUser' },
+            date: Math.floor(Date.now() / 1000),
+            text: 'I sent 0.2 USDT 46 minutes ago before making the invoice.',
+          },
+        });
+        const tickets = await supportService.getUserTickets('97501');
+        assert.ok(tickets.some(tkt => tkt.issueType === 'BINANCE_PRE_INVOICE'));
+
+        // 2) Payment 30 seconds before invoice (WITHIN 60s clock tolerance) succeeds
+        const invSkewOk = await binanceService.createInvoice(userId, '0.30');
+        const createdSkewMs = new Date(invSkewOk.createdAt).getTime();
+        const skewOkOrd = `ORD_SKEW_OK_${Date.now()}`;
+        binanceService.setFetchOverride(async () => ({
+          status: 200,
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              code: '000000',
+              data: [
+                {
+                  transactionId: `TX_SKEW_OK_${Date.now()}`,
+                  orderId: skewOkOrd,
+                  transactionTime: createdSkewMs - 30000, // within 60s tolerance
+                  orderType: 'C2C',
+                  amount: '0.3000',
+                  currency: 'USDT',
+                  receiverInfo: { binanceId: receiverId },
+                },
+              ],
+            }),
+        }) as any);
+        const resSkewOk = await binanceService.verifyDeposit(invSkewOk.id, skewOkOrd, userId);
+        assert.strictEqual(resSkewOk.verified, true);
+        assert.strictEqual(resSkewOk.classification, 'VERIFIED');
+      } finally {
+        config.binance.paymentClockToleranceSeconds = origTol;
+      }
+    });
+  });
+
+  await it('C. Identifier Security: rejects counterpartyId, orderNo, invoice/receiver/user IDs, partial match, & preserves leading zeros', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = `usr_ident_${Date.now()}`;
+      const inv = await binanceService.createInvoice(userId, '1.00');
+      const leadingZeroOrderId = `000465195606769819`;
+      const counterpartyId = `COUNTERPARTY_888999`;
+      const orderNo = `ORDNO_UNRELATED_777`;
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: `TX_LZ_${Date.now()}`,
+                orderId: leadingZeroOrderId,
+                orderNo,
+                counterpartyId,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '1.0000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      // 1) counterpartyId rejected
+      const rCounter = await binanceService.verifyDeposit(inv.id, counterpartyId, userId);
+      assert.strictEqual(rCounter.verified, false);
+      assert.strictEqual(rCounter.classification, 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE');
+
+      // 2) unrelated orderNo rejected
+      const rOrdNo = await binanceService.verifyDeposit(inv.id, orderNo, userId);
+      assert.strictEqual(rOrdNo.verified, false);
+      assert.strictEqual(rOrdNo.classification, 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE');
+
+      // 3) submitted invoice ID / receiver ID / Telegram user ID rejected
+      for (const badRef of [inv.id, receiverId, userId, '   ', '465195606769819']) {
+        const rBad = await binanceService.verifyDeposit(inv.id, badRef, userId);
+        assert.strictEqual(rBad.verified, false);
+        assert.ok(
+          rBad.classification === 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE' || rBad.classification === 'TXID_NOT_FOUND',
+          `Unexpected classification for "${badRef}": ${rBad.classification}`
+        );
+      }
+
+      // 4) Leading-zero missing fails, leading-zero exact matches!
+      const rMissingZero = await binanceService.verifyDeposit(inv.id, '465195606769819', userId);
+      assert.strictEqual(rMissingZero.verified, false);
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '0.0000');
+
+      const rExactZero = await binanceService.verifyDeposit(inv.id, `  ${leadingZeroOrderId}  `, userId);
+      assert.strictEqual(rExactZero.verified, true);
+      assert.strictEqual(rExactZero.classification, 'VERIFIED');
+      assert.strictEqual((await walletService.getBalance(userId)).available.toFixed(4), '1.0000');
+    });
+  });
+
+  await it('D. Replay Cross-ID Protection, Precedence Order, Rollback Safety & Readiness Gate', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ receiverId }) => {
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = `usr_replay_${Date.now()}`;
+      const inv1 = await binanceService.createInvoice(userId, '2.00');
+      const txShared = `TX_SHARED_${Date.now()}`;
+      const ordShared = `ORD_SHARED_${Date.now()}`;
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: txShared,
+                orderId: ordShared,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '2.0000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      // Claim via orderId
+      const ok1 = await binanceService.verifyDeposit(inv1.id, ordShared, userId);
+      assert.strictEqual(ok1.verified, true);
+
+      // Cross-ID replay on invoice 2 using same orderId OR same transactionId must BOTH fail with DUPLICATE_TRANSACTION
+      const inv2 = await binanceService.createInvoice(userId, '2.00');
+      const dupOrd = await binanceService.verifyDeposit(inv2.id, ordShared, userId);
+      assert.strictEqual(dupOrd.verified, false);
+      assert.strictEqual(dupOrd.classification, 'DUPLICATE_TRANSACTION');
+
+      const dupTx = await binanceService.verifyDeposit(inv2.id, txShared, userId);
+      assert.strictEqual(dupTx.verified, false);
+      assert.strictEqual(dupTx.classification, 'DUPLICATE_TRANSACTION');
+
+      // Outgoing direction returns NOT_INCOMING; post-window returns OUTSIDE_INVOICE_WINDOW
+      const outOrd = `ORD_OUT_${Date.now()}`;
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: `TX_OUT_${Date.now()}`,
+                orderId: outOrd,
+                transactionTime: Date.now(),
+                orderType: 'PAYOUT',
+                amount: '2.0000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+      const rOut = await binanceService.verifyDeposit(inv2.id, outOrd, userId);
+      assert.strictEqual(rOut.classification, 'NOT_INCOMING');
+
+      // Financial readiness block
+      config.safety.recoveryMode = true;
+      const rBlockedOrd = `ORD_BLK_${Date.now()}`;
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: `TX_BLK_${Date.now()}`,
+                orderId: rBlockedOrd,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '2.0000',
+                currency: 'USDT',
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+      const rGate = await binanceService.verifyDeposit(inv2.id, rBlockedOrd, userId);
+      assert.strictEqual(rGate.verified, false);
+      assert.strictEqual(rGate.classification, 'ELIGIBILITY_RESTRICTED');
+
+      // Rollback safety test if executeMutation throws mid-transaction
+      config.safety.recoveryMode = false;
+      const origMutate = walletService.executeMutation.bind(walletService);
+      (walletService as any).executeMutation = async () => {
+        throw new Error('Simulated ledger failure');
+      };
+      try {
+        const invRb = await binanceService.createInvoice(userId, '2.00');
+        const rbRes = await binanceService.verifyDeposit(invRb.id, rBlockedOrd, userId);
+        assert.strictEqual(rbRes.verified, false);
+        assert.strictEqual(rbRes.classification, 'BINANCE_API_ERROR');
+        const depAfterRb = await db.queryRow<any>('SELECT status, binance_order_id FROM deposits WHERE id = $1', [invRb.id]);
+        assert.strictEqual(depAfterRb.status, 'PENDING', 'Transaction rollback must keep deposit PENDING');
+        assert.strictEqual(depAfterRb.binance_order_id, null, 'Transaction rollback must clear binance_order_id');
+      } finally {
+        (walletService as any).executeMutation = origMutate;
+      }
+    });
+  });
+
+  await it('E. Secret & PII Hygiene: zero leaks of keys, secrets, signatures, tokens, full IDs or payer PII', 'mock_integration', async () => {
+    await withMockBinanceEnv(async ({ apiKey, apiSecret, receiverId }) => {
+      config.safety.recoveryMode = false;
+      await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code = 'BINANCE_USDT'");
+      binanceService.setFetchOverride(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ code: '000000', data: [] }) }) as any);
+      await binanceService.testReadOnlyVerification(true);
+
+      const userId = '70001';
+      const inv = await binanceService.createInvoice(userId, '0.45');
+      const fullOrderId = '465195606769819999';
+      const fullTxId = 'TX_FULL_SECRET_11223344';
+      const payerName = 'PRIVATE_PAYER_FULL_NAME';
+      const payerBinId = 'PRIVATE_PAYER_BIN_ID_777';
+
+      binanceService.setFetchOverride(async () => ({
+        status: 200,
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            code: '000000',
+            data: [
+              {
+                transactionId: fullTxId,
+                orderId: fullOrderId,
+                transactionTime: Date.now(),
+                orderType: 'C2C',
+                amount: '0.4500',
+                currency: 'USDT',
+                payerInfo: { name: payerName, binanceId: payerBinId },
+                receiverInfo: { binanceId: receiverId },
+              },
+            ],
+          }),
+      }) as any);
+
+      const sentPayloads: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        if (method === 'sendMessage') sentPayloads.push(JSON.parse(JSON.stringify(body)));
+        return { ok: true, result: { message_id: 9801 } };
+      });
+
+      await customerHandler.executeBinanceTxVerification(70001, userId, inv.id, fullOrderId, 'en');
+      const allTgText = sentPayloads.map(p => String(p.text)).join('\n');
+      for (const secret of [apiKey, apiSecret, receiverId, fullOrderId, fullTxId, payerName, payerBinId]) {
+        assert.strictEqual(allTgText.includes(secret), false, `Telegram verification output must never leak sensitive value: ${secret.slice(0, 6)}`);
+      }
+
+      const ptRow = await db.queryRow<any>('SELECT external_ref, raw_data FROM payment_transactions WHERE deposit_id = $1', [inv.id]);
+      const ptStr = JSON.stringify(ptRow || {});
+      assert.strictEqual(ptStr.includes(payerName), false, 'payment_transactions must never store payer PII');
+      assert.strictEqual(ptStr.includes(payerBinId), false, 'payment_transactions must never store payer PII');
+      assert.strictEqual(ptStr.includes(fullOrderId), false, 'payment_transactions must never store full orderId');
+      assert.strictEqual(ptStr.includes(fullTxId), false, 'payment_transactions must never store full transactionId');
+
+      const ledRow = await db.queryRow<any>('SELECT operation_ref, reason, metadata FROM ledger_entries WHERE idempotency_key = $1', [inv.id]);
+      const ledStr = JSON.stringify(ledRow || {});
+      assert.strictEqual(ledStr.includes(fullOrderId), false, 'ledger_entries must never leak full orderId');
+      assert.strictEqual(ledStr.includes(fullTxId), false, 'ledger_entries must never leak full transactionId');
+
+      const attRow = await db.queryRow<any>('SELECT payload, response FROM deposit_attempts WHERE deposit_id = $1 ORDER BY created_at DESC LIMIT 1', [inv.id]);
+      const attStr = JSON.stringify(attRow || {});
+      assert.strictEqual(attStr.includes(fullOrderId), false, 'deposit_attempts must store masked ID only');
     });
   });
 

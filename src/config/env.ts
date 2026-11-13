@@ -26,6 +26,7 @@ export interface AppConfig {
     requestTimeoutMs: number;
     minDepositUsdt: number;
     maxDepositUsdt: number;
+    paymentClockToleranceSeconds: number;
     diagnosticEnabled: boolean;
   };
   safety: {
@@ -33,6 +34,14 @@ export interface AppConfig {
     liveOrderingEnabled: boolean;
     manualPaymentsEnabled: boolean;
   };
+}
+
+export function parseBoundedClockToleranceSeconds(raw?: string): number {
+  const parsed = Number.parseInt(String(raw ?? '').trim(), 10);
+  if (!Number.isFinite(parsed) || Number.isNaN(parsed)) {
+    return 60;
+  }
+  return Math.max(0, Math.min(300, parsed));
 }
 
 const adminIdsRaw = process.env.TELEGRAM_ADMIN_IDS || '';
@@ -66,6 +75,7 @@ export const config: AppConfig = {
     requestTimeoutMs: parseInt(process.env.BINANCE_REQUEST_TIMEOUT_MS || '10000', 10),
     minDepositUsdt: parseFloat(process.env.BINANCE_MIN_DEPOSIT_USDT || '0.10'),
     maxDepositUsdt: parseFloat(process.env.BINANCE_MAX_DEPOSIT_USDT || '10000.00'),
+    paymentClockToleranceSeconds: parseBoundedClockToleranceSeconds(process.env.BINANCE_PAYMENT_CLOCK_TOLERANCE_SECONDS),
     diagnosticEnabled: process.env.BINANCE_DIAGNOSTIC_ENABLED === 'true',
   },
   safety: {
@@ -110,6 +120,7 @@ export function getSanitizedConfig(): Record<string, unknown> {
       recvWindowMs: config.binance.recvWindowMs,
       requestTimeoutMs: config.binance.requestTimeoutMs,
       limits: `${config.binance.minDepositUsdt} - ${config.binance.maxDepositUsdt} USDT`,
+      paymentClockToleranceSeconds: config.binance.paymentClockToleranceSeconds,
       diagnosticEnabled: config.binance.diagnosticEnabled,
     },
     safety: { ...config.safety },

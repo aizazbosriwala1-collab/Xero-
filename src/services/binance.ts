@@ -11,13 +11,18 @@ Decimal.set({ precision: 28, rounding: Decimal.ROUND_HALF_UP });
 
 export type BinanceTerminalState =
   | 'VERIFIED'
+  | 'ALREADY_VERIFIED'
   | 'TXID_NOT_FOUND'
+  | 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE'
+  | 'PAYMENT_BEFORE_INVOICE'
+  | 'OUTSIDE_INVOICE_WINDOW'
   | 'WRONG_AMOUNT'
   | 'WRONG_CURRENCY'
   | 'WRONG_RECEIVER'
-  | 'OUTSIDE_INVOICE_WINDOW'
+  | 'NOT_INCOMING'
   | 'DUPLICATE_TRANSACTION'
   | 'EXPIRED_INVOICE'
+  | 'ELIGIBILITY_RESTRICTED'
   | 'BINANCE_API_ERROR'
   | 'BINANCE_API_TIMEOUT';
 
@@ -34,20 +39,21 @@ export type BinanceErrorClassification =
   | 'INVALID_SIGNATURE'
   | 'TIMESTAMP_RECVWINDOW_REJECTION'
   | 'RATE_LIMIT'
-  | 'ELIGIBILITY_RESTRICTED'
   | 'ZERO_RECORDS_FOUND'
   | 'WRONG_DIRECTION'
   | 'AMBIGUOUS_TRANSACTION'
   | 'EXACT_VALID_MATCH';
 
 export type IdentifierMatchField =
-  | 'MATCHED_TRANSACTION_ID'
   | 'MATCHED_ORDER_ID'
+  | 'MATCHED_TRANSACTION_ID'
   | 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE';
 
 export interface BinanceTransactionRecord {
   transactionId: string;
-  orderId?: string;
+  orderId?: string | null;
+  orderNo?: string | null;
+  counterpartyId?: string | null;
   transactionTime: number;
   orderType: string;
   amount: string;
@@ -502,16 +508,50 @@ export class BinanceService {
       }
 
       const rawRecords = Array.isArray(data.data) ? data.data : (Array.isArray(data.records) ? data.records : []);
-      const records: BinanceTransactionRecord[] = rawRecords.map((r: any) => ({
-        transactionId: r?.transactionId ? String(r.transactionId).trim() : '',
-        orderId: r?.orderId ? String(r.orderId).trim() : undefined,
-        transactionTime: Number(r?.transactionTime || r?.orderTime || Date.now()),
-        orderType: String(r?.orderType || 'C2C'),
-        amount: new Decimal(r?.amount || 0).toFixed(4),
-        currency: String(r?.currency || 'USDT').toUpperCase(),
-        payerInfo: r?.payerInfo,
-        receiverInfo: r?.receiverInfo,
-      }));
+      const records: BinanceTransactionRecord[] = rawRecords.map((r: any) => {
+        const rawTxId =
+          r?.transactionId !== undefined && r?.transactionId !== null && String(r.transactionId).trim() !== ''
+            ? String(r.transactionId).trim()
+            : '';
+        const rawOrderId =
+          r?.orderId !== undefined && r?.orderId !== null && String(r.orderId).trim() !== ''
+            ? String(r.orderId).trim()
+            : undefined;
+        const rawOrderNo =
+          r?.orderNo !== undefined && r?.orderNo !== null && String(r.orderNo).trim() !== ''
+            ? String(r.orderNo).trim()
+            : undefined;
+        const rawCounterpartyId =
+          r?.counterpartyId !== undefined && r?.counterpartyId !== null && String(r.counterpartyId).trim() !== ''
+            ? String(r.counterpartyId).trim()
+            : undefined;
+        const parsedTime =
+          r?.transactionTime !== undefined && r?.transactionTime !== null
+            ? Number(r.transactionTime)
+            : r?.orderTime !== undefined && r?.orderTime !== null
+              ? Number(r.orderTime)
+              : NaN;
+
+        let formattedAmount = '0.0000';
+        try {
+          formattedAmount = new Decimal(r?.amount ?? 0).toFixed(4);
+        } catch {
+          formattedAmount = '0.0000';
+        }
+
+        return {
+          transactionId: rawTxId,
+          ...(rawOrderId !== undefined ? { orderId: rawOrderId } : {}),
+          ...(rawOrderNo !== undefined ? { orderNo: rawOrderNo } : {}),
+          ...(rawCounterpartyId !== undefined ? { counterpartyId: rawCounterpartyId } : {}),
+          transactionTime: parsedTime,
+          orderType: String(r?.orderType || 'C2C'),
+          amount: formattedAmount,
+          currency: String(r?.currency || 'USDT').toUpperCase(),
+          payerInfo: r?.payerInfo,
+          receiverInfo: r?.receiverInfo,
+        };
+      });
 
       return {
         httpStatus,
@@ -621,6 +661,82 @@ export class BinanceService {
     }
   }
 
+  private isOutgoingOrderType(orderType?: string | null, amount?: string | null): boolean {
+    const typeUpper = String(orderType || '').trim().toUpperCase();
+    if (
+      typeUpper.includes('PAYOUT') ||
+      typeUpper.includes('WITHDRAW') ||
+      typeUpper.includes('OUT') ||
+      typeUpper.includes('SEND') ||
+      typeUpper.includes('SPEND')
+    ) {
+      return true;
+    }
+    if (amount !== undefined && amount !== null) {
+      try {
+        if (new Decimal(amount).isNegative()) {
+          return true;
+        }
+      } catch {
+        // Ignore parse error here; handled by amount equality check
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Read-only helper invoked strictly on misses in the invoice credit window to distinguish
+   * pre-invoice payments (PAYMENT_BEFORE_INVOICE) from unknown references (TXID_NOT_FOUND).
+   * Structurally incapable of crediting a wallet or altering deposits.
+   */
+  private async detectPreInvoicePaymentReadOnly(params: {
+    submittedId: string;
+    invoiceCreatedMs: number;
+    windowStartMs: number;
+  }): Promise<'PAYMENT_BEFORE_INVOICE' | 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE' | null> {
+    const lookbackMs = 6 * 60 * 60 * 1000; // Bounded 6h pre-invoice window (never 90-day scan)
+    const searchStartMs = Math.max(0, params.invoiceCreatedMs - lookbackMs);
+    const searchEndMs = Math.max(searchStartMs, params.windowStartMs - 1);
+
+    try {
+      const priorRes = await this.queryTransactions({
+        startTime: searchStartMs,
+        endTime: searchEndMs,
+        limit: 100,
+      });
+
+      if (priorRes.errorClassification || priorRes.records.length === 0) {
+        return null;
+      }
+
+      const sub = params.submittedId;
+      const ordMatch = priorRes.records.find(r => r.orderId !== undefined && r.orderId !== null && r.orderId.trim() === sub);
+      const txMatch = ordMatch || priorRes.records.find(r => r.transactionId && r.transactionId.trim() === sub);
+
+      if (txMatch) {
+        const txTime = Number(txMatch.transactionTime);
+        if (Number.isFinite(txTime) && txTime < params.windowStartMs) {
+          return 'PAYMENT_BEFORE_INVOICE';
+        }
+        return null;
+      }
+
+      const nonProofMatch = priorRes.records.find(
+        r =>
+          (r.counterpartyId !== undefined && r.counterpartyId !== null && r.counterpartyId.trim() === sub) ||
+          (r.payerInfo?.binanceId !== undefined && r.payerInfo.binanceId !== null && String(r.payerInfo.binanceId).trim() === sub) ||
+          (r.orderNo !== undefined && r.orderNo !== null && r.orderNo.trim() === sub)
+      );
+      if (nonProofMatch) {
+        return 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE';
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   private async verifyDepositInternal(
     depositId: string,
     submittedTxId: string | undefined,
@@ -672,8 +788,8 @@ export class BinanceService {
     if (deposit.status === 'VERIFIED') {
       return {
         verified: true,
-        classification: 'VERIFIED',
-        message: 'Deposit has already been verified and credited.',
+        classification: 'ALREADY_VERIFIED',
+        message: 'This deposit invoice has already been verified and credited to your wallet.',
         sanitizedDetails: { validationMs: Date.now() - valStart, totalDurationMs: Date.now() - overallStart },
       };
     }
@@ -695,22 +811,58 @@ export class BinanceService {
       };
     }
 
+    if (deposit.status !== 'PENDING') {
+      return {
+        verified: false,
+        classification: 'ELIGIBILITY_RESTRICTED',
+        message: 'This deposit invoice is no longer pending verification.',
+        sanitizedDetails: { validationMs: Date.now() - valStart, totalDurationMs: Date.now() - overallStart, retryable: false },
+      };
+    }
+
     const expectedAmount = new Decimal(deposit.amount);
     const expectedCurrency = (deposit.currency || 'USDT').toUpperCase();
+    const hasSubmittedRef = submittedTxId !== undefined;
+    const normalizedSubmitted = hasSubmittedRef ? String(submittedTxId).trim() : '';
 
-    // Guard against customer submitting invoice ID, receiver ID, or customer ID as transaction ID
-    if (submittedTxId && submittedTxId.trim()) {
-      const cleanSub = submittedTxId.trim().toLowerCase();
-      const configuredRec = this.getReceiverId() ? this.getReceiverId()!.toLowerCase() : '';
-      const recRef = deposit.receiver_ref ? String(deposit.receiver_ref).toLowerCase().trim() : '';
-      const invId = depositId.toLowerCase();
-      const usrId = String(deposit.user_id).toLowerCase();
-
-      if (cleanSub === invId || (configuredRec && cleanSub === configuredRec) || (recRef && cleanSub === recRef) || cleanSub === usrId) {
+    // Strict identifier hygiene check when customer submits an Order ID / reference
+    if (hasSubmittedRef) {
+      if (
+        !normalizedSubmitted ||
+        normalizedSubmitted.length < 3 ||
+        normalizedSubmitted.length > 128 ||
+        /[\s\x00-\x1F\x7F]/.test(normalizedSubmitted)
+      ) {
         return {
           verified: false,
-          classification: 'TXID_NOT_FOUND',
-          message: 'The submitted value is not a Binance Transaction ID. Please enter the official Transaction ID found in your Binance Pay history.',
+          classification: 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE',
+          message:
+            'Please submit a valid Binance Order ID from Binance App → Pay → History → Payment Details.',
+          sanitizedDetails: {
+            identifierMatchField: 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE',
+            validationMs: Date.now() - valStart,
+            totalDurationMs: Date.now() - overallStart,
+            retryable: false,
+          },
+        };
+      }
+
+      const configuredRec = this.getReceiverId() ? this.getReceiverId()!.trim() : '';
+      const recRef = deposit.receiver_ref ? String(deposit.receiver_ref).trim() : '';
+      const invId = depositId.trim();
+      const usrId = String(deposit.user_id).trim();
+
+      if (
+        normalizedSubmitted === invId ||
+        (configuredRec && normalizedSubmitted === configuredRec) ||
+        (recRef && normalizedSubmitted === recRef) ||
+        normalizedSubmitted === usrId
+      ) {
+        return {
+          verified: false,
+          classification: 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE',
+          message:
+            'The submitted value is not a valid Binance Order ID. Do not submit the invoice ID, receiver Binance ID, or your Telegram user ID.',
           sanitizedDetails: {
             identifierMatchField: 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE',
             validationMs: Date.now() - valStart,
@@ -723,15 +875,18 @@ export class BinanceService {
 
     const validationMs = Date.now() - valStart;
 
-    // 1. Tightly bounded time window based on deposit created_at and expires_at / verification time
+    // Tightly bounded time window based on invoice.created_at - configuredClockTolerance
+    const toleranceSec = Math.max(0, Math.min(300, Number(config.binance.paymentClockToleranceSeconds ?? 60)));
+    const toleranceMs = toleranceSec * 1000;
     const invoiceCreatedMs = new Date(deposit.created_at).getTime();
-    const windowStartMs = invoiceCreatedMs - 60000;
-    const windowEndMs = Math.min(now + 60000, expiresAtMs);
+    const windowStartMs = invoiceCreatedMs - toleranceMs;
+    const windowEndMs = Math.min(now, expiresAtMs) + toleranceMs;
 
     // Stage: Binance API Request
     logger.info('Binance verification stage: binance_request_started', {
       depositId,
       maskedSubmittedTxId,
+      clockToleranceSeconds: toleranceSec,
       windowStart: new Date(windowStartMs).toISOString(),
       windowEnd: new Date(windowEndMs).toISOString(),
     });
@@ -739,6 +894,7 @@ export class BinanceService {
     const result = await this.queryTransactions({
       startTime: windowStartMs,
       endTime: windowEndMs,
+      limit: 100,
     });
 
     logger.info('Binance verification stage: binance_response_received', {
@@ -750,19 +906,22 @@ export class BinanceService {
       binanceDurationMs: result.durationMs,
     });
 
-    // Record attempt for audit trail (non-fatal)
+    // Record attempt for audit trail (non-fatal, masked reference only)
     try {
-      await db.query(`
+      await db.query(
+        `
         INSERT INTO deposit_attempts (id, deposit_id, attempt_number, payload, response, error_classification)
         VALUES ($1, $2, $3, $4, $5, $6)
-      `, [
-        `att_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        depositId,
-        (deposit.attempt_count || 0) + 1,
-        JSON.stringify({ maskedSubmittedTxId }),
-        JSON.stringify({ httpStatus: result.httpStatus, code: result.binanceCode, count: result.records.length, durationMs: result.durationMs }),
-        result.errorClassification || 'QUERY_OK',
-      ]);
+      `,
+        [
+          `att_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          depositId,
+          (deposit.attempt_count || 0) + 1,
+          JSON.stringify({ maskedSubmittedTxId }),
+          JSON.stringify({ httpStatus: result.httpStatus, code: result.binanceCode, count: result.records.length, durationMs: result.durationMs }),
+          result.errorClassification || 'QUERY_OK',
+        ]
+      );
       await db.query('UPDATE deposits SET attempt_count = attempt_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1', [depositId]);
     } catch (attErr: any) {
       logger.warn('Failed to persist deposit attempt log (non-fatal)', { depositId, error: attErr?.message });
@@ -785,7 +944,7 @@ export class BinanceService {
         verified: false,
         classification: terminalClassification,
         message: isTimeout
-          ? 'Binance Pay timed out while checking your transaction. Your invoice is still pending with zero credit applied — please tap Retry Verification.'
+          ? 'Binance Pay timed out while checking your Order ID. Your invoice is still pending with zero credit applied — please tap Retry Verification.'
           : 'Could not verify with Binance Pay right now due to an API/network response error. Your invoice is still pending with zero credit applied — please tap Retry Verification.',
         sanitizedDetails: {
           upstreamClassification: result.errorClassification,
@@ -800,91 +959,65 @@ export class BinanceService {
 
     const fetchedRecords = result.records;
 
-    // 2. Fetch all transaction IDs already attached to verified or consumed deposits
-    const consumedRows = await db.query<{ binance_transaction_id: string }>(
-      'SELECT DISTINCT binance_transaction_id FROM deposits WHERE binance_transaction_id IS NOT NULL AND status = $1',
+    // Fetch all transactionIds AND orderIds already attached to verified deposits (replay guard)
+    const consumedRows = await db.query<{ binance_transaction_id: string | null; binance_order_id: string | null }>(
+      `SELECT binance_transaction_id, binance_order_id
+       FROM deposits
+       WHERE status = $1
+         AND (binance_transaction_id IS NOT NULL OR binance_order_id IS NOT NULL)`,
       ['VERIFIED']
     );
-    const consumedTxIds = new Set(consumedRows.rows.map(r => r.binance_transaction_id.toLowerCase().trim()));
+    const consumedIds = new Set<string>();
+    for (const row of consumedRows.rows) {
+      if (row.binance_transaction_id) consumedIds.add(String(row.binance_transaction_id).trim());
+      if (row.binance_order_id) consumedIds.add(String(row.binance_order_id).trim());
+    }
 
     const getCanonicalTxId = (r: BinanceTransactionRecord): string => (r.transactionId || r.orderId || '').trim();
     const isConsumedRecord = (r: BinanceTransactionRecord): boolean => {
-      if (r.transactionId && consumedTxIds.has(r.transactionId.toLowerCase().trim())) return true;
-      if (r.orderId && consumedTxIds.has(r.orderId.toLowerCase().trim())) return true;
+      if (r.transactionId && consumedIds.has(r.transactionId.trim())) return true;
+      if (r.orderId && consumedIds.has(r.orderId.trim())) return true;
       return false;
     };
 
     // Stage: Matching & strict financial validation
     const matchStart = Date.now();
-    const inWindowRecords = fetchedRecords.filter(r => {
-      const txTime = Number(r.transactionTime);
-      return txTime >= windowStartMs && txTime <= windowEndMs;
-    });
-    const withTxIdRecords = inWindowRecords.filter(r => Boolean(getCanonicalTxId(r)));
-    const currencyMatches = withTxIdRecords.filter(r => r.currency.toUpperCase() === expectedCurrency);
-    const incomingMatches = currencyMatches.filter(r => {
-      const type = (r.orderType || '').toUpperCase();
-      return !(type.includes('PAYOUT') || type.includes('WITHDRAW') || type.includes('OUT'));
-    });
-
     const configuredReceiver = this.getReceiverId();
-    const wrongReceiverMatches = incomingMatches.filter(r => {
-      if (configuredReceiver && r.receiverInfo?.binanceId) {
-        return r.receiverInfo.binanceId.trim().toLowerCase() !== configuredReceiver.toLowerCase();
-      }
-      return false;
-    });
-    const receiverMatches = incomingMatches.filter(r => {
-      if (configuredReceiver && r.receiverInfo?.binanceId) {
-        return r.receiverInfo.binanceId.trim().toLowerCase() === configuredReceiver.toLowerCase();
-      }
-      return true;
-    });
-    const amountMatches = receiverMatches.filter(r => {
-      try {
-        return new Decimal(r.amount).equals(expectedAmount);
-      } catch {
-        return false;
-      }
-    });
-    const unusedMatches = amountMatches.filter(r => !isConsumedRecord(r));
-    unusedMatches.sort((a, b) => Number(a.transactionTime) - Number(b.transactionTime));
+    const configuredRecTrimmed = configuredReceiver ? configuredReceiver.trim() : '';
 
     let identifierMatchField: IdentifierMatchField = 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE';
-    let eligibleCandidates = unusedMatches;
 
     const buildDiagnostics = (candidates: BinanceTransactionRecord[], extra: Record<string, unknown> = {}) => ({
       windowStart: new Date(windowStartMs).toISOString(),
       windowEnd: new Date(windowEndMs).toISOString(),
+      clockToleranceSeconds: toleranceSec,
       httpStatus: result.httpStatus,
       binanceCode: result.binanceCode,
       binanceDurationMs: result.durationMs,
       depositLoadMs,
       validationMs,
       recordsFetched: fetchedRecords.length,
-      recordsInWindow: inWindowRecords.length,
-      recordsAfterCurrency: currencyMatches.length,
-      recordsAfterDirectionReceiver: receiverMatches.length,
-      recordsAfterAmount: amountMatches.length,
-      recordsAfterAlreadyUsed: unusedMatches.length,
       eligibleCandidatesCount: candidates.length,
       maskedCandidateIds: candidates.map(c => maskIdentifier(getCanonicalTxId(c))),
       identifierMatchField,
       ...extra,
     });
 
-    if (submittedTxId && submittedTxId.trim()) {
-      const cleanSub = submittedTxId.trim().toLowerCase();
-      const configuredRec = configuredReceiver ? configuredReceiver.toLowerCase() : '';
+    let matchedTx: BinanceTransactionRecord | undefined;
 
-      // Match ONLY against identifiers ACTUALLY returned by official Binance response
-      let rawMatch = fetchedRecords.find(r => r.transactionId && r.transactionId.toLowerCase() === cleanSub);
+    if (hasSubmittedRef) {
+      // Exact string matching priority:
+      // 1. Official Binance orderId -> MATCHED_ORDER_ID
+      // 2. Official Binance transactionId (compatibility fallback) -> MATCHED_TRANSACTION_ID
+      let rawMatch = fetchedRecords.find(
+        r => r.orderId !== undefined && r.orderId !== null && r.orderId.trim() === normalizedSubmitted
+      );
       if (rawMatch) {
-        identifierMatchField = 'MATCHED_TRANSACTION_ID';
+        identifierMatchField = 'MATCHED_ORDER_ID';
       } else {
-        rawMatch = fetchedRecords.find(r => r.orderId && r.orderId.toLowerCase() === cleanSub);
+        rawMatch = fetchedRecords.find(r => r.transactionId && r.transactionId.trim() === normalizedSubmitted);
         if (rawMatch) {
-          identifierMatchField = 'MATCHED_ORDER_ID';
+          identifierMatchField = 'MATCHED_TRANSACTION_ID';
         }
       }
 
@@ -897,11 +1030,60 @@ export class BinanceService {
       });
 
       if (!rawMatch) {
+        // Reject counterpartyId, payerInfo.binanceId, or unrelated orderNo explicitly
+        const nonProofMatch = fetchedRecords.find(
+          r =>
+            (r.counterpartyId !== undefined && r.counterpartyId !== null && r.counterpartyId.trim() === normalizedSubmitted) ||
+            (r.payerInfo?.binanceId !== undefined &&
+              r.payerInfo.binanceId !== null &&
+              String(r.payerInfo.binanceId).trim() === normalizedSubmitted) ||
+            (r.orderNo !== undefined && r.orderNo !== null && r.orderNo.trim() === normalizedSubmitted)
+        );
+        if (nonProofMatch) {
+          const totalDurationMs = Date.now() - overallStart;
+          return {
+            verified: false,
+            classification: 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE',
+            message:
+              'The submitted ID does not match a verifiable Binance Pay Order ID. Please open Payment Details in Binance Pay History and submit the official Order ID.',
+            sanitizedDetails: buildDiagnostics([], { matchDurationMs, totalDurationMs, retryable: false }),
+          };
+        }
+
+        // Bounded non-credit check for pre-invoice payments
+        const preInvoiceClass = await this.detectPreInvoicePaymentReadOnly({
+          submittedId: normalizedSubmitted,
+          invoiceCreatedMs,
+          windowStartMs,
+        });
+
+        if (preInvoiceClass === 'PAYMENT_BEFORE_INVOICE') {
+          const totalDurationMs = Date.now() - overallStart;
+          return {
+            verified: false,
+            classification: 'PAYMENT_BEFORE_INVOICE',
+            message:
+              'This payment was completed before this invoice was created, so it cannot be used for this invoice. Please create a current invoice before making a payment.',
+            sanitizedDetails: buildDiagnostics([], { matchDurationMs, totalDurationMs, retryable: false }),
+          };
+        }
+
+        if (preInvoiceClass === 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE') {
+          const totalDurationMs = Date.now() - overallStart;
+          return {
+            verified: false,
+            classification: 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE',
+            message:
+              'The submitted ID is not a verifiable Binance Pay Order ID. Please open Payment Details in Binance Pay History and submit the official Order ID.',
+            sanitizedDetails: buildDiagnostics([], { matchDurationMs, totalDurationMs, retryable: false }),
+          };
+        }
+
         const totalDurationMs = Date.now() - overallStart;
         return {
           verified: false,
           classification: 'TXID_NOT_FOUND',
-          message: 'The submitted Binance Transaction ID was not found in recent incoming payments for this invoice window.',
+          message: 'The submitted Binance Order ID was not found in incoming payments for this invoice window.',
           sanitizedDetails: buildDiagnostics([], { matchDurationMs, totalDurationMs, retryable: true }),
         };
       }
@@ -917,11 +1099,46 @@ export class BinanceService {
         amount: rawMatch.amount,
         currency: rawMatch.currency,
         orderType: rawMatch.orderType,
-        receiverMatches: Boolean(configuredRec && rawMatch.receiverInfo?.binanceId && rawMatch.receiverInfo.binanceId.trim().toLowerCase() === configuredRec),
+        receiverMatches: Boolean(
+          configuredRecTrimmed &&
+            rawMatch.receiverInfo?.binanceId &&
+            rawMatch.receiverInfo.binanceId.trim().toLowerCase() === configuredRecTrimmed.toLowerCase()
+        ),
       });
 
+      // Exact Validation Precedence Order:
+      // 1. Duplicate/replay protection
+      if (isConsumedRecord(rawMatch)) {
+        return {
+          verified: false,
+          classification: 'DUPLICATE_TRANSACTION',
+          message: 'This Binance payment has already been verified and credited to an account.',
+          sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: false }),
+        };
+      }
+
+      // (2 & 3: Invoice ownership/status and invoice expiry already validated before Binance query)
+
+      // 4. Payment timestamp window (PAYMENT_BEFORE_INVOICE vs OUTSIDE_INVOICE_WINDOW)
       const txTime = Number(rawMatch.transactionTime);
-      if (txTime < windowStartMs || txTime > windowEndMs) {
+      if (!Number.isFinite(txTime)) {
+        return {
+          verified: false,
+          classification: 'OUTSIDE_INVOICE_WINDOW',
+          message: 'This Binance transaction timestamp could not be verified within the invoice window.',
+          sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: false }),
+        };
+      }
+      if (txTime < windowStartMs) {
+        return {
+          verified: false,
+          classification: 'PAYMENT_BEFORE_INVOICE',
+          message:
+            'This payment was completed before this invoice was created, so it cannot be used for this invoice. Please create a current invoice before making a payment.',
+          sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: false }),
+        };
+      }
+      if (txTime > windowEndMs) {
         return {
           verified: false,
           classification: 'OUTSIDE_INVOICE_WINDOW',
@@ -930,7 +1147,8 @@ export class BinanceService {
         };
       }
 
-      if (rawMatch.currency.toUpperCase() !== expectedCurrency) {
+      // 5. Currency
+      if ((rawMatch.currency || '').toUpperCase() !== expectedCurrency) {
         return {
           verified: false,
           classification: 'WRONG_CURRENCY',
@@ -939,17 +1157,14 @@ export class BinanceService {
         };
       }
 
-      const orderTypeUpper = (rawMatch.orderType || '').toUpperCase();
-      if (orderTypeUpper.includes('PAYOUT') || orderTypeUpper.includes('WITHDRAW') || orderTypeUpper.includes('OUT')) {
-        return {
-          verified: false,
-          classification: 'TXID_NOT_FOUND',
-          message: 'This transaction is an outgoing transfer and cannot be used to credit your wallet.',
-          sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: false }),
-        };
+      // 6. Amount
+      let parsedAmount: Decimal;
+      try {
+        parsedAmount = new Decimal(rawMatch.amount);
+      } catch {
+        parsedAmount = new Decimal(0);
       }
-
-      if (!new Decimal(rawMatch.amount).equals(expectedAmount)) {
+      if (!parsedAmount.equals(expectedAmount)) {
         return {
           verified: false,
           classification: 'WRONG_AMOUNT',
@@ -958,7 +1173,22 @@ export class BinanceService {
         };
       }
 
-      if (configuredRec && rawMatch.receiverInfo?.binanceId && rawMatch.receiverInfo.binanceId.trim().toLowerCase() !== configuredRec) {
+      // 7. Incoming direction
+      if (this.isOutgoingOrderType(rawMatch.orderType, rawMatch.amount)) {
+        return {
+          verified: false,
+          classification: 'NOT_INCOMING',
+          message: 'This transaction is an outgoing transfer and cannot be used to credit your wallet.',
+          sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: false }),
+        };
+      }
+
+      // 8. Receiver
+      if (
+        configuredRecTrimmed &&
+        rawMatch.receiverInfo?.binanceId &&
+        rawMatch.receiverInfo.binanceId.trim().toLowerCase() !== configuredRecTrimmed.toLowerCase()
+      ) {
         return {
           verified: false,
           classification: 'WRONG_RECEIVER',
@@ -967,104 +1197,106 @@ export class BinanceService {
         };
       }
 
-      if (isConsumedRecord(rawMatch)) {
+      if (!canonicalId) {
         return {
           verified: false,
-          classification: 'DUPLICATE_TRANSACTION',
-          message: 'This Binance Transaction ID has already been credited to an account.',
+          classification: 'CUSTOMER_REFERENCE_NOT_API_MATCHABLE',
+          message: 'Transaction record returned by Binance had no comparable payment identifier.',
           sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: false }),
         };
       }
 
-      eligibleCandidates = unusedMatches.filter(
-        c => (c.transactionId && c.transactionId.toLowerCase() === cleanSub) || (c.orderId && c.orderId.toLowerCase() === cleanSub)
-      );
-
+      matchedTx = rawMatch;
       logger.info('Binance verification stage: checks_completed', {
         depositId,
         identifierMatchField,
-        eligibleCount: eligibleCandidates.length,
+        eligibleCount: 1,
         checksDurationMs: Date.now() - checksStart,
       });
+    } else {
+      // Unspecified TXID internal compatibility scan
+      const inWindowRecords = fetchedRecords.filter(r => {
+        const txTime = Number(r.transactionTime);
+        return Number.isFinite(txTime) && txTime >= windowStartMs && txTime <= windowEndMs;
+      });
+      const withTxIdRecords = inWindowRecords.filter(r => Boolean(getCanonicalTxId(r)));
+      const currencyMatches = withTxIdRecords.filter(r => r.currency.toUpperCase() === expectedCurrency);
+      const incomingMatches = currencyMatches.filter(r => !this.isOutgoingOrderType(r.orderType, r.amount));
+      const wrongReceiverMatches = incomingMatches.filter(r => {
+        if (configuredRecTrimmed && r.receiverInfo?.binanceId) {
+          return r.receiverInfo.binanceId.trim().toLowerCase() !== configuredRecTrimmed.toLowerCase();
+        }
+        return false;
+      });
+      const receiverMatches = incomingMatches.filter(r => {
+        if (configuredRecTrimmed && r.receiverInfo?.binanceId) {
+          return r.receiverInfo.binanceId.trim().toLowerCase() === configuredRecTrimmed.toLowerCase();
+        }
+        return true;
+      });
+      const amountMatches = receiverMatches.filter(r => {
+        try {
+          return new Decimal(r.amount).equals(expectedAmount);
+        } catch {
+          return false;
+        }
+      });
+      const unusedMatches = amountMatches.filter(r => !isConsumedRecord(r));
+      unusedMatches.sort((a, b) => Number(a.transactionTime) - Number(b.transactionTime));
 
-      if (eligibleCandidates.length === 0) {
+      const diagnostics = buildDiagnostics(unusedMatches, { totalDurationMs: Date.now() - overallStart });
+
+      if (unusedMatches.length === 0) {
+        if (wrongReceiverMatches.length > 0 && receiverMatches.length === 0) {
+          return {
+            verified: false,
+            classification: 'WRONG_RECEIVER',
+            message: 'Transaction receiver ID does not match the configured Binance receiver ID.',
+            sanitizedDetails: diagnostics,
+          };
+        }
+        if (amountMatches.length > 0) {
+          return {
+            verified: false,
+            classification: 'DUPLICATE_TRANSACTION',
+            message: 'Matching transaction was already processed for a previous deposit.',
+            sanitizedDetails: diagnostics,
+          };
+        }
+        if (currencyMatches.length > 0 && amountMatches.length === 0) {
+          return {
+            verified: false,
+            classification: 'WRONG_AMOUNT',
+            message: `Payment not found for exact amount ${expectedAmount.toFixed(4)} USDT in this invoice window.`,
+            sanitizedDetails: diagnostics,
+          };
+        }
         return {
           verified: false,
           classification: 'TXID_NOT_FOUND',
-          message: 'The submitted Binance Transaction ID was not found in your recent matching incoming transactions.',
-          sanitizedDetails: buildDiagnostics([], { checksDurationMs: Date.now() - checksStart, totalDurationMs: Date.now() - overallStart, retryable: true }),
+          message: 'No matching incoming payment detected yet. Please submit your Binance Order ID.',
+          sanitizedDetails: { ...diagnostics, retryable: true },
         };
       }
-    }
 
-    const diagnostics = buildDiagnostics(eligibleCandidates, { totalDurationMs: Date.now() - overallStart });
-
-    logger.info('Binance verification matching diagnostics', {
-      depositId,
-      diagnostics,
-    });
-
-    // Evaluation outcomes: 0 candidates
-    if (eligibleCandidates.length === 0) {
-      if (wrongReceiverMatches.length > 0 && receiverMatches.length === 0) {
+      if (unusedMatches.length > 1) {
         return {
           verified: false,
-          classification: 'WRONG_RECEIVER',
-          message: 'Transaction receiver ID does not match the configured Binance receiver ID.',
-          sanitizedDetails: diagnostics,
+          classification: 'TXID_NOT_FOUND',
+          message: 'Multiple matching transactions were detected in this window. Please enter your exact Binance Order ID.',
+          sanitizedDetails: { ...diagnostics, upstreamClassification: 'AMBIGUOUS_TRANSACTION', retryable: true },
         };
       }
-      if (amountMatches.length > 0 && unusedMatches.length === 0) {
-        return {
-          verified: false,
-          classification: 'DUPLICATE_TRANSACTION',
-          message: 'Matching transaction was already processed for a previous deposit.',
-          sanitizedDetails: diagnostics,
-        };
-      }
-      if (currencyMatches.length > 0 && amountMatches.length === 0) {
-        return {
-          verified: false,
-          classification: 'WRONG_AMOUNT',
-          message: `Payment not found for exact amount ${expectedAmount.toFixed(4)} USDT in this invoice window.`,
-          sanitizedDetails: diagnostics,
-        };
-      }
-      return {
-        verified: false,
-        classification: 'TXID_NOT_FOUND',
-        message: 'No matching incoming payment detected yet. Please verify your Transaction ID and try again in 10–20 seconds.',
-        sanitizedDetails: { ...diagnostics, retryable: true },
-      };
+
+      matchedTx = unusedMatches[0];
+      identifierMatchField = matchedTx.orderId ? 'MATCHED_ORDER_ID' : 'MATCHED_TRANSACTION_ID';
     }
 
-    // Multiple unused matching candidates without unambiguous TXID -> zero credit
-    if (eligibleCandidates.length > 1) {
-      logger.warn('Ambiguous matching transactions detected within invoice window', {
-        depositId,
-        diagnostics,
-      });
-      return {
-        verified: false,
-        classification: 'TXID_NOT_FOUND',
-        message: 'Multiple matching transactions were detected in this window. Please enter the exact Transaction ID or contact Support.',
-        sanitizedDetails: { ...diagnostics, upstreamClassification: 'AMBIGUOUS_TRANSACTION', retryable: true },
-      };
-    }
-
-    const matchedTx = eligibleCandidates[0];
+    const diagnostics = buildDiagnostics([matchedTx], { totalDurationMs: Date.now() - overallStart });
     const matchedCanonicalId = getCanonicalTxId(matchedTx);
+    const matchedOrderId = matchedTx.orderId ? matchedTx.orderId.trim() : null;
 
-    if (isConsumedRecord(matchedTx)) {
-      return {
-        verified: false,
-        classification: 'DUPLICATE_TRANSACTION',
-        message: 'This Binance Transaction ID has already been credited.',
-        sanitizedDetails: diagnostics,
-      };
-    }
-
-    // Safety Gate Check: BINANCE_PAY_ENABLED=true alone must NEVER enable automatic wallet credit.
+    // 9. Financial Readiness Safety Gate: BINANCE_PAY_ENABLED=true alone must NEVER enable automatic wallet credit.
     const readiness = await this.getReadinessState();
     if (!readiness.automaticCreditEnabled) {
       logger.warn('Binance automatic wallet credit blocked by safety gate: readiness criteria not satisfied', {
@@ -1079,7 +1311,7 @@ export class BinanceService {
       };
     }
 
-    // Stage: Atomic database credit transaction
+    // 10. Atomic database credit transaction
     const dbStageStart = Date.now();
     const txResult = await db.withTransaction(async (client) => {
       const lockedDeposit = await client.queryRow<any>(
@@ -1087,72 +1319,138 @@ export class BinanceService {
         [depositId]
       );
 
+      if (!lockedDeposit) {
+        return {
+          verified: false,
+          classification: 'TXID_NOT_FOUND' as BinanceErrorClassification,
+          message: 'Deposit invoice not found.',
+          sanitizedDetails: diagnostics,
+        };
+      }
+
+      if (customerId && lockedDeposit.user_id !== String(customerId)) {
+        return {
+          verified: false,
+          classification: 'ELIGIBILITY_RESTRICTED' as BinanceErrorClassification,
+          message: 'This deposit invoice does not belong to your account.',
+          sanitizedDetails: diagnostics,
+        };
+      }
+
       if (lockedDeposit.status === 'VERIFIED') {
         return {
           verified: true,
-          classification: 'VERIFIED' as BinanceErrorClassification,
-          message: 'Deposit already credited.',
+          classification: 'ALREADY_VERIFIED' as BinanceErrorClassification,
+          message: 'This deposit invoice has already been verified and credited to your wallet.',
           transaction: matchedTx,
           sanitizedDetails: diagnostics,
         };
       }
 
-      const checkDouble = await client.queryRow<any>(
-        'SELECT id FROM deposits WHERE binance_transaction_id = $1 AND id <> $2 FOR UPDATE',
-        [matchedCanonicalId, depositId]
-      );
-      if (checkDouble) {
+      const lockedExpiresMs = lockedDeposit.expires_at ? new Date(lockedDeposit.expires_at).getTime() : Date.now() + 3600000;
+      if (lockedDeposit.status === 'EXPIRED' || Date.now() > lockedExpiresMs) {
         return {
           verified: false,
-          classification: 'DUPLICATE_TRANSACTION' as BinanceErrorClassification,
-          message: 'This transaction was claimed concurrently by another deposit.',
+          classification: 'EXPIRED_INVOICE' as BinanceErrorClassification,
+          message: 'This deposit invoice has expired.',
           sanitizedDetails: diagnostics,
         };
       }
 
-      await client.query(`
+      if (lockedDeposit.status !== 'PENDING') {
+        return {
+          verified: false,
+          classification: 'ELIGIBILITY_RESTRICTED' as BinanceErrorClassification,
+          message: 'This deposit invoice is not eligible for verification.',
+          sanitizedDetails: diagnostics,
+        };
+      }
+
+      const idsToCheck = Array.from(new Set([matchedCanonicalId, matchedOrderId].filter((v): v is string => Boolean(v))));
+      if (idsToCheck.length > 0) {
+        const placeholders = idsToCheck.map((_, idx) => `$${idx + 2}`).join(', ');
+        const checkDouble = await client.queryRow<any>(
+          `SELECT id FROM deposits
+           WHERE id <> $1
+             AND (binance_transaction_id IN (${placeholders}) OR binance_order_id IN (${placeholders}))
+           FOR UPDATE`,
+          [depositId, ...idsToCheck]
+        );
+        if (checkDouble) {
+          return {
+            verified: false,
+            classification: 'DUPLICATE_TRANSACTION' as BinanceErrorClassification,
+            message: 'This Binance payment was already claimed by another deposit.',
+            sanitizedDetails: diagnostics,
+          };
+        }
+      }
+
+      await client.query(
+        `
         UPDATE deposits
         SET status = 'VERIFIED',
             binance_transaction_id = $1,
-            binance_order_type = $2,
+            binance_order_id = $2,
+            binance_match_type = $3,
+            binance_order_type = $4,
+            txid = $5,
             verified_at = CURRENT_TIMESTAMP,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = $3
-      `, [matchedCanonicalId, matchedTx.orderType, depositId]);
+        WHERE id = $6
+      `,
+        [
+          matchedCanonicalId,
+          matchedOrderId,
+          identifierMatchField,
+          matchedTx.orderType,
+          maskIdentifier(matchedOrderId || matchedCanonicalId),
+          depositId,
+        ]
+      );
 
-      await client.query(`
+      const sanitizedProofId = maskIdentifier(matchedOrderId || matchedCanonicalId);
+      const txRefHash = crypto.createHash('sha256').update(matchedCanonicalId).digest('hex').slice(0, 16);
+
+      await client.query(
+        `
         INSERT INTO payment_transactions (id, deposit_id, provider, external_ref, amount, currency, raw_data)
         VALUES ($1, $2, 'BINANCE_PAY', $3, $4, $5, $6)
-      `, [
-        `pt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        depositId,
-        matchedCanonicalId,
-        matchedTx.amount,
-        matchedTx.currency,
-        JSON.stringify({
-          transactionId: matchedTx.transactionId || undefined,
-          orderId: matchedTx.orderId || undefined,
-          transactionTime: matchedTx.transactionTime,
-          orderType: matchedTx.orderType,
-          amount: matchedTx.amount,
-          currency: matchedTx.currency,
-        }),
-      ]);
+      `,
+        [
+          `pt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          depositId,
+          `BIN_REF_${txRefHash}`,
+          matchedTx.amount,
+          matchedTx.currency,
+          JSON.stringify({
+            maskedTransactionId: matchedTx.transactionId ? maskIdentifier(matchedTx.transactionId) : undefined,
+            maskedOrderId: matchedOrderId ? maskIdentifier(matchedOrderId) : undefined,
+            matchType: identifierMatchField,
+            transactionTime: matchedTx.transactionTime,
+            orderType: matchedTx.orderType,
+            amount: matchedTx.amount,
+            currency: matchedTx.currency,
+          }),
+        ]
+      );
 
-      const operationRef = `DEP_BINANCE_${matchedCanonicalId}`;
+      const operationRef = `DEP_BINANCE_${txRefHash}`;
       await walletService.executeMutation({
         userId: lockedDeposit.user_id,
         amount: expectedAmount,
         operationRef,
         idempotencyKey: depositId,
         entryType: 'DEPOSIT',
-        reason: `Binance Pay USDT automatic credit (${matchedCanonicalId.substring(0, 8)}...)`,
+        reason: `Binance Pay USDT automatic credit (${sanitizedProofId})`,
         source: 'BINANCE_USDT',
         actor: 'SYSTEM_VERIFIER',
         metadata: {
           depositId,
           orderType: matchedTx.orderType,
+          matchType: identifierMatchField,
         },
+        client,
       });
 
       const dbStageMs = Date.now() - dbStageStart;

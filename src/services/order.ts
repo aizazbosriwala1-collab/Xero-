@@ -130,6 +130,7 @@ export class OrderService {
           unitPrice: unitPrice.toFixed(2),
           quantity: qty,
         },
+        client,
       });
     });
 
@@ -215,6 +216,7 @@ export class OrderService {
           source: 'SUPPLIER_REJECTION',
           actor: 'SYSTEM',
           metadata: { orderId, errorCode: supplierRes.error_code },
+          client,
         });
       });
 
@@ -363,6 +365,7 @@ export class OrderService {
           source: 'SUPPLIER_RETRY_REJECTION',
           actor: 'SYSTEM',
           metadata: { orderId, errorCode: supplierRes.error_code },
+          client,
         });
 
         return {

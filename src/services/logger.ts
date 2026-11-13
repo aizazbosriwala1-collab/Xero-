@@ -26,6 +26,7 @@ export function sanitizeObject(obj: unknown): unknown {
       'key', 'secret', 'token', 'authorization', 'password', 'signature',
       'apikey', 'api_key', 'api_secret', 'webhook_secret', 'credential',
       'credentials', 'receiverid', 'receiver_id', 'binance_transaction_id',
+      'binance_order_id', 'counterpartyid', 'counterparty_id', 'payerinfo', 'payer_info',
       'delivery_encryption_key', 'encryption_key', 'encryptionkey', 'delivered_items',
       'content', 'plaintext'
     ];

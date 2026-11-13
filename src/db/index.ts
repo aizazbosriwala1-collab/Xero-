@@ -21,6 +21,7 @@ class DatabaseManager {
   private memDb: IMemoryDb | null = null;
   private memAdapter: any = null;
   private isInMemory = false;
+  private memTxQueue: Promise<void> = Promise.resolve();
 
   constructor() {
     if (config.databaseUrl) {
@@ -110,6 +111,36 @@ class DatabaseManager {
   }
 
   public async withTransaction<T>(callback: (client: DbClient) => Promise<T>): Promise<T> {
+    if (this.isInMemory && this.memDb) {
+      const prev = this.memTxQueue;
+      let release!: () => void;
+      const current = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      this.memTxQueue = prev.then(() => current);
+      await prev;
+
+      const client = await this.getClient();
+      const memBackup = this.memDb.backup();
+      try {
+        await client.query('BEGIN');
+        const result = await callback(client);
+        await client.query('COMMIT');
+        return result;
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr: any) {
+          logger.error('Transaction rollback failed', { error: rollbackErr.message });
+        }
+        memBackup.restore();
+        throw err;
+      } finally {
+        client.release();
+        release();
+      }
+    }
+
     const client = await this.getClient();
     try {
       await client.query('BEGIN');

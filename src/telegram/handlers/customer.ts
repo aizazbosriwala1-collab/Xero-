@@ -24,6 +24,7 @@ import {
   getWalletKeyboard,
   getDepositMethodsKeyboard,
   getBinanceInvoiceKeyboard,
+  getPaymentBeforeInvoiceKeyboard,
   getLanguageKeyboard,
   getBackHomeKeyboard,
   getStaleMenuKeyboard,
@@ -501,18 +502,20 @@ export class CustomerHandler {
       return;
     }
 
-    // Binance: Submit Transaction ID
+    // Binance: Submit Order ID
     if (data.startsWith('bin_tx:')) {
       const [, depositId] = data.split(':');
       await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } });
       const prompt =
-        `🔎 *SUBMIT BINANCE TRANSACTION ID*\n\n` +
-        `Please paste the Binance *Transaction ID* for your payment.\n\n` +
+        `🔎 *SUBMIT BINANCE ORDER ID*\n\n` +
+        `Please paste the Binance *Order ID* from your completed Binance Pay transfer.\n\n` +
         `Where to find it in Binance:\n` +
-        `1. Open Binance App → Pay → Transaction History\n` +
-        `2. Tap the transfer you just sent\n` +
-        `3. Copy the *Transaction ID* (or Order ID)\n\n` +
-        `_Note: Do not submit the invoice ID or Binance Pay receiver ID._`;
+        `1. Open Binance App → Pay → History\n` +
+        `2. Open Payment Details for the transfer you just sent\n` +
+        `3. Copy the *Order ID*\n\n` +
+        `⚠️ Your Binance payment must be sent *after* creating this invoice.\n` +
+        `_Official API Transaction IDs are also accepted for compatibility._\n\n` +
+        `_Do NOT submit the invoice ID, receiver Binance ID, Binance account ID, Telegram user ID, or an Order ID from an earlier payment._`;
 
       await telegramClient.sendMessage(chatId, prompt, {
         reply_markup: getBackHomeKeyboard('m:dep', lang),
@@ -521,7 +524,25 @@ export class CustomerHandler {
       return;
     }
 
-    // Binance: Retry Verification with last submitted Transaction ID
+    // Binance: Contact Support pre-seeded from pre-invoice / deposit notice
+    if (data.startsWith('bin_sup:')) {
+      const [, depositId] = data.split(':');
+      await redis.setFsmState(userId, {
+        step: 'AWAITING_SUPPORT_MESSAGE',
+        data: { contextType: 'BINANCE_PRE_INVOICE', depositId },
+      });
+      const prompt =
+        `🎧 *BINANCE DEPOSIT SUPPORT*\n\n` +
+        `If you sent a Binance Pay payment before creating your invoice, please describe what happened (for example: approximate time and USDT amount sent).\n\n` +
+        `Our support team will review and assist you promptly:`;
+      await telegramClient.sendMessage(chatId, prompt, {
+        reply_markup: getBackHomeKeyboard('m:dep', lang),
+      });
+      await ackPromise;
+      return;
+    }
+
+    // Binance: Retry Verification with last submitted Order ID / TXID
     if (data.startsWith('bin_r:')) {
       const [, depositId] = data.split(':');
       const allowed = await navigationService.acquireActionLock(userId, `bin_r:${depositId}`, 3);
@@ -535,7 +556,7 @@ export class CustomerHandler {
         await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } });
         await telegramClient.sendMessage(
           chatId,
-          '🔎 Please paste your Binance *Transaction ID* again to retry verification:',
+          '🔎 Please paste your Binance *Order ID* again to retry verification:',
           { reply_markup: getBackHomeKeyboard('m:dep', lang) }
         );
         await ackPromise;
@@ -849,11 +870,11 @@ export class CustomerHandler {
         `📋 *Send To Binance ID:*\n\`${receiverId}\`\n\n` +
         `_Long-press the Binance ID above to copy it._\n\n` +
         `⏳ *Expires In:* 60 minutes\n\n` +
-        `1. Open Binance → Pay → Send\n` +
+        `1. Open Binance App → Pay → Send\n` +
         `2. Copy the Binance ID above\n` +
-        `3. Send exactly the displayed USDT amount\n` +
-        `4. Return here\n` +
-        `5. Tap *🔎 SUBMIT TRANSACTION ID* below`;
+        `3. Send the exact displayed USDT amount *after* creating this invoice\n` +
+        `4. Open Binance Pay → History → Payment Details and copy the *Order ID*\n` +
+        `5. Tap *🔎 SUBMIT ORDER ID* below`;
 
       await telegramClient.sendMessage(chatId, invoiceMsg, {
         reply_markup: getBinanceInvoiceKeyboard(invoice.id, lang),
@@ -910,11 +931,15 @@ export class CustomerHandler {
     // FSM: Support Message
     if (fsm.step === 'AWAITING_SUPPORT_MESSAGE') {
       await redis.clearFsmState(userId);
+      const isPreInvoice = fsm.data?.contextType === 'BINANCE_PRE_INVOICE';
+      const relatedDep = fsm.data?.depositId ? String(fsm.data.depositId) : undefined;
       const ticketId = await supportService.createTicket({
         userId,
-        issueType: 'GENERAL_INQUIRY',
-        subject: text.substring(0, 50),
-        message: text,
+        issueType: isPreInvoice ? 'BINANCE_PRE_INVOICE' : 'GENERAL_INQUIRY',
+        subject: isPreInvoice
+          ? `Pre-invoice Binance deposit (${relatedDep || 'N/A'})`.substring(0, 50)
+          : text.substring(0, 50),
+        message: relatedDep ? `[Invoice Ref: ${relatedDep}] ${text}` : text,
       });
 
       await telegramClient.sendMessage(chatId, t('support_created', lang, { ticketId }), {
@@ -1219,7 +1244,7 @@ export class CustomerHandler {
       await redis.set(`bin_last_tx:${userId}:${depositId}`, cleanTx, 3600).catch(() => {});
     }
 
-    await telegramClient.sendMessage(chatId, `🔍 Verifying submitted Transaction ID \`${cleanTx}\`...`);
+    await telegramClient.sendMessage(chatId, `🔍 Verifying submitted Order ID \`${maskedTx || 'SUBMITTED'}\`...`);
 
     let res: BinanceVerificationResult;
     try {
@@ -1241,11 +1266,20 @@ export class CustomerHandler {
     const sendStart = Date.now();
     let tgRes: any;
     if (res.verified) {
+      const heading = res.classification === 'ALREADY_VERIFIED' ? '✅ *ALREADY VERIFIED*' : '✅ *PAYMENT VERIFIED!*';
       tgRes = await telegramClient.sendMessage(
         chatId,
-        `✅ *PAYMENT VERIFIED!*\n\n${this.escapeMarkdownText(res.message)}`,
+        `${heading}\n\n${this.escapeMarkdownText(res.message)}`,
         { reply_markup: getBackHomeKeyboard('m:wall', lang) }
       );
+    } else if (res.classification === 'PAYMENT_BEFORE_INVOICE') {
+      const preInvoiceMsg =
+        `⚠️ *PAYMENT COMPLETED BEFORE INVOICE*\n\n` +
+        `This payment was completed before this invoice was created, so it cannot be used for this invoice. Please create a current invoice before making a payment.\n\n` +
+        `If you genuinely sent funds earlier by mistake, tap *🎧 CONTACT SUPPORT* below so our team can review it.`;
+      tgRes = await telegramClient.sendMessage(chatId, preInvoiceMsg, {
+        reply_markup: getPaymentBeforeInvoiceKeyboard(lang, depositId),
+      });
     } else {
       const safeClassification = this.escapeMarkdownText(res.classification);
       const safeMessage = this.escapeMarkdownText(res.message);

@@ -501,8 +501,8 @@ export function getDepositMethodsKeyboard(lang: SupportedLanguage = 'en'): Teleg
 }
 
 /**
- * Binance Invoice Action Keyboard (TXID-only Customer Flow)
- * Strictly TWO buttons: [ 🔎 SUBMIT TRANSACTION ID ] (success) and [ ❌ CANCEL ] (danger)
+ * Binance Invoice Action Keyboard (Order-ID Customer Flow)
+ * Strictly TWO buttons: [ 🔎 SUBMIT ORDER ID ] (success) and [ ❌ CANCEL ] (danger)
  */
 export function getBinanceInvoiceKeyboard(
   depositId: string,
@@ -523,6 +523,45 @@ export function getBinanceInvoiceKeyboard(
           settingKey: 'btn.dep.cancel',
           lang,
           callbackData: 'm:dep',
+          forceVisible: true,
+        }),
+      ]),
+    ]),
+  };
+}
+
+/**
+ * Keyboard shown when customer submits an Order ID belonging to a payment sent before invoice creation.
+ */
+export function getPaymentBeforeInvoiceKeyboard(
+  lang: SupportedLanguage = 'en',
+  depositId?: string
+): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: filterNonEmptyRows([
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({
+          text: lang === 'ur' ? 'سپورٹ سے رابطہ کریں' : 'CONTACT SUPPORT',
+          fallbackEmoji: '🎧',
+          style: 'primary',
+          callbackData: depositId ? `bin_sup:${depositId}` : 'm:supp',
+          forceVisible: true,
+        }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({
+          text: lang === 'ur' ? 'موجودہ انوائس بنائیں' : 'CREATE CURRENT INVOICE',
+          fallbackEmoji: '➕',
+          style: 'success',
+          callbackData: 'dep_m:binance',
+          forceVisible: true,
+        }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({
+          settingKey: 'btn.nav.home',
+          lang,
+          callbackData: 'm:home',
           forceVisible: true,
         }),
       ]),
