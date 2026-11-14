@@ -16,6 +16,7 @@ import {
 import { orderService } from '../src/services/order.js';
 import { referralService } from '../src/services/referral.js';
 import { giveawayService } from '../src/services/giveaway.js';
+import { announcementService } from '../src/services/announcement.js';
 import {
   telegramBotRouter,
   isRegisteredCallbackRoute,
@@ -6748,6 +6749,434 @@ export async function runComprehensiveTests() {
       assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered route: ${cb}`);
     }
     void adminId;
+  });
+
+  // ===========================================================================
+  // CONTRACT 11: REFERRAL TWO-COUNTER, CUSTOM GIVEAWAYS, ANNOUNCEMENTS & SPEED
+  // ===========================================================================
+  await it('Contract 11.1: Two-Counter Referrals (Total vs Qualified), Anti-Abuse (Self/Circular/Duplicate/Rejoin) & Referral Program Screen', 'mock_integration', async () => {
+    const referrerId = '97001';
+    const invitedA = '97002';
+    const invitedB = '97003';
+    const preExisting = '97004';
+    await ensureAuditUser(referrerId);
+    await ensureAuditUser(invitedA);
+    await ensureAuditUser(invitedB);
+    await ensureAuditUser(preExisting);
+
+    // Make preExisting look older (>120s) to verify rejoin abuse protection
+    await db.query("UPDATE users SET created_at = NOW() - INTERVAL '10 minutes' WHERE id = $1", [preExisting]);
+
+    // Ensure at least one active milestone tier exists
+    const adminId = String(config.telegram.adminIds[0]);
+    const tierId = await referralService.createRewardTier(
+      { title: 'Referral Milestone Bonus', requiredQualifiedReferrals: 2, rewardType: 'WALLET_USDT', rewardAmount: '1.00', isActive: true },
+      adminId
+    );
+
+    try {
+      // 1. Self-referral rejected
+      assert.strictEqual(await referralService.registerReferral(referrerId, referrerId), false, 'Self-referral must fail');
+
+      // 2. Rejoin abuse by older account rejected
+      assert.strictEqual(await referralService.registerReferral(referrerId, preExisting), false, 'Old account rejoin abuse must fail');
+
+      // 3. Valid new joins count ONCE in Total Referrals, 0 in Qualified
+      assert.strictEqual(await referralService.registerReferral(referrerId, invitedA), true);
+      assert.strictEqual(await referralService.registerReferral(referrerId, invitedA), false, 'Duplicate join must fail');
+      assert.strictEqual(await referralService.registerReferral(referrerId, invitedB), true);
+
+      // 4. Circular referral (invitedA trying to refer referrerId) rejected
+      assert.strictEqual(await referralService.registerReferral(invitedA, referrerId), false, 'Circular referral must fail');
+
+      let stats = await referralService.getStats(referrerId);
+      assert.strictEqual(stats.totalReferred, 2, 'Total Referrals must be 2 after 2 valid joins');
+      assert.strictEqual(stats.qualifiedCount, 0, 'Qualified Referrals must start at 0 before purchases');
+
+      // 5. Qualifying purchase completes for invitedA -> Qualified becomes 1; second order does NOT double-count
+      const minQual = Number((await referralService.getSettings()).minQualifyingOrderUsdt || '0.50');
+      const qualifyAmt = new Decimal(Math.max(1.0, minQual).toFixed(2));
+      await referralService.processOrderQualification(invitedA, 'ord_ref_qual_a1', qualifyAmt);
+      await referralService.processOrderQualification(invitedA, 'ord_ref_qual_a2', qualifyAmt);
+
+      stats = await referralService.getStats(referrerId);
+      assert.strictEqual(stats.totalReferred, 2);
+      assert.strictEqual(stats.qualifiedCount, 1, 'Same referred user must only qualify once');
+
+      // 6. Verify customer m:ref Referral Program screen
+      const sent: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        sent.push({ method, body });
+        return { ok: true, result: { message_id: 9710 } };
+      });
+
+      await telegramBotRouter.handleUpdate({
+        update_id: 970101,
+        callback_query: {
+          id: 'cb_ref_11',
+          from: { id: Number(referrerId), is_bot: false, first_name: 'RefUser' },
+          data: 'm:ref',
+          message: { message_id: 9710, chat: { id: Number(referrerId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Menu' },
+        },
+      });
+      const refMsg = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Referral Program'));
+      assert.ok(refMsg, 'Customer m:ref must render Referral Program screen');
+      const txt = String(refMsg!.body.text);
+      assert.ok(txt.includes('*Referral Link:*'));
+      assert.ok(txt.includes('*Total Referrals:* `2`'));
+      assert.ok(txt.includes('*Qualified Referrals:* `1`'));
+      assert.ok(txt.includes('*Active Rewards:*'));
+      assert.ok(txt.includes('*Progress:*'));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await referralService.deleteRewardTier(tierId, adminId).catch(() => {});
+    }
+  });
+
+  await it('Contract 11.2: Custom Product & Wallet Credit Giveaways + Total/Qualified Thresholds + Atomic Ledger Integrity', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const refOwner = '97101';
+    const f1 = '97102';
+    const f2 = '97103';
+    await ensureAuditUser(refOwner);
+    await ensureAuditUser(f1);
+    await ensureAuditUser(f2);
+
+    // 1 friend joined (total = 1)
+    assert.strictEqual(await referralService.registerReferral(refOwner, f1), true);
+
+    // Create Custom Product giveaway requiring 2 Total Referrals (0 Qualified)
+    const customGwId = await giveawayService.createGiveaway(
+      {
+        title: 'Custom CapCut Giveaway',
+        rewardType: 'CUSTOM_PRODUCT',
+        rewardLabel: 'CapCut Premium',
+        requiredTotalReferrals: 2,
+        requiredQualifiedReferrals: 0,
+        claimLimit: 10,
+      },
+      adminId
+    );
+
+    // Create Wallet Credit giveaway requiring 1 Qualified Referral
+    const walletGwId = await giveawayService.createGiveaway(
+      {
+        title: 'USDT Wallet Bonus Giveaway',
+        rewardType: 'WALLET_CREDIT',
+        rewardAmountUsdt: '1.50',
+        requiredTotalReferrals: 0,
+        requiredQualifiedReferrals: 1,
+        claimLimit: 10,
+      },
+      adminId
+    );
+
+    try {
+      // With only 1 total referral, customGw requires 2 total -> must fail
+      await assert.rejects(() => giveawayService.claimGiveaway(customGwId, refOwner), /You need at least 2 referrals/i);
+
+      // Add 2nd join (still 0 qualified) -> customGw must now succeed!
+      assert.strictEqual(await referralService.registerReferral(refOwner, f2), true);
+
+      const customClaim = await giveawayService.claimGiveaway(customGwId, refOwner);
+      assert.strictEqual(customClaim.success, true);
+      assert.strictEqual(customClaim.rewardType, 'CUSTOM_PRODUCT');
+      assert.ok(customClaim.message.includes('CapCut Premium'));
+
+      // Wallet giveaway requires 1 qualified -> blocked before qualification
+      await assert.rejects(() => giveawayService.claimGiveaway(walletGwId, refOwner), /qualified referrals/i);
+
+      // Qualify f1 -> claim Wallet Credit giveaway -> atomic ledger credit +1.50 USDT
+      await referralService.processOrderQualification(f1, 'ord_gw_qual_1', new Decimal('5.00'));
+      const beforeBal = await walletService.getBalance(refOwner);
+      const walletClaim = await giveawayService.claimGiveaway(walletGwId, refOwner);
+      assert.strictEqual(walletClaim.success, true);
+      assert.strictEqual(walletClaim.rewardType, 'WALLET_CREDIT');
+      assert.strictEqual(walletClaim.creditedUsdt, '1.50');
+
+      const afterBal = await walletService.getBalance(refOwner);
+      assert.strictEqual(
+        afterBal.available.minus(beforeBal.available).toFixed(2),
+        '1.50',
+        'Wallet credit giveaway must credit exact 1.50 USDT'
+      );
+
+      // Duplicate claim rejected & wallet ledger still reconciles
+      await assert.rejects(() => giveawayService.claimGiveaway(walletGwId, refOwner), /already claimed/i);
+      const rec = await walletService.reconcile(refOwner);
+      assert.strictEqual(rec.isBalanced, true, 'Wallet ledger reconciliation must remain 100% valid after giveaway credit');
+
+      // Exercise Admin Giveaway Type switcher callbacks
+      const sent: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        sent.push({ method, body });
+        return { ok: true, result: { message_id: 9720 } };
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 970201,
+        callback_query: {
+          id: 'cb_gw_new',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:gw_new',
+          message: { message_id: 9720, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 970202,
+        callback_query: {
+          id: 'cb_gw_custom',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:gw_rt:draft:custom',
+          message: { message_id: 9720, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+      assert.ok(sent.some(m => String(m.body.text).includes('CUSTOM_PRODUCT')));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await giveawayService.deleteGiveaway(customGwId, adminId).catch(() => {});
+      await giveawayService.deleteGiveaway(walletGwId, adminId).catch(() => {});
+    }
+  });
+
+  await it('Contract 11.3: Announcements Center, Preview, Non-Blocking Broadcast (429 Retry, Blocked, Failed) & Cancellation', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const uOk = '97201';
+    const u429 = '97202';
+    const uBlk = '97203';
+    const uFail = '97204';
+    await ensureAuditUser(uOk);
+    await ensureAuditUser(u429);
+    await ensureAuditUser(uBlk);
+    await ensureAuditUser(uFail);
+
+    const ann = await announcementService.createAnnouncement(
+      {
+        title: 'Launch Flash Sale',
+        messageText: '🔥 *50% Bonus Sale* is live now!',
+        mediaType: 'PHOTO',
+        mediaFileId: 'AgACAgIAAxkBA_test_photo_id',
+        buttons: announcementService.parseButtonsInput('Shop Now | m:prod\nChannel | https://t.me/xerokhan'),
+      },
+      adminId
+    );
+    assert.strictEqual(ann.status, 'DRAFT');
+    assert.strictEqual(ann.buttons.length, 2);
+
+    const retrySeen = new Set<string>();
+    const deliveredPhotos: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      const target = String(body?.chat_id || '');
+      if (method === 'sendPhoto' && target === u429 && !retrySeen.has(u429)) {
+        retrySeen.add(u429);
+        return { ok: false, error_code: 429, parameters: { retry_after: 0.02 }, description: 'Too Many Requests' };
+      }
+      if (method === 'sendPhoto' && target === uBlk) {
+        return { ok: false, error_code: 403, description: 'Forbidden: bot was blocked by the user' };
+      }
+      if (method === 'sendPhoto' && target === uFail) {
+        return { ok: false, error_code: 500, description: 'Internal Server Error' };
+      }
+      if (method === 'sendPhoto') {
+        deliveredPhotos.push({ chatId: target, body });
+      }
+      return { ok: true, result: { message_id: 9730 } };
+    });
+
+    try {
+      // 1. Preview to Admin sends sendPhoto cleanly
+      const prevRes = await announcementService.sendPreview(ann, adminId);
+      assert.strictEqual(prevRes.ok, true);
+      assert.ok(deliveredPhotos.some(p => p.chatId === adminId));
+
+      // 2. Start non-blocking broadcast with small batchDelayMs so SENDING state overlaps customer callback
+      const { started, announcement: startedAnn } = await announcementService.startBroadcast(ann.id, adminId, {
+        batchSize: 2,
+        batchDelayMs: 40,
+        maxRetryWaitMs: 100,
+      });
+      assert.strictEqual(started, true);
+      assert.strictEqual(startedAnn.status, 'SENDING');
+
+      // Customer callback executes immediately WITHOUT waiting for broadcast completion
+      const custStart = Date.now();
+      await telegramBotRouter.handleUpdate({
+        update_id: 970301,
+        callback_query: {
+          id: 'cb_cust_nonblock',
+          from: { id: Number(uOk), is_bot: false, first_name: 'FastBuyer' },
+          data: 'm:wall',
+          message: { message_id: 9731, chat: { id: Number(uOk), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Menu' },
+        },
+      });
+      const custElapsed = Date.now() - custStart;
+      assert.ok(custElapsed < 300, `Customer callback blocked by broadcast: ${custElapsed}ms`);
+
+      // Wait for background broadcast worker to finish
+      await announcementService.waitForBroadcast(ann.id, 10000);
+      const done = await announcementService.getAnnouncementById(ann.id);
+      assert.ok(done);
+      assert.strictEqual(done!.status, 'COMPLETED');
+      assert.ok(done!.totalUsers >= 4);
+      assert.strictEqual(done!.blockedCount, 1, '403 blocked user must count in blockedCount');
+      assert.strictEqual(done!.failedCount, 1, '500 failure must count in failedCount');
+      assert.strictEqual(done!.deliveredCount + done!.blockedCount + done!.failedCount, done!.totalUsers);
+      assert.ok(retrySeen.has(u429), '429 rate-limit must trigger retry_after backoff and retry');
+
+      // 3. Test mid-flight broadcast cancellation + Admin UI Announcements routes
+      const cancelAnn = await announcementService.createAnnouncement(
+        { title: 'Cancellable Broadcast', messageText: 'Testing cancel flow', mediaType: 'TEXT' },
+        adminId
+      );
+      await announcementService.startBroadcast(cancelAnn.id, adminId, { batchSize: 1, batchDelayMs: 50 });
+      const cancelled = await announcementService.cancelBroadcast(cancelAnn.id, adminId);
+      assert.strictEqual(cancelled?.status, 'CANCELLED');
+      await announcementService.waitForBroadcast(cancelAnn.id, 10000);
+
+      // Admin UI navigation checks
+      const uiOut: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        uiOut.push({ method, body });
+        return { ok: true, result: { message_id: 9740 } };
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 970302,
+        callback_query: {
+          id: 'cb_adm_ann',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:ann',
+          message: { message_id: 9740, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 970303,
+        callback_query: {
+          id: 'cb_adm_ann_hist',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:ann_hist',
+          message: { message_id: 9740, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+      assert.ok(uiOut.some(m => String(m.body.text).includes('ANNOUNCEMENTS & BROADCAST CENTER')));
+      assert.ok(uiOut.some(m => String(m.body.text).includes('ANNOUNCEMENT BROADCAST HISTORY')));
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('Contract 11.4: Callback Latency Targets (<300ms Home, <500ms Views), 60s Redis Cache Hits, >300ms/>500ms PerfTracker & Button Audit', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '97301';
+    await ensureAuditUser(custId);
+
+    // 1. PerfTracker dual threshold (>300ms & >500ms)
+    perfTracker.resetHistory();
+    const { metrics: m310 } = await perfTracker.run('test:warn300', async () => {
+      await new Promise(r => setTimeout(r, 315));
+    });
+    assert.strictEqual(m310.slow300, true, 'Callback >300ms must flag slow300');
+    assert.strictEqual(m310.slow, false, 'Callback at ~315ms must not flag slow (>500ms)');
+
+    const { metrics: m520 } = await perfTracker.run('test:warn500', async () => {
+      await new Promise(r => setTimeout(r, 515));
+    });
+    assert.strictEqual(m520.slow300, true);
+    assert.strictEqual(m520.slow, true);
+    assert.ok(perfTracker.getSlowCallbacks300().length >= 2);
+    assert.ok(perfTracker.getSlowCallbacks().length >= 1);
+
+    // 2. Verify 60s Redis caches execute 0 DB queries on warm reads across Referrals, Giveaways, Announcements, Categories
+    await referralService.getStats(custId);
+    await referralService.listRewardTiers({ activeOnly: true });
+    await giveawayService.getActiveGiveaways();
+    await announcementService.listAnnouncements(20);
+    await pricingService.getCategories(true);
+
+    const { metrics: zeroDbHits } = await perfTracker.run('test:warm_redis_bundle', async () => {
+      await referralService.getStats(custId);
+      await referralService.listRewardTiers({ activeOnly: true });
+      await giveawayService.getActiveGiveaways();
+      await announcementService.listAnnouncements(20);
+      await pricingService.getCategories(true);
+    });
+    assert.strictEqual(zeroDbHits.dbQueryCount, 0, 'Warm 60s Redis caches must execute 0 DB queries');
+    assert.strictEqual(zeroDbHits.supplierCallCount, 0, 'Warm reads must execute 0 supplier calls');
+
+    // 3. Measure actual callback round-trip timings via TelegramBotRouter (warm path)
+    telegramClient.setTransportOverride(async () => ({ ok: true, result: { message_id: 9750 } }));
+    try {
+      const measureCb = async (uid: string, cbData: string, updateId: number): Promise<number> => {
+        // Warm once
+        await telegramBotRouter.handleUpdate({
+          update_id: updateId,
+          callback_query: {
+            id: `cb_w_${updateId}`,
+            from: { id: Number(uid), is_bot: false, first_name: 'Bench' },
+            data: cbData,
+            message: { message_id: 9750, chat: { id: Number(uid), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Menu' },
+          },
+        });
+        const t0 = Date.now();
+        await telegramBotRouter.handleUpdate({
+          update_id: updateId + 100,
+          callback_query: {
+            id: `cb_m_${updateId}`,
+            from: { id: Number(uid), is_bot: false, first_name: 'Bench' },
+            data: cbData,
+            message: { message_id: 9750, chat: { id: Number(uid), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Menu' },
+          },
+        });
+        return Date.now() - t0;
+      };
+
+      const homeMs = await measureCb(custId, 'm:home', 970401);
+      const catMs = await measureCb(custId, 'cat:all:1', 970402);
+      const wallMs = await measureCb(custId, 'm:wall', 970403);
+      const refMs = await measureCb(custId, 'm:ref', 970404);
+      const admMs = await measureCb(adminId, 'adm:main', 970405);
+
+      console.log(
+        `[PERF TIMINGS] m:home=${homeMs}ms cat:all:1=${catMs}ms m:wall=${wallMs}ms m:ref=${refMs}ms adm:main=${admMs}ms`
+      );
+      assert.ok(homeMs < 300, `Main Menu exceeded 300ms: ${homeMs}ms`);
+      assert.ok(catMs < 500, `Category Open exceeded 500ms: ${catMs}ms`);
+      assert.ok(wallMs < 500, `Wallet Open exceeded 500ms: ${wallMs}ms`);
+      assert.ok(refMs < 500, `Referral Open exceeded 500ms: ${refMs}ms`);
+      assert.ok(admMs < 500, `Admin Menu exceeded 500ms: ${admMs}ms`);
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+
+    // 4. Button-Route & 64-byte compliance audit across all Contract 11 routes
+    const sampleId = 'ann_1763130000000_abcd';
+    const sampleGwId = 'gw_1763130000000_abcd';
+    const newRoutes = [
+      `adm:gw_rt:${sampleGwId}:store`,
+      `adm:gw_rt:${sampleGwId}:custom`,
+      `adm:gw_rt:${sampleGwId}:wallet`,
+      `adm:gw_f:${sampleGwId}:clabel`,
+      `adm:gw_f:${sampleGwId}:wamt`,
+      'adm:ann',
+      'adm:ann_new',
+      'adm:ann_hist',
+      'adm:ann_save',
+      'adm:ann_mt:draft:text',
+      'adm:ann_mt:draft:photo',
+      'adm:ann_mt:draft:banner',
+      `adm:ann_mt:${sampleId}:banner`,
+      `adm:ann_f:${sampleId}:title`,
+      `adm:ann_f:${sampleId}:msg`,
+      `adm:ann_f:${sampleId}:btns`,
+      `adm:ann_m:${sampleId}`,
+      `adm:ann_prev:${sampleId}`,
+      `adm:ann_send:${sampleId}`,
+      `adm:ann_sendc:${sampleId}`,
+      `adm:ann_v:${sampleId}`,
+      `adm:ann_cancel:${sampleId}`,
+    ];
+    for (const cb of newRoutes) {
+      assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `Callback exceeds 64 bytes: ${cb}`);
+      assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered route: ${cb}`);
+    }
   });
 
   // SUMMARY & STATS DYNAMIC COMPUTATION

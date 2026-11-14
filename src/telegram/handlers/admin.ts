@@ -10,7 +10,8 @@ import {
 } from '../../services/supplier.js';
 import { pricingService } from '../../services/pricing.js';
 import { orderService } from '../../services/order.js';
-import { giveawayService } from '../../services/giveaway.js';
+import { giveawayService, GiveawayRewardType } from '../../services/giveaway.js';
+import { announcementService, AnnouncementMediaType } from '../../services/announcement.js';
 import { referralService } from '../../services/referral.js';
 import { channelService } from '../../services/channel.js';
 import { settingsService } from '../../services/settings.js';
@@ -704,8 +705,11 @@ export class AdminHandler {
         : {
             title: '',
             description: '',
+            rewardType: 'STORE_PRODUCT' as GiveawayRewardType,
             rewardProductId: '',
             rewardProductName: '',
+            rewardLabel: '',
+            rewardAmountUsdt: '0.00',
             rewardQuantity: 1,
             requiredTotalReferrals: 0,
             requiredQualifiedReferrals: 3,
@@ -720,6 +724,62 @@ export class AdminHandler {
       if (data === 'adm:gw_draft_act') draft.isActive = !draft.isActive;
       await redis.set(draftKey, JSON.stringify(draft), 1800);
       await this.renderAdminGiveawayDraft(chatId, messageId, draft);
+      return;
+    }
+
+    if (data.startsWith('adm:gw_rt:')) {
+      const rest = data.slice('adm:gw_rt:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const targetId = lastColon > 0 ? rest.slice(0, lastColon) : 'draft';
+      const shortType = lastColon > 0 ? rest.slice(lastColon + 1) : 'store';
+      const rewardType: GiveawayRewardType =
+        shortType === 'custom' ? 'CUSTOM_PRODUCT' : shortType === 'wallet' ? 'WALLET_CREDIT' : 'STORE_PRODUCT';
+
+      if (targetId === 'draft') {
+        const draftKey = `gw_draft:${userId}`;
+        const raw = await redis.get(draftKey).catch(() => null);
+        const draft = raw
+          ? JSON.parse(raw)
+          : {
+              title: '',
+              description: '',
+              rewardType,
+              rewardProductId: '',
+              rewardProductName: '',
+              rewardLabel: '',
+              rewardAmountUsdt: '0.00',
+              rewardQuantity: 1,
+              requiredTotalReferrals: 0,
+              requiredQualifiedReferrals: 3,
+              claimLimit: 50,
+              startAt: null,
+              endAt: null,
+              isActive: true,
+              isPublic: true,
+            };
+        draft.rewardType = rewardType;
+        if (rewardType === 'CUSTOM_PRODUCT') {
+          draft.rewardProductId = '';
+          draft.rewardProductName = '';
+        } else if (rewardType === 'WALLET_CREDIT') {
+          draft.rewardProductId = '';
+          draft.rewardProductName = '';
+          if (!Number(draft.rewardAmountUsdt)) draft.rewardAmountUsdt = '1.00';
+        }
+        await redis.set(draftKey, JSON.stringify(draft), 1800);
+        await this.renderAdminGiveawayDraft(chatId, messageId, draft, `✅ Reward type set to *${rewardType}*`);
+      } else {
+        const curr = await giveawayService.getGiveawayById(targetId);
+        if (!curr) return;
+        const patch: any = { rewardType };
+        if (rewardType === 'CUSTOM_PRODUCT' && !curr.rewardLabel) {
+          patch.rewardLabel = 'Custom Reward';
+        } else if (rewardType === 'WALLET_CREDIT' && Number(curr.rewardAmountUsdt || 0) <= 0) {
+          patch.rewardAmountUsdt = '1.00';
+        }
+        await giveawayService.updateGiveaway(targetId, patch, userId);
+        await this.renderAdminGiveawayDetail(chatId, messageId, targetId, `✅ Reward type updated to *${rewardType}*`);
+      }
       return;
     }
 
@@ -873,6 +933,8 @@ export class AdminHandler {
       const prompts: Record<string, string> = {
         title: 'Enter *Giveaway Name*:',
         desc: 'Enter *Description* (or send `clear`):',
+        clabel: 'Enter *Custom Product Name* (e.g. `CapCut Premium`, `Netflix Private`, `VIP Package`):',
+        wamt: 'Enter *Wallet Credit Reward Amount (USDT)* (e.g. `2.50`):',
         qty: 'Enter *Reward Quantity* (integer >= 1):',
         reqq: 'Enter *Required Qualified Referrals* (integer >= 0):',
         reqt: 'Enter *Required Total Referrals* (integer >= 0):',
@@ -904,6 +966,299 @@ export class AdminHandler {
           },
         }
       );
+      return;
+    }
+
+    // =========================================================================
+    // ANNOUNCEMENTS & NON-BLOCKING BACKGROUND BROADCAST SYSTEM
+    // =========================================================================
+    if (data === 'adm:ann' || data === 'adm:ann_hist') {
+      const list = await announcementService.listAnnouncements(20);
+      const isHist = data === 'adm:ann_hist';
+      let text = isHist
+        ? `📜 *ANNOUNCEMENT BROADCAST HISTORY*\n\n`
+        : `📢 *ANNOUNCEMENTS & BROADCAST CENTER*\n\nCreate text, photo, or banner broadcasts with inline buttons and monitor delivery without blocking customers.\n\n`;
+
+      const rows: any[][] = [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Create Announcement', fallbackEmoji: '➕', style: 'success', callbackData: 'adm:ann_new', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: isHist ? 'Overview' : 'Broadcast History', fallbackEmoji: '📜', style: 'primary', callbackData: isHist ? 'adm:ann' : 'adm:ann_hist', forceVisible: true }),
+        ]),
+      ];
+
+      if (list.length === 0) {
+        text += `_No announcements created yet._`;
+      } else {
+        for (const a of list.slice(0, 8)) {
+          const badge =
+            a.status === 'COMPLETED' ? '✅' : a.status === 'SENDING' ? '🚀' : a.status === 'CANCELLED' ? '🛑' : '📝';
+          text += `${badge} *${this.escapeDiagMarkdown(a.title)}* (${a.mediaType})\n   Status: \`${a.status}\` | Delivered: \`${a.deliveredCount}/${a.totalUsers}\` | Blocked: \`${a.blockedCount}\` | Failed: \`${a.failedCount}\`\n`;
+          rows.push(
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: `${badge} ${a.title.slice(0, 26)}`,
+                style: a.status === 'SENDING' ? 'success' : 'default',
+                callbackData: `adm:ann_v:${a.id}`,
+                forceVisible: true,
+              }),
+            ])
+          );
+        }
+      }
+
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ])
+      );
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+      return;
+    }
+
+    if (data === 'adm:ann_new') {
+      const draft = {
+        title: '',
+        messageText: '',
+        mediaType: 'TEXT' as AnnouncementMediaType,
+        mediaFileId: null as string | null,
+        buttons: [] as any[],
+      };
+      await redis.set(`ann_draft:${userId}`, JSON.stringify(draft), 1800);
+      await this.renderAdminAnnouncementDraft(chatId, messageId, draft);
+      return;
+    }
+
+    if (data.startsWith('adm:ann_mt:')) {
+      const rest = data.slice('adm:ann_mt:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const targetId = lastColon > 0 ? rest.slice(0, lastColon) : 'draft';
+      const shortType = lastColon > 0 ? rest.slice(lastColon + 1) : 'text';
+      const mediaType: AnnouncementMediaType =
+        shortType === 'photo' ? 'PHOTO' : shortType === 'banner' ? 'BANNER' : 'TEXT';
+
+      if (targetId === 'draft') {
+        const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+        const draft = raw ? JSON.parse(raw) : { title: '', messageText: '', mediaType, mediaFileId: null, buttons: [] };
+        draft.mediaType = mediaType;
+        if (mediaType === 'TEXT') draft.mediaFileId = null;
+        await redis.set(`ann_draft:${userId}`, JSON.stringify(draft), 1800);
+        await this.renderAdminAnnouncementDraft(chatId, messageId, draft, `✅ Media type set to *${mediaType}*`);
+      } else {
+        await announcementService.updateAnnouncement(
+          targetId,
+          { mediaType, ...(mediaType === 'TEXT' ? { mediaFileId: null } : {}) },
+          userId
+        );
+        await this.renderAdminAnnouncementDetail(chatId, messageId, targetId, `✅ Media type updated to *${mediaType}*`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:ann_f:')) {
+      const rest = data.slice('adm:ann_f:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const targetId = rest.slice(0, lastColon);
+      const field = rest.slice(lastColon + 1);
+      const prompts: Record<string, string> = {
+        title: 'Enter *Announcement Title* (admin reference label):',
+        msg: 'Enter *Message Body* (supports Telegram Markdown):',
+        btns: 'Enter *Inline Buttons* (up to 6, one per line) in format:\n`Open Channel | https://t.me/yourchannel`\n`Visit Shop | m:prod`\n\nOr send `clear` to remove all buttons:',
+      };
+
+      await redis.setFsmState(userId, {
+        step: 'ADMIN_ANN_EDIT_VALUE',
+        data: { targetId, field },
+      });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `📢 *EDIT ANNOUNCEMENT*\n\n${prompts[field] || 'Enter new value:'}`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({
+                  text: 'Cancel',
+                  fallbackEmoji: '❌',
+                  style: 'danger',
+                  callbackData: targetId === 'draft' ? 'adm:ann' : `adm:ann_v:${targetId}`,
+                  forceVisible: true,
+                }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:ann_m:')) {
+      const targetId = data.slice('adm:ann_m:'.length);
+      await redis.setFsmState(userId, {
+        step: 'ADMIN_ANN_EDIT_MEDIA',
+        data: { targetId },
+      });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `🖼️ *SET ANNOUNCEMENT PHOTO / BANNER*\n\nUpload a *Telegram Photo* directly in chat, OR paste an *HTTPS Image URL* / Telegram \`file_id\`, OR send \`clear\` to revert to Text-only:`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({
+                  text: 'Cancel',
+                  fallbackEmoji: '❌',
+                  style: 'danger',
+                  callbackData: targetId === 'draft' ? 'adm:ann' : `adm:ann_v:${targetId}`,
+                  forceVisible: true,
+                }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data === 'adm:ann_save') {
+      const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+      if (!raw) {
+        await telegramClient.editMessageText(chatId, messageId, '⚠️ Draft expired. Start a new announcement.', {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Create Announcement', fallbackEmoji: '➕', style: 'primary', callbackData: 'adm:ann_new', forceVisible: true }),
+                ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ann', forceVisible: true }),
+              ]),
+            ],
+          },
+        });
+        return;
+      }
+
+      const draft = JSON.parse(raw);
+      try {
+        const created = await announcementService.createAnnouncement(draft, userId);
+        await redis.del(`ann_draft:${userId}`).catch(() => {});
+        await this.renderAdminAnnouncementDetail(chatId, messageId, created.id, '✅ Announcement draft saved!');
+      } catch (err: any) {
+        await this.renderAdminAnnouncementDraft(chatId, messageId, draft, `⚠️ ${err.message}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:ann_prev:')) {
+      const targetId = data.slice('adm:ann_prev:'.length);
+      try {
+        if (targetId === 'draft') {
+          const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+          const draft = raw ? JSON.parse(raw) : null;
+          if (!draft || !draft.messageText) {
+            throw new Error('Set Message Body before sending a preview.');
+          }
+          await announcementService.sendPreview(draft, chatId);
+          await this.renderAdminAnnouncementDraft(chatId, messageId, draft, '✅ Preview sent to your Telegram chat!');
+        } else {
+          const ann = await announcementService.getAnnouncementById(targetId);
+          if (!ann) return;
+          await announcementService.sendPreview(ann, chatId);
+          await this.renderAdminAnnouncementDetail(chatId, messageId, targetId, '✅ Preview sent to your Telegram chat!');
+        }
+      } catch (err: any) {
+        if (targetId === 'draft') {
+          const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+          await this.renderAdminAnnouncementDraft(chatId, messageId, raw ? JSON.parse(raw) : {}, `⚠️ ${err.message}`);
+        } else {
+          await this.renderAdminAnnouncementDetail(chatId, messageId, targetId, `⚠️ ${err.message}`);
+        }
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:ann_send:')) {
+      let targetId = data.slice('adm:ann_send:'.length);
+      if (targetId === 'draft') {
+        const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+        if (!raw) return;
+        const draft = JSON.parse(raw);
+        try {
+          const created = await announcementService.createAnnouncement(draft, userId);
+          await redis.del(`ann_draft:${userId}`).catch(() => {});
+          targetId = created.id;
+        } catch (err: any) {
+          await this.renderAdminAnnouncementDraft(chatId, messageId, draft, `⚠️ ${err.message}`);
+          return;
+        }
+      }
+
+      const ann = await announcementService.getAnnouncementById(targetId);
+      if (!ann) return;
+      const usersRes = await db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM users');
+      const userCount = parseInt(usersRes?.c || '0', 10);
+
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `🚀 *CONFIRM BROADCAST TO ALL USERS*\n\n` +
+          `• Title: *${this.escapeDiagMarkdown(ann.title)}*\n` +
+          `• Media: \`${ann.mediaType}\` | Buttons: \`${ann.buttons.length}\`\n` +
+          `• Estimated Audience: \`${userCount} users\`\n\n` +
+          `_Broadcast runs asynchronously in the background so customer shopping and wallets stay fast._`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({
+                  text: 'YES, SEND TO ALL USERS',
+                  fallbackEmoji: '🚀',
+                  style: 'success',
+                  callbackData: `adm:ann_sendc:${ann.id}`,
+                  forceVisible: true,
+                }),
+              ]),
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({
+                  text: 'Cancel',
+                  fallbackEmoji: '❌',
+                  style: 'danger',
+                  callbackData: `adm:ann_v:${ann.id}`,
+                  forceVisible: true,
+                }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:ann_sendc:')) {
+      const annId = data.slice('adm:ann_sendc:'.length);
+      try {
+        await announcementService.startBroadcast(annId, userId);
+        await this.renderAdminAnnouncementDetail(
+          chatId,
+          messageId,
+          annId,
+          '🚀 *Background broadcast started!* Customer commands remain responsive. Tap Refresh Progress below.'
+        );
+      } catch (err: any) {
+        await this.renderAdminAnnouncementDetail(chatId, messageId, annId, `⚠️ ${err.message}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:ann_v:')) {
+      const annId = data.slice('adm:ann_v:'.length);
+      await this.renderAdminAnnouncementDetail(chatId, messageId, annId);
+      return;
+    }
+
+    if (data.startsWith('adm:ann_cancel:')) {
+      const annId = data.slice('adm:ann_cancel:'.length);
+      await announcementService.cancelBroadcast(annId, userId);
+      await this.renderAdminAnnouncementDetail(chatId, messageId, annId, '🛑 Broadcast cancelled.');
       return;
     }
 
@@ -1524,13 +1879,13 @@ export class AdminHandler {
         }
       }
 
-      if (perf.slowCallbacks.length > 0) {
-        text += `\n⚠️ *Slow Callbacks (>500ms):* \`${perf.slowCallbacks.length}\`\n`;
-        for (const s of perf.slowCallbacks.slice(0, 4)) {
+      if (perf.slowCallbacks300.length > 0) {
+        text += `\n⚠️ *Slow Callbacks (>300ms):* \`${perf.slowCallbacks300.length}\` (>500ms: \`${perf.slowCallbacks.length}\`)\n`;
+        for (const s of perf.slowCallbacks300.slice(0, 4)) {
           text += `• \`${this.escapeDiagMarkdown(s.callbackName)}\` — \`${s.responseTimeMs}ms\` (DB \`${s.dbTimeMs}ms\`, Sup \`${s.supplierTimeMs}ms\`)\n`;
         }
       } else {
-        text += `\n✅ *Slow Callbacks (>500ms):* \`0\`\n`;
+        text += `\n✅ *Slow Callbacks (>300ms):* \`0\` | *(>500ms):* \`0\`\n`;
       }
 
       text += `\nℹ️ _${this.escapeDiagMarkdown(perf.summary)}_`;
@@ -2602,6 +2957,26 @@ export class AdminHandler {
           patch.title = text.trim();
         } else if (field === 'desc') {
           patch.description = text.trim().toLowerCase() === 'clear' ? '' : text.trim();
+        } else if (field === 'clabel') {
+          if (!text.trim()) throw new Error('Custom product reward name cannot be empty.');
+          patch.rewardType = 'CUSTOM_PRODUCT';
+          patch.rewardProductId = '';
+          patch.rewardLabel = text.trim();
+          patch.rewardAmountUsdt = '0.00';
+        } else if (field === 'wamt') {
+          let dec: Decimal;
+          try {
+            dec = new Decimal(text.trim());
+          } catch {
+            throw new Error('Enter a valid USDT amount (e.g. 2.50).');
+          }
+          if (dec.isNaN() || dec.lessThanOrEqualTo(0)) {
+            throw new Error('Wallet credit reward amount must be greater than 0 USDT.');
+          }
+          patch.rewardType = 'WALLET_CREDIT';
+          patch.rewardProductId = '';
+          patch.rewardAmountUsdt = dec.toFixed(2);
+          patch.rewardLabel = `${dec.toFixed(2)} USDT Wallet Credit`;
         } else if (field === 'qty') {
           const n = parseInt(text, 10);
           if (!Number.isFinite(n) || n < 1) throw new Error('Quantity must be an integer >= 1.');
@@ -2819,6 +3194,113 @@ export class AdminHandler {
         await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nPlease try again:`);
       }
       return;
+    }
+
+    if (fsm.step === 'ADMIN_ANN_EDIT_VALUE') {
+      const { targetId = 'draft', field } = fsm.data || {};
+      try {
+        const patch: any = {};
+        if (field === 'title') {
+          if (!text.trim()) throw new Error('Announcement title cannot be empty.');
+          patch.title = text.trim();
+        } else if (field === 'msg') {
+          if (!text.trim()) throw new Error('Announcement message cannot be empty.');
+          patch.messageText = text;
+        } else if (field === 'btns') {
+          patch.buttons = announcementService.parseButtonsInput(text);
+        }
+
+        await redis.clearFsmState(userId);
+        if (targetId === 'draft') {
+          const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+          const draft = raw ? { ...JSON.parse(raw), ...patch } : patch;
+          await redis.set(`ann_draft:${userId}`, JSON.stringify(draft), 1800);
+          await this.renderAdminAnnouncementDraft(chatId, undefined, draft, '✅ Field updated!');
+        } else {
+          await announcementService.updateAnnouncement(targetId, patch, userId);
+          await this.renderAdminAnnouncementDetail(chatId, undefined, targetId, '✅ Announcement updated!');
+        }
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nPlease try again:`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_ANN_EDIT_MEDIA') {
+      const { targetId = 'draft' } = fsm.data || {};
+      const clean = text.trim();
+      const clearing = clean.toLowerCase() === 'clear' || clean.toLowerCase() === 'none';
+      await redis.clearFsmState(userId);
+
+      if (targetId === 'draft') {
+        const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+        const draft = raw ? JSON.parse(raw) : { title: '', messageText: '', mediaType: 'TEXT', mediaFileId: null, buttons: [] };
+        if (clearing) {
+          draft.mediaFileId = null;
+          draft.mediaType = 'TEXT';
+        } else {
+          draft.mediaFileId = clean;
+          if (draft.mediaType === 'TEXT') draft.mediaType = 'PHOTO';
+        }
+        await redis.set(`ann_draft:${userId}`, JSON.stringify(draft), 1800);
+        await this.renderAdminAnnouncementDraft(
+          chatId,
+          undefined,
+          draft,
+          clearing ? '✅ Media cleared (Text-only).' : '✅ Media image saved!'
+        );
+      } else {
+        const curr = await announcementService.getAnnouncementById(targetId);
+        await announcementService.updateAnnouncement(
+          targetId,
+          clearing
+            ? { mediaType: 'TEXT', mediaFileId: null }
+            : { mediaType: curr?.mediaType === 'BANNER' ? 'BANNER' : 'PHOTO', mediaFileId: clean },
+          userId
+        );
+        await this.renderAdminAnnouncementDetail(
+          chatId,
+          undefined,
+          targetId,
+          clearing ? '✅ Media cleared (Text-only).' : '✅ Media image updated!'
+        );
+      }
+      return;
+    }
+  }
+
+  public async handleAdminPhotoInput(msg: TelegramMessage, fsm: UserFsmState): Promise<void> {
+    if (!msg.from || !msg.photo || msg.photo.length === 0) return;
+    const userId = String(msg.from.id);
+    const chatId = msg.chat.id;
+
+    if (!this.checkAuthorization(userId)) {
+      await redis.clearFsmState(userId);
+      await telegramClient.sendMessage(chatId, '⛔ *ACCESS DENIED*');
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_ANN_EDIT_MEDIA') {
+      const { targetId = 'draft' } = fsm.data || {};
+      const fileId = msg.photo[msg.photo.length - 1].file_id;
+      await redis.clearFsmState(userId);
+
+      if (targetId === 'draft') {
+        const raw = await redis.get(`ann_draft:${userId}`).catch(() => null);
+        const draft = raw ? JSON.parse(raw) : { title: '', messageText: '', mediaType: 'PHOTO', mediaFileId: null, buttons: [] };
+        draft.mediaFileId = fileId;
+        if (draft.mediaType === 'TEXT') draft.mediaType = 'PHOTO';
+        await redis.set(`ann_draft:${userId}`, JSON.stringify(draft), 1800);
+        await this.renderAdminAnnouncementDraft(chatId, undefined, draft, '✅ Photo attached from Telegram upload!');
+      } else {
+        const curr = await announcementService.getAnnouncementById(targetId);
+        await announcementService.updateAnnouncement(
+          targetId,
+          { mediaType: curr?.mediaType === 'BANNER' ? 'BANNER' : 'PHOTO', mediaFileId: fileId },
+          userId
+        );
+        await this.renderAdminAnnouncementDetail(chatId, undefined, targetId, '✅ Photo updated from Telegram upload!');
+      }
     }
   }
 
@@ -3323,11 +3805,27 @@ export class AdminHandler {
     draft: any,
     notice?: string
   ): Promise<void> {
+    const rType: GiveawayRewardType = draft.rewardType || 'STORE_PRODUCT';
+    const rewardDisplay =
+      rType === 'WALLET_CREDIT'
+        ? `${draft.rewardAmountUsdt || '0.00'} USDT Wallet Credit`
+        : rType === 'CUSTOM_PRODUCT'
+        ? draft.rewardLabel || 'Not set'
+        : draft.rewardProductName || 'Not selected';
+
+    const primaryRewardBtn =
+      rType === 'WALLET_CREDIT'
+        ? ButtonBuilder.buildButton({ text: 'Set Wallet USDT', fallbackEmoji: '💰', style: 'primary', callbackData: 'adm:gw_f:draft:wamt', forceVisible: true })
+        : rType === 'CUSTOM_PRODUCT'
+        ? ButtonBuilder.buildButton({ text: 'Set Custom Name', fallbackEmoji: '🎁', style: 'primary', callbackData: 'adm:gw_f:draft:clabel', forceVisible: true })
+        : ButtonBuilder.buildButton({ text: 'Pick Product (DB)', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:gw_prod:draft:1', forceVisible: true });
+
     const text =
       (notice ? `${notice}\n\n` : '') +
       `🎁 *CREATE NEW GIVEAWAY*\n\n` +
       `• Name: *${this.escapeDiagMarkdown(draft.title || 'Not set')}*\n` +
-      `• Reward Product: *${this.escapeDiagMarkdown(draft.rewardProductName || 'Not selected')}*\n` +
+      `• Reward Type: \`${rType}\`\n` +
+      `• Reward: *${this.escapeDiagMarkdown(rewardDisplay)}*\n` +
       `• Reward Qty: \`${draft.rewardQuantity || 1}\`\n` +
       `• Req Qualified Referrals: \`${draft.requiredQualifiedReferrals ?? 3}\`\n` +
       `• Req Total Referrals: \`${draft.requiredTotalReferrals ?? 0}\`\n` +
@@ -3341,7 +3839,12 @@ export class AdminHandler {
       inline_keyboard: [
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: 'Set Name', fallbackEmoji: '✏️', style: 'primary', callbackData: 'adm:gw_f:draft:title', forceVisible: true }),
-          ButtonBuilder.buildButton({ text: 'Pick Product (DB)', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:gw_prod:draft:1', forceVisible: true }),
+          primaryRewardBtn,
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Store Product', style: rType === 'STORE_PRODUCT' ? 'success' : 'default', callbackData: 'adm:gw_rt:draft:store', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Custom Product', style: rType === 'CUSTOM_PRODUCT' ? 'success' : 'default', callbackData: 'adm:gw_rt:draft:custom', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Wallet Credit', style: rType === 'WALLET_CREDIT' ? 'success' : 'default', callbackData: 'adm:gw_rt:draft:wallet', forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: 'Reward Qty', style: 'default', callbackData: 'adm:gw_f:draft:qty', forceVisible: true }),
@@ -3391,11 +3894,20 @@ export class AdminHandler {
       return;
     }
 
+    const primaryRewardBtn =
+      gw.rewardType === 'WALLET_CREDIT'
+        ? ButtonBuilder.buildButton({ text: 'Edit Wallet USDT', style: 'primary', callbackData: `adm:gw_f:${gw.id}:wamt`, forceVisible: true })
+        : gw.rewardType === 'CUSTOM_PRODUCT'
+        ? ButtonBuilder.buildButton({ text: 'Edit Custom Name', style: 'primary', callbackData: `adm:gw_f:${gw.id}:clabel`, forceVisible: true })
+        : ButtonBuilder.buildButton({ text: 'Change Product', style: 'primary', callbackData: `adm:gw_prod:${gw.id}:1`, forceVisible: true });
+
     const text =
       (notice ? `${notice}\n\n` : '') +
       `🎁 *GIVEAWAY DETAILS & EDITOR*\n\n` +
       `• Title: *${this.escapeDiagMarkdown(gw.title)}*\n` +
-      `• Reward Product: *${this.escapeDiagMarkdown(gw.rewardProductName)}* (\`${gw.rewardProductId || 'NONE'}\`)\n` +
+      `• Reward Type: \`${gw.rewardType}\`\n` +
+      `• Reward: *${this.escapeDiagMarkdown(gw.rewardProductName)}*\n` +
+      (gw.rewardType === 'WALLET_CREDIT' ? `• Wallet Amount: \`${gw.rewardAmountUsdt} USDT\`\n` : '') +
       `• Reward Qty: \`${gw.rewardQuantity}\`\n` +
       `• Req Qualified Referrals: \`${gw.requiredQualifiedReferrals}\`\n` +
       `• Req Total Referrals: \`${gw.requiredTotalReferrals}\`\n` +
@@ -3409,7 +3921,12 @@ export class AdminHandler {
       inline_keyboard: [
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: 'Edit Name', style: 'primary', callbackData: `adm:gw_f:${gw.id}:title`, forceVisible: true }),
-          ButtonBuilder.buildButton({ text: 'Change Product', style: 'primary', callbackData: `adm:gw_prod:${gw.id}:1`, forceVisible: true }),
+          primaryRewardBtn,
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Store Product', style: gw.rewardType === 'STORE_PRODUCT' ? 'success' : 'default', callbackData: `adm:gw_rt:${gw.id}:store`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Custom Product', style: gw.rewardType === 'CUSTOM_PRODUCT' ? 'success' : 'default', callbackData: `adm:gw_rt:${gw.id}:custom`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Wallet Credit', style: gw.rewardType === 'WALLET_CREDIT' ? 'success' : 'default', callbackData: `adm:gw_rt:${gw.id}:wallet`, forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: 'Edit Qty', style: 'default', callbackData: `adm:gw_f:${gw.id}:qty`, forceVisible: true }),
@@ -4042,6 +4559,136 @@ export class AdminHandler {
       ],
     };
 
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminAnnouncementDraft(
+    chatId: number,
+    messageId: number | undefined,
+    draft: any,
+    notice?: string
+  ): Promise<void> {
+    const mType: AnnouncementMediaType = draft.mediaType || 'TEXT';
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `📢 *CREATE ANNOUNCEMENT*\n\n` +
+      `• Title: *${this.escapeDiagMarkdown(draft.title || 'Not set')}*\n` +
+      `• Media Type: \`${mType}\` ${draft.mediaFileId ? '✅ Attached' : mType === 'TEXT' ? '(Text-only)' : '⚠️ Missing photo'}\n` +
+      `• Buttons: \`${Array.isArray(draft.buttons) ? draft.buttons.length : 0}\`\n` +
+      `• Message Preview:\n${draft.messageText ? this.escapeDiagMarkdown(draft.messageText.slice(0, 200)) : '_Not set_'}\n`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Set Title', fallbackEmoji: '✏️', style: 'primary', callbackData: 'adm:ann_f:draft:title', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Set Message', fallbackEmoji: '📝', style: 'primary', callbackData: 'adm:ann_f:draft:msg', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'TEXT', style: mType === 'TEXT' ? 'success' : 'default', callbackData: 'adm:ann_mt:draft:text', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'PHOTO', style: mType === 'PHOTO' ? 'success' : 'default', callbackData: 'adm:ann_mt:draft:photo', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'BANNER', style: mType === 'BANNER' ? 'success' : 'default', callbackData: 'adm:ann_mt:draft:banner', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Upload/Set Photo', fallbackEmoji: '🖼️', style: 'default', callbackData: 'adm:ann_m:draft', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Inline Buttons', fallbackEmoji: '🔗', style: 'default', callbackData: 'adm:ann_f:draft:btns', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Preview to Me', fallbackEmoji: '👁️', style: 'primary', callbackData: 'adm:ann_prev:draft', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Save Draft', fallbackEmoji: '💾', style: 'default', callbackData: 'adm:ann_save', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Send to All Users', fallbackEmoji: '🚀', style: 'success', callbackData: 'adm:ann_send:draft', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Back to Announcements', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ann', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminAnnouncementDetail(
+    chatId: number,
+    messageId: number | undefined,
+    annId: string,
+    notice?: string
+  ): Promise<void> {
+    const ann = await announcementService.getAnnouncementById(annId);
+    if (!ann) {
+      const msg = '⚠️ Announcement not found.';
+      if (messageId) await telegramClient.editMessageText(chatId, messageId, msg);
+      else await telegramClient.sendMessage(chatId, msg);
+      return;
+    }
+
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `📢 *ANNOUNCEMENT: ${this.escapeDiagMarkdown(ann.title)}*\n\n` +
+      `• Status: \`${ann.status}\`\n` +
+      `• Media Type: \`${ann.mediaType}\` ${ann.mediaFileId ? '✅ Attached' : ''}\n` +
+      `• Buttons: \`${ann.buttons.length}\`\n` +
+      `• Progress:\n` +
+      `  👥 Total Users: \`${ann.totalUsers}\`\n` +
+      `  ✅ Delivered: \`${ann.deliveredCount}\`\n` +
+      `  🚫 Blocked: \`${ann.blockedCount}\`\n` +
+      `  ❌ Failed: \`${ann.failedCount}\`\n\n` +
+      `*Message:*\n${this.escapeDiagMarkdown(ann.messageText.slice(0, 300))}`;
+
+    const rows: any[][] = [];
+    if (ann.status === 'DRAFT' || ann.status === 'COMPLETED' || ann.status === 'CANCELLED') {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Edit Title', style: 'primary', callbackData: `adm:ann_f:${ann.id}:title`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Edit Message', style: 'primary', callbackData: `adm:ann_f:${ann.id}:msg`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'TEXT', style: ann.mediaType === 'TEXT' ? 'success' : 'default', callbackData: `adm:ann_mt:${ann.id}:text`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'PHOTO', style: ann.mediaType === 'PHOTO' ? 'success' : 'default', callbackData: `adm:ann_mt:${ann.id}:photo`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'BANNER', style: ann.mediaType === 'BANNER' ? 'success' : 'default', callbackData: `adm:ann_mt:${ann.id}:banner`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Photo / Banner', fallbackEmoji: '🖼️', style: 'default', callbackData: `adm:ann_m:${ann.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Edit Buttons', fallbackEmoji: '🔗', style: 'default', callbackData: `adm:ann_f:${ann.id}:btns`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Send Preview', fallbackEmoji: '👁️', style: 'primary', callbackData: `adm:ann_prev:${ann.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Send to All Users', fallbackEmoji: '🚀', style: 'success', callbackData: `adm:ann_send:${ann.id}`, forceVisible: true }),
+        ])
+      );
+    }
+
+    if (ann.status === 'SENDING') {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Refresh Progress', fallbackEmoji: '🔄', style: 'primary', callbackData: `adm:ann_v:${ann.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Cancel Broadcast', fallbackEmoji: '🛑', style: 'danger', callbackData: `adm:ann_cancel:${ann.id}`, forceVisible: true }),
+        ])
+      );
+    } else if (ann.status === 'DRAFT') {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Cancel Draft', fallbackEmoji: '🛑', style: 'danger', callbackData: `adm:ann_cancel:${ann.id}`, forceVisible: true }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Announcements', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ann', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'ADMIN', fallbackEmoji: '👑', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
     if (messageId) {
       await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
     } else {

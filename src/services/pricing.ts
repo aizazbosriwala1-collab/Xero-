@@ -440,8 +440,44 @@ export class PricingService {
       isFeatured: Boolean(row.isFeatured),
       isHidden: Boolean(row.isHidden),
     };
-    await redis.set(itemCacheKey, JSON.stringify(item), 45).catch(() => {});
+    await redis.set(itemCacheKey, JSON.stringify(item), 60).catch(() => {});
     return item;
+  }
+
+  /**
+   * Fetch ordered active product IDs for a category or 'all' (Redis-cached 60s by catalog version).
+   */
+  public async getOrderedCatalogIds(catId = 'all'): Promise<string[]> {
+    const ver = await this.getCatalogVersion();
+    const key = `catalog:ids:v${ver}:${catId || 'all'}`;
+    try {
+      const cached = await redis.get(key);
+      if (cached) return JSON.parse(cached) as string[];
+    } catch {
+      // Cache miss
+    }
+
+    const isAll = !catId || catId === 'all';
+    let whereClause = `WHERE (po.is_hidden IS NULL OR po.is_hidden = FALSE)
+      AND (sp.is_unlimited = TRUE OR sp.latest_stock > 0)
+      AND sp.is_available = TRUE`;
+    const queryParams: any[] = [];
+    if (!isAll) {
+      whereClause += ` AND po.category_id = $1`;
+      queryParams.push(catId);
+    }
+
+    const res = await db.query<{ id: string }>(
+      `SELECT sp.id
+       FROM supplier_products sp
+       LEFT JOIN product_overrides po ON sp.id = po.product_id
+       ${whereClause}
+       ORDER BY po.is_featured DESC NULLS LAST, sp.original_name ASC`,
+      queryParams
+    );
+    const ids = res.rows.map(r => r.id);
+    await redis.set(key, JSON.stringify(ids), 60).catch(() => {});
+    return ids;
   }
 
   /**
@@ -582,7 +618,7 @@ export class PricingService {
 
     const payload = { items, total };
     if (cacheable && catalogCacheKey) {
-      await redis.set(catalogCacheKey, JSON.stringify(payload), 45).catch(() => {});
+      await redis.set(catalogCacheKey, JSON.stringify(payload), 60).catch(() => {});
     }
     return payload;
   }

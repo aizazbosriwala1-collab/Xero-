@@ -752,7 +752,7 @@ export class CustomerHandler {
       return;
     }
 
-    // Giveaways
+    // Giveaways (Store Product, Custom Product & Wallet Credit with flexible Total/Qualified rules)
     if (data === 'm:give') {
       const [gwSettings, giveaways] = await Promise.all([
         giveawayService.getSettings(),
@@ -767,14 +767,24 @@ export class CustomerHandler {
       const rows: any[][] = [];
       for (const gw of giveaways) {
         const prog = gw.userProgress;
+        const rewardLine =
+          gw.rewardType === 'WALLET_CREDIT'
+            ? `*${gw.rewardAmountUsdt} USDT Wallet Credit*`
+            : `*${gw.rewardLabel || gw.rewardProductName}* (x${gw.rewardQuantity})`;
+        const hasTotalReq = gw.requiredTotalReferrals > 0;
+        const hasQualReq = gw.requiredQualifiedReferrals > 0;
+
         text +=
           `🏆 *${gw.title}*\n` +
           (gw.description ? `ℹ️ _${gw.description}_\n` : '') +
-          `• Reward: *${gw.rewardProductName}* (x${gw.rewardQuantity})\n` +
-          (gw.requiredTotalReferrals > 0
+          `• Reward: ${rewardLine}\n` +
+          (hasTotalReq
             ? `• Total Referrals Required: *${prog?.currentTotal ?? 0} / ${gw.requiredTotalReferrals}*\n`
             : '') +
-          `• Qualified Referrals: *${prog?.currentQualified ?? 0} / ${gw.requiredQualifiedReferrals}*\n` +
+          (hasQualReq
+            ? `• Qualified Referrals Required: *${prog?.currentQualified ?? 0} / ${gw.requiredQualifiedReferrals}*\n`
+            : '') +
+          (!hasTotalReq && !hasQualReq ? `• Requirement: *Open Giveaway*\n` : '') +
           `• Winners Claimed: \`${gw.claimsCount} / ${gw.claimLimit}\`\n` +
           (gw.endAt ? `• Ends: \`${new Date(gw.endAt).toISOString().slice(0, 16).replace('T', ' ')}Z\`\n` : '');
         if (prog) {
@@ -815,21 +825,46 @@ export class CustomerHandler {
       return;
     }
 
-    // Refer & Earn (with admin-configured milestone reward tiers)
+    // Refer & Earn (Two-counter Referral Program + Active Rewards & Milestones)
     if (data === 'm:ref') {
-      const [stats, tiers, refSettings] = await Promise.all([
+      const [stats, refSettings, activeGiveaways] = await Promise.all([
         referralService.getStats(userId),
-        referralService.listRewardTiers({ activeOnly: true, userId }),
         referralService.getSettings(),
+        giveawayService.getActiveGiveaways(userId),
       ]);
-      const template = uiConfigService.getText('msg.referral_title', lang) || t('referral_title', lang);
-      let text = template
-        .replace(/\{link\}/g, stats.referralLink)
-        .replace(/\{total\}/g, String(stats.totalReferred))
-        .replace(/\{qualified\}/g, String(stats.qualifiedCount))
-        .replace(/\{pending\}/g, String(stats.pendingCount));
+      const tiers = await referralService.listRewardTiers({
+        activeOnly: true,
+        userId,
+        knownQualifiedCount: stats.qualifiedCount,
+      });
 
-      text += `\n\nℹ️ *Rule:* _Joining alone earns no reward. A referral qualifies once their purchase reaches COMPLETED status (\u2265 ${refSettings.minQualifyingOrderUsdt} USDT)._`;
+      const activeTiersCount = refSettings.rewardsEnabled ? tiers.length : 0;
+      const activeRewardsCount = activeTiersCount + activeGiveaways.length;
+
+      let progressStr = `${stats.totalReferred} / ${Math.max(1, stats.totalReferred)} referrals`;
+      const nextTier = tiers.find(tr => !tr.userClaimed) || tiers[0];
+      if (nextTier && refSettings.rewardsEnabled) {
+        progressStr = `${stats.qualifiedCount} / ${nextTier.requiredQualifiedReferrals} qualified referrals`;
+      } else if (activeGiveaways.length > 0) {
+        const g = activeGiveaways[0];
+        if (g.requiredTotalReferrals > 0 && g.requiredQualifiedReferrals === 0) {
+          progressStr = `${stats.totalReferred} / ${g.requiredTotalReferrals} referrals`;
+        } else {
+          const target = Math.max(g.requiredQualifiedReferrals, g.requiredTotalReferrals, 1);
+          const cur = g.requiredQualifiedReferrals > 0 ? stats.qualifiedCount : stats.totalReferred;
+          progressStr = `${cur} / ${target} referrals`;
+        }
+      }
+
+      let text =
+        `👥 *Referral Program*\n\n` +
+        `🔗 *Referral Link:*\n` +
+        `\`${stats.referralLink}\`\n\n` +
+        `👥 *Total Referrals:* \`${stats.totalReferred}\`\n` +
+        `💰 *Qualified Referrals:* \`${stats.qualifiedCount}\`\n` +
+        `🎁 *Active Rewards:* \`${activeRewardsCount}\`\n\n` +
+        `📊 *Progress:* \`${progressStr}\`\n\n` +
+        `ℹ️ *Rules:* _Friends count once in Total Referrals when they join, and once in Qualified Referrals when they complete a qualifying purchase (\u2265 ${refSettings.minQualifyingOrderUsdt} USDT)._`;
 
       const rows: any[][] = [];
       if (tiers.length > 0 && refSettings.rewardsEnabled) {
@@ -1255,6 +1290,12 @@ export class CustomerHandler {
     const lang = await getUserLanguage(userId);
 
     const fsm = await redis.getFsmState<UserFsmState>(userId);
+    if (fsm?.step?.startsWith('ADMIN_')) {
+      const { adminHandler } = await import('./admin.js');
+      await adminHandler.handleAdminPhotoInput(msg, fsm);
+      return;
+    }
+
     if (fsm?.step === 'AWAITING_MANUAL_PROOF') {
       const { methodCode, amount, txid } = fsm.data || {};
       const largestPhoto = msg.photo[msg.photo.length - 1];
@@ -1389,27 +1430,7 @@ export class CustomerHandler {
     total: number;
     index: number;
   }> {
-    const isAll = catId === 'all';
-    let whereClause = `WHERE (po.is_hidden IS NULL OR po.is_hidden = FALSE)
-      AND (sp.is_unlimited = TRUE OR sp.latest_stock > 0)
-      AND sp.is_available = TRUE`;
-    const queryParams: any[] = [];
-
-    if (!isAll) {
-      whereClause += ` AND po.category_id = $1`;
-      queryParams.push(catId);
-    }
-
-    const sql = `
-      SELECT sp.id
-      FROM supplier_products sp
-      LEFT JOIN product_overrides po ON sp.id = po.product_id
-      ${whereClause}
-      ORDER BY po.is_featured DESC NULLS LAST, sp.original_name ASC
-    `;
-
-    const res = await db.query<{ id: string }>(sql, queryParams);
-    const ids = res.rows.map(r => r.id);
+    const ids = await pricingService.getOrderedCatalogIds(catId);
     const index = ids.indexOf(productId);
     const total = ids.length;
 

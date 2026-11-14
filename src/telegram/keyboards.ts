@@ -711,7 +711,10 @@ export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): Telegr
         ButtonBuilder.buildButton({ text: 'Referrals', fallbackEmoji: '👥', style: 'default', callbackData: 'adm:ref', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Channels', fallbackEmoji: '📢', style: 'default', callbackData: 'adm:ch', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Announcements', fallbackEmoji: '📢', style: 'primary', callbackData: 'adm:ann', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Channels', fallbackEmoji: '📡', style: 'default', callbackData: 'adm:ch', forceVisible: true }),
+      ]),
+      ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ settingKey: 'btn.adm.ui_editor', lang, callbackData: 'adm:ui', forceVisible: true }),
         ButtonBuilder.buildButton({ text: 'Settings', fallbackEmoji: '⚙️', style: 'default', callbackData: 'adm:set', forceVisible: true }),
       ]),

@@ -36,13 +36,30 @@ export interface ReferralSettings {
 }
 
 export class ReferralService {
+  private readonly settingsCacheKey = 'sys:referral_rules';
+  private readonly tiersCacheActiveKey = 'ref:tiers:active';
+  private readonly tiersCacheAllKey = 'ref:tiers:all';
+
+  private statsCacheKey(userId: string): string {
+    return `ref:stats:${userId}`;
+  }
+
+  public async invalidateStatsCache(userId: string): Promise<void> {
+    await redis.del(this.statsCacheKey(String(userId))).catch(() => {});
+  }
+
   /**
    * Register a new referral relationship when a new user joins with ?start=ref_<referrerTelegramId>.
-   * Rule preserved: Referral join = NO REWARD. Qualification occurs ONLY after a COMPLETED purchase.
+   * Enforces: no self-referral, no circular referral, no duplicate referral, no rejoin abuse.
+   * Rule preserved: Referral join increments Total Referrals once; Qualified Referrals increments ONLY after COMPLETED purchase.
    */
   public async registerReferral(referrerTelegramId: string | number, referredTelegramId: string | number): Promise<boolean> {
-    const referrerId = String(referrerTelegramId);
-    const referredId = String(referredTelegramId);
+    const referrerId = String(referrerTelegramId).trim();
+    const referredId = String(referredTelegramId).trim();
+
+    if (!referrerId || !referredId) {
+      return false;
+    }
 
     // 1. Prevent self-referral
     if (referrerId === referredId) {
@@ -60,15 +77,50 @@ export class ReferralService {
       return false;
     }
 
-    // 3. Register referral relationship (unique constraint prevents multiple referrers for one user)
+    // 3. Prevent duplicate referral counting (same Telegram account must NEVER count twice)
+    const alreadyReferred = await db.queryRow<any>(
+      'SELECT id, referrer_id FROM referrals WHERE referred_id = $1',
+      [referredId]
+    );
+    if (alreadyReferred) {
+      logger.info('Duplicate referral attempt ignored (user already referred)', { referrerId, referredId });
+      return false;
+    }
+
+    // 4. Prevent rejoin abuse (existing user with prior activity/history re-clicking a referral link)
+    const [priorOrder, priorDeposit, existingUser] = await Promise.all([
+      db.queryRow<any>('SELECT id FROM local_orders WHERE user_id = $1 LIMIT 1', [referredId]),
+      db.queryRow<any>('SELECT id FROM deposits WHERE user_id = $1 LIMIT 1', [referredId]),
+      db.queryRow<{ created_at: string | Date }>('SELECT created_at FROM users WHERE id = $1', [referredId]),
+    ]);
+    if (priorOrder || priorDeposit) {
+      logger.warn('Rejoin referral abuse rejected (existing account activity)', { referrerId, referredId });
+      return false;
+    }
+    if (existingUser?.created_at) {
+      const ageMs = Date.now() - new Date(existingUser.created_at).getTime();
+      if (ageMs > 120_000) {
+        logger.warn('Rejoin referral abuse rejected (existing pre-established user)', { referrerId, referredId });
+        return false;
+      }
+    }
+
+    // 5. Register referral relationship atomically with UNIQUE(referred_id) guard
     try {
       const referralId = `ref_${referrerId}_${referredId}`;
-      await db.query(`
-        INSERT INTO referrals (id, referrer_id, referred_id, status, created_at, updated_at)
-        VALUES ($1, $2, $3, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT (referred_id) DO NOTHING
-      `, [referralId, referrerId, referredId]);
+      const res = await db.query<{ id: string }>(
+        `INSERT INTO referrals (id, referrer_id, referred_id, status, created_at, updated_at)
+         VALUES ($1, $2, $3, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT (referred_id) DO NOTHING
+         RETURNING id`,
+        [referralId, referrerId, referredId]
+      );
 
+      if (res.rows.length === 0) {
+        return false;
+      }
+
+      await this.invalidateStatsCache(referrerId);
       logger.info('Registered referral relationship', { referrerId, referredId });
       return true;
     } catch (err: any) {
@@ -126,15 +178,40 @@ export class ReferralService {
           orderId,
         });
       });
+
+      await this.invalidateStatsCache(referral.referrer_id);
     } catch (err: any) {
       logger.warn('Failed to qualify referral (possibly already qualified)', { error: err.message, referralId: referral.id });
     }
   }
 
   /**
-   * Get customer referral stats in a single aggregated SQL query (no duplicate scans).
+   * Get customer referral stats in a single aggregated SQL query, Redis-cached 60s and invalidated on joins/purchases.
    */
-  public async getStats(userId: string, botUsername: string = 'XeroKhanBot'): Promise<ReferralStats> {
+  public async getStats(
+    userId: string,
+    botUsername: string = 'XeroKhanBot',
+    options?: { bypassCache?: boolean }
+  ): Promise<ReferralStats> {
+    const cacheKey = this.statsCacheKey(userId);
+    if (!options?.bypassCache) {
+      try {
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+          const parsed = JSON.parse(cached) as { totalReferred: number; qualifiedCount: number; pendingCount: number };
+          return {
+            referralCode: userId,
+            referralLink: `https://t.me/${botUsername}?start=ref_${userId}`,
+            totalReferred: parsed.totalReferred,
+            qualifiedCount: parsed.qualifiedCount,
+            pendingCount: parsed.pendingCount,
+          };
+        }
+      } catch {
+        // Cache miss
+      }
+    }
+
     const agg = await db.queryRow<{
       total: string;
       qualified: string;
@@ -152,6 +229,8 @@ export class ReferralService {
     const qualifiedCount = parseInt(agg?.qualified || '0', 10);
     const pendingCount = parseInt(agg?.pending || '0', 10);
 
+    await redis.set(cacheKey, JSON.stringify({ totalReferred, qualifiedCount, pendingCount }), 60).catch(() => {});
+
     return {
       referralCode: userId,
       referralLink: `https://t.me/${botUsername}?start=ref_${userId}`,
@@ -160,10 +239,6 @@ export class ReferralService {
       pendingCount,
     };
   }
-
-  private readonly settingsCacheKey = 'sys:referral_rules';
-  private readonly tiersCacheActiveKey = 'ref:tiers:active';
-  private readonly tiersCacheAllKey = 'ref:tiers:all';
 
   private async invalidateCaches(): Promise<void> {
     await Promise.all([
@@ -225,7 +300,11 @@ export class ReferralService {
   // ADMIN-CONFIGURABLE REFERRAL REWARD TIERS (Zero Hardcoded Milestones)
   // =========================================================================
 
-  public async listRewardTiers(options?: { activeOnly?: boolean; userId?: string }): Promise<ReferralRewardTier[]> {
+  public async listRewardTiers(options?: {
+    activeOnly?: boolean;
+    userId?: string;
+    knownQualifiedCount?: number;
+  }): Promise<ReferralRewardTier[]> {
     const activeOnly = Boolean(options?.activeOnly);
     const cacheKey = activeOnly ? this.tiersCacheActiveKey : this.tiersCacheAllKey;
     let rawRows: any[] | null = null;
@@ -254,17 +333,17 @@ export class ReferralService {
         ORDER BY rt.required_qualified_referrals ASC, rt.created_at ASC
       `);
       rawRows = res.rows;
-      await redis.set(cacheKey, JSON.stringify(rawRows), 45).catch(() => {});
+      await redis.set(cacheKey, JSON.stringify(rawRows), 60).catch(() => {});
     }
 
-    let qualifiedCount = 0;
+    let qualifiedCount = options?.knownQualifiedCount ?? 0;
     const claimedSet = new Set<string>();
     if (options?.userId) {
       const [stats, claims] = await Promise.all([
-        this.getStats(options.userId),
+        options.knownQualifiedCount !== undefined ? Promise.resolve(null) : this.getStats(options.userId),
         db.query<{ tier_id: string }>('SELECT tier_id FROM referral_reward_claims WHERE user_id = $1', [options.userId]),
       ]);
-      qualifiedCount = stats.qualifiedCount;
+      if (stats) qualifiedCount = stats.qualifiedCount;
       for (const c of claims.rows) claimedSet.add(c.tier_id);
     }
 
@@ -450,7 +529,7 @@ export class ReferralService {
       throw new Error('This referral reward tier is inactive or no longer exists.');
     }
 
-    const stats = await this.getStats(userId);
+    const stats = await this.getStats(userId, 'XeroKhanBot', { bypassCache: true });
     if (stats.qualifiedCount < tier.requiredQualifiedReferrals) {
       throw new Error(
         `You need ${tier.requiredQualifiedReferrals} qualified referrals to unlock "${tier.title}". Current qualified: ${stats.qualifiedCount}.`

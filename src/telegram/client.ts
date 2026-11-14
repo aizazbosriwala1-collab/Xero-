@@ -498,7 +498,16 @@ export class TelegramClient {
       payload.disable_notification = options.disable_notification;
     }
     const res = await this.post('sendPhoto', payload);
-    if (!res?.ok && caption) {
+    const errCode = Number(res?.error_code || 0);
+    const errDesc = String(res?.description || '').toLowerCase();
+    const isNonFallbackError =
+      errCode === 429 ||
+      errCode === 403 ||
+      errCode >= 500 ||
+      errDesc.includes('blocked') ||
+      errDesc.includes('deactivated') ||
+      errDesc.includes('chat not found');
+    if (!res?.ok && caption && !isNonFallbackError) {
       return await this.sendMessage(chatId, caption, options);
     }
     return res;

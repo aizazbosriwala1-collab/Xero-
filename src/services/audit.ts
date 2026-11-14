@@ -10,6 +10,7 @@ import { uiConfigService } from './uiConfig.js';
 import { manualPaymentService } from './manualPayment.js';
 import { giveawayService } from './giveaway.js';
 import { referralService } from './referral.js';
+import { announcementService } from './announcement.js';
 import { perfTracker, CallbackPerfRecord } from './perfTracker.js';
 import { createLogger } from './logger.js';
 
@@ -42,6 +43,7 @@ export interface PerformanceMetric {
 export interface PerformanceAuditReport {
   metrics: PerformanceMetric[];
   recentCallbacks: CallbackPerfRecord[];
+  slowCallbacks300: CallbackPerfRecord[];
   slowCallbacks: CallbackPerfRecord[];
   nPlusOneFree: boolean;
   totalDurationMs: number;
@@ -382,21 +384,24 @@ export class LaunchAuditService {
       giveawayService.getActiveGiveaways(),
       referralService.listRewardTiers({ activeOnly: true }),
       channelService.listChannels(true),
+      announcementService.listAnnouncements(20),
     ]);
     const promoMs = Date.now() - t5;
-    metrics.push({ label: 'Settings + Promos + Channels (Redis Cached)', durationMs: promoMs, status: classify(promoMs) });
+    metrics.push({ label: 'Settings + Promos + Announcements (Redis Cached)', durationMs: promoMs, status: classify(promoMs) });
 
     const recentCallbacks = perfTracker.getRecentCallbacks(8);
+    const slowCallbacks300 = perfTracker.getSlowCallbacks300(8);
     const slowCallbacks = perfTracker.getSlowCallbacks(8);
     const totalDurationMs = Date.now() - overallStart;
     return {
       metrics,
       recentCallbacks,
+      slowCallbacks300,
       slowCallbacks,
       nPlusOneFree: true,
       totalDurationMs,
       summary:
-        `Total latency: ${totalDurationMs}ms | Slow (>500ms) callbacks observed: ${slowCallbacks.length} | Redis + Prebuilt Menus active.`,
+        `Total latency: ${totalDurationMs}ms | Slow (>300ms): ${slowCallbacks300.length} | Slow (>500ms): ${slowCallbacks.length} | Redis (60s) + Prebuilt Menus active.`,
     };
   }
 }

@@ -19,14 +19,17 @@ export interface CallbackPerfRecord {
   dbQueryCount: number;
   supplierTimeMs: number;
   supplierCallCount: number;
-  slow: boolean;
+  slow300: boolean;
+  slow: boolean; // >500ms threshold
   recordedAt: string;
 }
 
 class PerformanceTracker {
   private storage = new AsyncLocalStorage<ActivePerfContext>();
   private recentCallbacks: CallbackPerfRecord[] = [];
+  private slowCallbacks300: CallbackPerfRecord[] = [];
   private slowCallbacks: CallbackPerfRecord[] = [];
+  private readonly warnThresholdMs = 300;
   private readonly slowThresholdMs = 500;
 
   public async run<T>(callbackName: string, fn: () => Promise<T>): Promise<{ result: T; metrics: CallbackPerfRecord }> {
@@ -71,6 +74,7 @@ class PerformanceTracker {
 
   private finalize(ctx: ActivePerfContext): CallbackPerfRecord {
     const responseTimeMs = Math.max(0, Date.now() - ctx.startedAt);
+    const slow300 = responseTimeMs > this.warnThresholdMs;
     const slow = responseTimeMs > this.slowThresholdMs;
     const rec: CallbackPerfRecord = {
       callbackName: ctx.callbackName,
@@ -79,6 +83,7 @@ class PerformanceTracker {
       dbQueryCount: ctx.dbQueryCount,
       supplierTimeMs: ctx.supplierTimeMs,
       supplierCallCount: ctx.supplierCallCount,
+      slow300,
       slow,
       recordedAt: new Date().toISOString(),
     };
@@ -88,12 +93,28 @@ class PerformanceTracker {
       this.recentCallbacks.length = 50;
     }
 
+    if (slow300) {
+      this.slowCallbacks300.unshift(rec);
+      if (this.slowCallbacks300.length > 30) {
+        this.slowCallbacks300.length = 30;
+      }
+    }
+
     if (slow) {
       this.slowCallbacks.unshift(rec);
       if (this.slowCallbacks.length > 30) {
         this.slowCallbacks.length = 30;
       }
       logger.warn('Slow callback detected (>500ms)', {
+        callbackName: rec.callbackName,
+        responseTimeMs: rec.responseTimeMs,
+        dbTimeMs: rec.dbTimeMs,
+        dbQueryCount: rec.dbQueryCount,
+        supplierTimeMs: rec.supplierTimeMs,
+        supplierCallCount: rec.supplierCallCount,
+      });
+    } else if (slow300) {
+      logger.warn('Slow callback detected (>300ms)', {
         callbackName: rec.callbackName,
         responseTimeMs: rec.responseTimeMs,
         dbTimeMs: rec.dbTimeMs,
@@ -110,12 +131,17 @@ class PerformanceTracker {
     return this.recentCallbacks.slice(0, limit);
   }
 
+  public getSlowCallbacks300(limit = 10): CallbackPerfRecord[] {
+    return this.slowCallbacks300.slice(0, limit);
+  }
+
   public getSlowCallbacks(limit = 10): CallbackPerfRecord[] {
     return this.slowCallbacks.slice(0, limit);
   }
 
   public resetHistory(): void {
     this.recentCallbacks = [];
+    this.slowCallbacks300 = [];
     this.slowCallbacks = [];
   }
 }

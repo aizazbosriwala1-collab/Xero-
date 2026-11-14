@@ -6,7 +6,7 @@ import { TelegramInlineKeyboardMarkup } from './types.js';
  */
 class MenuCache {
   private store = new Map<string, { markup: TelegramInlineKeyboardMarkup; expiresAt: number }>();
-  private readonly defaultTtlMs = 45_000;
+  private readonly defaultTtlMs = 60_000;
 
   public get(key: string): TelegramInlineKeyboardMarkup | null {
     const entry = this.store.get(key);
