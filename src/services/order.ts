@@ -1280,35 +1280,44 @@ export class OrderService {
       LIMIT $2
     `, [userId, effectiveLimit]);
 
-    const orders: OrderDetails[] = [];
-    for (const r of res.rows) {
-      const itemsRes = await db.query<{ content: string }>(
-        'SELECT content FROM delivered_items WHERE local_order_id = $1 AND user_id = $2',
-        [r.id, userId]
-      );
-      orders.push({
-        id: r.id,
-        userId: r.userId,
-        productId: r.productId,
-        productName: r.productName,
-        quantity: r.quantity,
-        unitPrice: new Decimal(r.unitPrice).toFixed(2),
-        totalPrice: new Decimal(r.totalPrice).toFixed(2),
-        supplierCost: new Decimal(r.supplierCost).toFixed(4),
-        customerEmail: r.customerEmail,
-        status: r.status,
-        deliveredItems: itemsRes.rows.map(i => {
-          try {
-            return encryptionService.decrypt(i.content);
-          } catch {
-            return '[ENCRYPTED_DATA]';
-          }
-        }),
-        createdAt: r.createdAt,
-      });
+    if (res.rows.length === 0) {
+      return [];
     }
 
-    return orders;
+    const orderIds = res.rows.map(r => r.id);
+    const placeholders = orderIds.map((_, idx) => `$${idx + 2}`).join(',');
+    const batchItemsRes = await db.query<{ local_order_id: string; content: string }>(
+      `SELECT local_order_id, content
+       FROM delivered_items
+       WHERE user_id = $1 AND local_order_id IN (${placeholders})`,
+      [userId, ...orderIds]
+    );
+
+    const itemsByOrder = new Map<string, string[]>();
+    for (const row of batchItemsRes.rows) {
+      const list = itemsByOrder.get(row.local_order_id) || [];
+      try {
+        list.push(encryptionService.decrypt(row.content));
+      } catch {
+        list.push('[ENCRYPTED_DATA]');
+      }
+      itemsByOrder.set(row.local_order_id, list);
+    }
+
+    return res.rows.map(r => ({
+      id: r.id,
+      userId: r.userId,
+      productId: r.productId,
+      productName: r.productName,
+      quantity: r.quantity,
+      unitPrice: new Decimal(r.unitPrice).toFixed(2),
+      totalPrice: new Decimal(r.totalPrice).toFixed(2),
+      supplierCost: new Decimal(r.supplierCost).toFixed(4),
+      customerEmail: r.customerEmail,
+      status: r.status,
+      deliveredItems: itemsByOrder.get(r.id) || [],
+      createdAt: r.createdAt,
+    }));
   }
 }
 

@@ -1,9 +1,25 @@
 import Decimal from 'decimal.js';
 import { config } from '../config/env.js';
 import { db } from '../db/index.js';
+import { redis } from './redis.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('SupplierService');
+
+export type SupplierControlFlag = 'is_enabled' | 'routing_enabled' | 'ordering_enabled' | 'sync_enabled';
+
+export interface SupplierControlRecord {
+  id: string;
+  name: string;
+  baseUrl: string;
+  isEnabled: boolean;
+  routingEnabled: boolean;
+  orderingEnabled: boolean;
+  syncEnabled: boolean;
+  lastBalanceUsdt: string | null;
+  lastBalanceAt: string | null;
+  lastSyncAt: string | null;
+}
 
 export interface SupplierRawProduct {
   id: string | number;
@@ -179,6 +195,107 @@ export class SupplierService {
    */
   public hasOrderStatusLookup(): boolean {
     return true;
+  }
+
+  private mapSupplierControlRow(r: any): SupplierControlRecord {
+    return {
+      id: r.id,
+      name: r.name,
+      baseUrl: r.base_url || this.baseUrl,
+      isEnabled: r.is_enabled !== false,
+      routingEnabled: r.routing_enabled !== false,
+      orderingEnabled: r.ordering_enabled !== false,
+      syncEnabled: r.sync_enabled !== false,
+      lastBalanceUsdt: r.last_balance_usdt !== null && r.last_balance_usdt !== undefined
+        ? new Decimal(r.last_balance_usdt).toFixed(4)
+        : null,
+      lastBalanceAt: r.last_balance_at ? new Date(r.last_balance_at).toISOString() : null,
+      lastSyncAt: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
+    };
+  }
+
+  public async listSuppliers(): Promise<SupplierControlRecord[]> {
+    const res = await db.query<any>(
+      'SELECT * FROM suppliers ORDER BY created_at ASC'
+    );
+    if (res.rows.length === 0) {
+      return [await this.getSupplierControl('aitoolshop')];
+    }
+    return res.rows.map(r => this.mapSupplierControlRow(r));
+  }
+
+  public async getSupplierControl(supplierId = 'aitoolshop'): Promise<SupplierControlRecord> {
+    const cacheKey = `supplier_ctrl:${supplierId}`;
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached) as SupplierControlRecord;
+    } catch {
+      // Cache miss
+    }
+
+    const row = await db.queryRow<any>('SELECT * FROM suppliers WHERE id = $1', [supplierId]);
+    const ctrl: SupplierControlRecord = row
+      ? this.mapSupplierControlRow(row)
+      : {
+          id: supplierId,
+          name: 'AiToolShop Reseller',
+          baseUrl: this.baseUrl,
+          isEnabled: true,
+          routingEnabled: true,
+          orderingEnabled: true,
+          syncEnabled: true,
+          lastBalanceUsdt: null,
+          lastBalanceAt: null,
+          lastSyncAt: null,
+        };
+
+    await redis.set(cacheKey, JSON.stringify(ctrl), 30).catch(() => {});
+    return ctrl;
+  }
+
+  public async setSupplierFlag(
+    supplierId: string,
+    field: SupplierControlFlag,
+    value: boolean,
+    adminId: string
+  ): Promise<SupplierControlRecord> {
+    const allowed: Record<SupplierControlFlag, string> = {
+      is_enabled: 'is_enabled',
+      routing_enabled: 'routing_enabled',
+      ordering_enabled: 'ordering_enabled',
+      sync_enabled: 'sync_enabled',
+    };
+    const col = allowed[field];
+    if (!col) throw new Error(`Unsupported supplier flag: ${field}`);
+
+    const existing = await db.queryRow<any>('SELECT id FROM suppliers WHERE id = $1', [supplierId]);
+    if (!existing) {
+      await db.query(
+        `INSERT INTO suppliers (id, name, base_url, is_enabled, routing_enabled, ordering_enabled, sync_enabled, created_at, updated_at)
+         VALUES ($1, $2, $3, TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [supplierId, 'AiToolShop Reseller', this.baseUrl]
+      );
+    }
+
+    await db.query(
+      `UPDATE suppliers SET ${col} = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [Boolean(value), supplierId]
+    );
+
+    await db.query(
+      `INSERT INTO admin_audit_logs (id, admin_id, action, target_entity, target_id, details)
+       VALUES ($1, $2, 'SUPPLIER_FLAG_UPDATED', 'suppliers', $3, $4)`,
+      [
+        `aud_sup_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        adminId,
+        supplierId,
+        JSON.stringify({ field: col, value: Boolean(value) }),
+      ]
+    );
+
+    await redis.del(`supplier_ctrl:${supplierId}`).catch(() => {});
+    logger.info('Supplier control flag updated', { supplierId, field: col, value: Boolean(value), adminId });
+    return await this.getSupplierControl(supplierId);
   }
 
   private async performFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -384,6 +501,13 @@ export class SupplierService {
 
       const rawBal = data.balance ?? data.balance_usdt ?? data.data?.balance ?? data.data?.balance_usdt ?? 0;
       const balance = new Decimal(rawBal);
+      await db.query(
+        `UPDATE suppliers
+         SET last_balance_usdt = $1, last_balance_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = 'aitoolshop'`,
+        [balance.toFixed(4)]
+      ).catch(() => {});
+      await redis.del('supplier_ctrl:aitoolshop').catch(() => {});
       return { ok: true, httpStatus: res.status, balanceUsdt: balance, currency: String(data.currency || 'USDT') };
     } catch (err: any) {
       logger.error('Supplier getBalance error', { error: err.message });
@@ -904,6 +1028,11 @@ export class SupplierService {
    * 4. Missing products marked unavailable instead of deleted
    */
   public async syncCatalogue(): Promise<{ importedCount: number; updatedCount: number; totalCount: number }> {
+    const ctrl = await this.getSupplierControl('aitoolshop');
+    if (!ctrl.isEnabled || !ctrl.syncEnabled) {
+      throw new Error('Supplier synchronization is disabled in Supplier Control Center.');
+    }
+
     logger.info('Starting catalogue synchronization with AiToolShop Reseller API...');
     const rawProducts = await this.fetchLiveProducts();
 
@@ -1018,6 +1147,14 @@ export class SupplierService {
 
     const totalCountRes = await db.queryRow<{ count: string }>('SELECT COUNT(*) as count FROM supplier_products');
     const totalCount = parseInt(totalCountRes?.count || '0', 10);
+
+    await db.query(
+      `UPDATE suppliers SET last_sync_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = 'aitoolshop'`
+    ).catch(() => {});
+    await Promise.all([
+      redis.del('supplier_ctrl:aitoolshop').catch(() => {}),
+      redis.del('cat_counts').catch(() => {}),
+    ]);
 
     logger.info('Catalogue sync finished', { importedCount, updatedCount, totalCount });
     return { importedCount, updatedCount, totalCount };
@@ -1174,6 +1311,16 @@ export class SupplierService {
         status: 'failed',
         error_code: 'INVALID_API_KEY',
         message: 'Supplier reseller API key is not configured.',
+      };
+    }
+
+    const ctrl = await this.getSupplierControl('aitoolshop');
+    if (!ctrl.isEnabled || !ctrl.orderingEnabled || !ctrl.routingEnabled) {
+      return {
+        success: false,
+        status: 'failed',
+        error_code: 'SUPPLIER_DISABLED',
+        message: 'Ordering or routing for AiToolShop is currently disabled in Supplier Control Center.',
       };
     }
 

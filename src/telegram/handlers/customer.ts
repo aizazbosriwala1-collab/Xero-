@@ -8,6 +8,8 @@ import { binanceService, BinanceVerificationResult, maskIdentifier } from '../..
 import { orderService } from '../../services/order.js';
 import { referralService } from '../../services/referral.js';
 import { giveawayService } from '../../services/giveaway.js';
+import { channelService } from '../../services/channel.js';
+import { settingsService } from '../../services/settings.js';
 import { supportService } from '../../services/support.js';
 import { uiConfigService } from '../../services/uiConfig.js';
 import { navigationService } from '../../services/navigation.js';
@@ -16,6 +18,7 @@ import { config } from '../../config/env.js';
 import {
   getCustomerMainInlineKeyboard,
   getCustomerMainReplyKeyboard,
+  getRequiredChannelsGateKeyboard,
   getCategoryKeyboard,
   getProductListKeyboard,
   getProductDetailKeyboard,
@@ -83,20 +86,37 @@ export class CustomerHandler {
     const [, userInfo] = await Promise.all([uiConfigService.ensureLoaded(), this.ensureUser(msg.from)]);
     const { userId, isAdmin, lang } = userInfo;
 
-    const [navState] = await Promise.all([
+    const [navState, , maint, banners, membership] = await Promise.all([
       navigationService.getState(userId),
       redis.clearFsmState(userId),
+      settingsService.getMaintenanceConfig(),
+      settingsService.getBannerImages(),
+      channelService.checkUserMembership(userId),
       referrerCode && referrerCode.startsWith('ref_')
         ? referralService.registerReferral(referrerCode.replace('ref_', '').trim(), userId)
         : Promise.resolve(false),
     ]);
 
+    if (!isAdmin && maint.enabled) {
+      await telegramClient.sendMessage(msg.chat.id, maint.message);
+      return;
+    }
+
+    if (!membership.allowed) {
+      await this.sendRequiredChannelsGate(msg.chat.id, undefined, userId, membership.missingChannels, lang, false);
+      return;
+    }
+
     const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
 
-    // Send single polished welcome screen + colored inline dashboard
-    const sent = await telegramClient.sendMessage(msg.chat.id, welcomeText, {
-      reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
-    });
+    // Send single polished welcome screen (with optional banner photo if configured) + colored inline dashboard
+    const sent = banners.welcomeBannerUrl
+      ? await telegramClient.sendPhoto(msg.chat.id, banners.welcomeBannerUrl, welcomeText, {
+          reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
+        })
+      : await telegramClient.sendMessage(msg.chat.id, welcomeText, {
+          reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
+        });
 
     // Attach/upgrade persistent 2-button bottom reply keyboard ([ Deposit ] [ Support ]) cleanly without duplicating home screen
     const needsReplyKbAttach = navState?.filters?.replyKbVersion !== 'v2_2btn';
@@ -117,6 +137,25 @@ export class CustomerHandler {
       filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' },
       rotateToken: true,
     });
+  }
+
+  private async sendRequiredChannelsGate(
+    chatId: number,
+    messageId: number | undefined,
+    userId: string,
+    missingChannels: Array<{ id: string; title: string; inviteUrl: string }>,
+    lang: SupportedLanguage,
+    retryNotice = false
+  ) {
+    const gateText =
+      `📢 *Join Required Channels*\n\n` +
+      (retryNotice
+        ? `⚠️ Please join all required channels below first, then tap *✅ Verify Membership*.\n\n`
+        : `ℹ️ Please join our official channel(s) below to unlock full store access:\n\n`) +
+      missingChannels.map((c, idx) => `${idx + 1}. *${c.title}*`).join('\n');
+
+    const kb = getRequiredChannelsGateKeyboard(missingChannels, lang);
+    await this.renderMenu(chatId, messageId, userId, gateText, kb);
   }
 
   /**
@@ -177,6 +216,53 @@ export class CustomerHandler {
       data = 'm:home';
     }
 
+    // Verify Required Channels Membership
+    if (data === 'ch:verify') {
+      const membership = await channelService.checkUserMembership(userId, { forceRefresh: true });
+      if (!membership.allowed) {
+        await this.sendRequiredChannelsGate(chatId, messageId, userId, membership.missingChannels, lang, true);
+        await ackPromise;
+        return;
+      }
+
+      const [navState] = await Promise.all([
+        navigationService.getState(userId),
+        navigationService.saveState(userId, { screen: 'home', categoryId: 'all', page: 1 }),
+      ]);
+      const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
+      await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, lang));
+      if (navState?.filters?.replyKbVersion !== 'v2_2btn') {
+        await telegramClient.sendMessage(chatId, '⚡ Quick actions enabled below: Deposit or Support.', {
+          disable_notification: true,
+          reply_markup: getCustomerMainReplyKeyboard(lang),
+        });
+        await navigationService.saveState(userId, {
+          filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' },
+        });
+      }
+      await ackPromise;
+      return;
+    }
+
+    // Check Maintenance Mode & Required Channel Membership before shop/wallet/order actions
+    const gatedPrefixes = ['m:home', 'm:prod', 'catp:', 'm:feat', 'feat:', 'm:srch', 'srch:', 'cat:', 'p:', 'qty:', 'buy:', 'buyc:', 'm:give', 'gw_cl:', 'm:ref', 'ref_cl:', 'm:dep', 'dep_m:'];
+    if (gatedPrefixes.some(p => (p.endsWith(':') ? data.startsWith(p) : data === p))) {
+      if (!isAdmin) {
+        const maint = await settingsService.getMaintenanceConfig();
+        if (maint.enabled) {
+          await this.renderMenu(chatId, messageId, userId, maint.message, getBackHomeKeyboard('m:supp', lang));
+          await ackPromise;
+          return;
+        }
+      }
+      const membership = await channelService.checkUserMembership(userId);
+      if (!membership.allowed) {
+        await this.sendRequiredChannelsGate(chatId, messageId, userId, membership.missingChannels, lang, false);
+        await ackPromise;
+        return;
+      }
+    }
+
     // Navigation: Home
     if (data === 'm:home') {
       await Promise.all([
@@ -189,15 +275,25 @@ export class CustomerHandler {
       return;
     }
 
-    // Navigation: Categories Grid
+    // Navigation: Categories Grid (with cached product counts)
     if (data === 'm:prod' || data.startsWith('catp:')) {
       const catPage = data.startsWith('catp:') ? Math.max(1, parseInt(data.split(':')[1] || '1', 10)) : 1;
-      const categories = await db.query<any>(
-        'SELECT id, name FROM product_categories WHERE is_visible = TRUE ORDER BY display_order ASC'
-      );
+      const [categories, catCounts] = await Promise.all([
+        db.query<any>('SELECT id, name FROM product_categories WHERE is_visible = TRUE ORDER BY display_order ASC'),
+        pricingService.getCategoryProductCounts(),
+      ]);
       await navigationService.saveState(userId, { screen: 'categories', page: catPage });
-      const text = uiConfigService.getText('msg.categories_header', lang) || t('categories_header', lang);
-      await this.renderMenu(chatId, messageId, userId, text, getCategoryKeyboard(categories.rows, lang, catPage));
+      const baseHeader = uiConfigService.getText('msg.categories_header', lang) || t('categories_header', lang);
+      const text =
+        `${baseHeader}\n\n` +
+        `📦 *Live Inventory:* \`${catCounts.totalActive}\` verified tools in stock`;
+      await this.renderMenu(
+        chatId,
+        messageId,
+        userId,
+        text,
+        getCategoryKeyboard(categories.rows, lang, catPage, catCounts.counts)
+      );
       return;
     }
 
@@ -233,7 +329,7 @@ export class CustomerHandler {
         userId,
         t('featured_header', lang, { page, totalPages }),
         getProductListKeyboard({
-          products: catalog.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
+          products: catalog.items.map(p => ({ id: p.id, name: `⭐ ${p.name}`, sellingPrice: p.sellingPrice })),
           page,
           totalPages,
           catId: 'all',
@@ -295,7 +391,11 @@ export class CustomerHandler {
         userId,
         listHeader,
         getProductListKeyboard({
-          products: catalog.items.map(p => ({ id: p.id, name: p.name, sellingPrice: p.sellingPrice })),
+          products: catalog.items.map(p => ({
+            id: p.id,
+            name: p.isFeatured ? `⭐ ${p.name}` : p.name,
+            sellingPrice: p.sellingPrice,
+          })),
           page,
           totalPages,
           catId,
@@ -633,8 +733,11 @@ export class CustomerHandler {
 
     // Giveaways
     if (data === 'm:give') {
-      const giveaways = await giveawayService.getActiveGiveaways(userId);
-      if (giveaways.length === 0) {
+      const [gwSettings, giveaways] = await Promise.all([
+        giveawayService.getSettings(),
+        giveawayService.getActiveGiveaways(userId),
+      ]);
+      if (!gwSettings.enabled || giveaways.length === 0) {
         await this.renderMenu(chatId, messageId, userId, t('giveaways_empty', lang), getBackHomeKeyboard('m:home', lang));
         return;
       }
@@ -645,12 +748,16 @@ export class CustomerHandler {
         const prog = gw.userProgress;
         text +=
           `🏆 *${gw.title}*\n` +
-          `• Reward: ${gw.rewardProductName} (x${gw.rewardQuantity})\n` +
-          `• Requirement: ${gw.requiredQualifiedReferrals} Qualified Referrals\n`;
+          (gw.description ? `ℹ️ _${gw.description}_\n` : '') +
+          `• Reward: *${gw.rewardProductName}* (x${gw.rewardQuantity})\n` +
+          (gw.requiredTotalReferrals > 0
+            ? `• Total Referrals Required: *${prog?.currentTotal ?? 0} / ${gw.requiredTotalReferrals}*\n`
+            : '') +
+          `• Qualified Referrals: *${prog?.currentQualified ?? 0} / ${gw.requiredQualifiedReferrals}*\n` +
+          `• Winners Claimed: \`${gw.claimsCount} / ${gw.claimLimit}\`\n` +
+          (gw.endAt ? `• Ends: \`${new Date(gw.endAt).toISOString().slice(0, 16).replace('T', ' ')}Z\`\n` : '');
         if (prog) {
-          text +=
-            `• Your Progress: *${prog.currentQualified} / ${prog.required}*\n` +
-            `• Status: ${prog.hasClaimed ? '✅ CLAIMED' : prog.isEligible ? '🌟 ELIGIBLE TO CLAIM' : '⏳ In Progress'}\n\n`;
+          text += `• Status: ${prog.hasClaimed ? '✅ CLAIMED' : prog.isEligible ? '✅ ELIGIBLE TO CLAIM' : '⚠️ In Progress'}\n\n`;
 
           if (prog.isEligible && !prog.hasClaimed) {
             rows.push(
@@ -673,34 +780,78 @@ export class CustomerHandler {
       return;
     }
 
-    // Claim Giveaway
+    // Claim Giveaway (clean in-place update)
     if (data.startsWith('gw_cl:')) {
       const allowed = await navigationService.acquireActionLock(userId, `gw:${data}`, 3);
       if (!allowed) return;
       const [, giveawayId] = data.split(':');
       try {
         const res = await giveawayService.claimGiveaway(giveawayId, userId);
-        await telegramClient.sendMessage(chatId, `🎉 ${res.message}`, {
-          reply_markup: getBackHomeKeyboard('m:give', lang),
-        });
+        await this.renderMenu(chatId, messageId, userId, `✅ ${res.message}`, getBackHomeKeyboard('m:give', lang));
       } catch (err: any) {
-        await telegramClient.sendMessage(chatId, `⚠️ ${err.message}`, {
-          reply_markup: getBackHomeKeyboard('m:give', lang),
-        });
+        await this.renderMenu(chatId, messageId, userId, `⚠️ ${err.message}`, getBackHomeKeyboard('m:give', lang));
       }
       return;
     }
 
-    // Refer & Earn
+    // Refer & Earn (with admin-configured milestone reward tiers)
     if (data === 'm:ref') {
-      const stats = await referralService.getStats(userId);
+      const [stats, tiers, refSettings] = await Promise.all([
+        referralService.getStats(userId),
+        referralService.listRewardTiers({ activeOnly: true, userId }),
+        referralService.getSettings(),
+      ]);
       const template = uiConfigService.getText('msg.referral_title', lang) || t('referral_title', lang);
-      const text = template
+      let text = template
         .replace(/\{link\}/g, stats.referralLink)
         .replace(/\{total\}/g, String(stats.totalReferred))
         .replace(/\{qualified\}/g, String(stats.qualifiedCount))
         .replace(/\{pending\}/g, String(stats.pendingCount));
-      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
+
+      text += `\n\nℹ️ *Rule:* _Joining alone earns no reward. A referral qualifies once their purchase reaches COMPLETED status (\u2265 ${refSettings.minQualifyingOrderUsdt} USDT)._`;
+
+      const rows: any[][] = [];
+      if (tiers.length > 0 && refSettings.rewardsEnabled) {
+        text += `\n\n🎁 *REFERRAL REWARD MILESTONES:*\n`;
+        for (const tier of tiers) {
+          const rewardDesc =
+            tier.rewardType === 'WALLET_USDT'
+              ? `${tier.rewardAmount} USDT Wallet Credit`
+              : `${tier.rewardProductName || 'Product'} x${tier.rewardQuantity}`;
+          const badge = tier.userClaimed ? '✅ Claimed' : tier.userEligible ? '✅ Ready to Claim' : `⚠️ ${stats.qualifiedCount}/${tier.requiredQualifiedReferrals}`;
+          text += `• *${tier.title}* (${tier.requiredQualifiedReferrals} Qualified) → ${rewardDesc} — ${badge}\n`;
+          if (tier.userEligible && !tier.userClaimed) {
+            rows.push(
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({
+                  text: `Claim: ${tier.title}`.slice(0, 36),
+                  fallbackEmoji: '🎁',
+                  style: 'success',
+                  callbackData: `ref_cl:${tier.id}`,
+                  forceVisible: true,
+                }),
+              ])
+            );
+          }
+        }
+      }
+
+      rows.push(ButtonBuilder.buildNavigationRow('m:home', lang));
+      await this.renderMenu(chatId, messageId, userId, text, { inline_keyboard: rows.filter(r => r.length > 0) });
+      return;
+    }
+
+    // Claim Referral Reward Tier
+    if (data.startsWith('ref_cl:')) {
+      const allowed = await navigationService.acquireActionLock(userId, `refcl:${data}`, 3);
+      if (!allowed) return;
+      const tierId = data.slice('ref_cl:'.length);
+      try {
+        const res = await referralService.claimRewardTier(tierId, userId);
+        await this.renderMenu(chatId, messageId, userId, `✅ ${res.message}`, getBackHomeKeyboard('m:ref', lang));
+      } catch (err: any) {
+        await this.renderMenu(chatId, messageId, userId, `⚠️ ${err.message}`, getBackHomeKeyboard('m:ref', lang));
+      }
       return;
     }
 
@@ -1265,22 +1416,23 @@ export class CustomerHandler {
   }
 
   /**
-   * Format product card text
+   * Format product card text with clean standardized status badges
    */
   private formatProductCard(p: any, quantity = 1): string {
-    const stockStr = p.isUnlimited ? '♾️ Unlimited' : p.stock > 0 ? `${p.stock} in stock` : '❌ Out of stock';
-    const emailStr = p.requiresEmail ? '⚠️ Email Required' : '⚡ Instant Key/Account';
+    const stockStr = p.isUnlimited ? '✅ Unlimited' : p.stock > 0 ? `✅ ${p.stock} in stock` : '❌ Out of stock';
+    const emailStr = p.requiresEmail ? '⚠️ Email Required' : '✅ Instant Key / Account';
     const totalStr = new Decimal(p.sellingPrice).times(quantity).toFixed(2);
+    const featuredBadge = p.isFeatured ? ' ⭐ _Featured_' : '';
 
     return (
-      `🛍️ *${p.name}*\n\n` +
+      `🛍️ *${p.name}*${featuredBadge}\n\n` +
       `💰 *Unit Price:* \`${p.sellingPrice} USDT\`\n` +
       (quantity > 1 ? `🧮 *Total (${quantity}x):* \`${totalStr} USDT\`\n` : '') +
-      `📦 *Availability:* ${stockStr}\n` +
+      `📦 *Stock:* ${stockStr}\n` +
       `⏱️ *Duration:* ${p.duration}\n` +
-      `🔑 *Type:* ${emailStr}\n\n` +
-      `📝 *Description:*\n_${p.description.substring(0, 160)}${p.description.length > 160 ? '...' : ''}_\n\n` +
-      `🛡️ *Warranty:* ${p.warrantySummary}`
+      `🔑 *Delivery:* ${emailStr}\n` +
+      `🛡️ *Warranty:* ${p.warrantySummary}\n\n` +
+      `📝 _${p.description.substring(0, 180)}${p.description.length > 180 ? '...' : ''}_`
     );
   }
 

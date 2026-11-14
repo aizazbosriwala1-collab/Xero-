@@ -481,6 +481,36 @@ export class TelegramClient {
     return res;
   }
 
+  public async sendPhoto(
+    chatId: number | string,
+    photo: string,
+    caption?: string,
+    options: SendMessageOptions = {}
+  ): Promise<any> {
+    const payload: Record<string, any> = {
+      chat_id: chatId,
+      photo,
+      caption,
+      parse_mode: options.parse_mode || 'Markdown',
+      reply_markup: options.reply_markup,
+    };
+    if (options.disable_notification !== undefined) {
+      payload.disable_notification = options.disable_notification;
+    }
+    const res = await this.post('sendPhoto', payload);
+    if (!res?.ok && caption) {
+      return await this.sendMessage(chatId, caption, options);
+    }
+    return res;
+  }
+
+  public async getChatMember(chatId: number | string, userId: number | string): Promise<any> {
+    return await this.post('getChatMember', {
+      chat_id: chatId,
+      user_id: Number(userId),
+    });
+  }
+
   public async answerCallbackQuery(callbackQueryId: string, text?: string, showAlert = false): Promise<any> {
     return await this.post('answerCallbackQuery', {
       callback_query_id: callbackQueryId,

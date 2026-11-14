@@ -108,12 +108,43 @@ export function getStaleMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramIn
 }
 
 /**
- * Product Categories Keyboard — Clean 3-column grid with blue primary style & utility actions
+ * Required Channel Membership Gate Keyboard
+ */
+export function getRequiredChannelsGateKeyboard(
+  channels: Array<{ id: string; title: string; inviteUrl: string }>,
+  lang: SupportedLanguage = 'en'
+): TelegramInlineKeyboardMarkup {
+  const rows: TelegramInlineKeyboardButton[][] = [];
+  for (const ch of channels) {
+    rows.push([
+      {
+        text: `📢 ${lang === 'ur' ? 'جوائن کریں' : 'Join'} ${ch.title}`.slice(0, 48),
+        url: ch.inviteUrl,
+      },
+    ]);
+  }
+  rows.push(
+    ButtonBuilder.buildActionRow([
+      ButtonBuilder.buildButton({
+        text: lang === 'ur' ? 'ممبرشپ کی تصدیق کریں' : 'Verify Membership',
+        fallbackEmoji: '✅',
+        style: 'success',
+        callbackData: 'ch:verify',
+        forceVisible: true,
+      }),
+    ])
+  );
+  return { inline_keyboard: filterNonEmptyRows(rows) };
+}
+
+/**
+ * Product Categories Keyboard — Clean 3-column grid with blue primary style, counts & utility actions
  */
 export function getCategoryKeyboard(
   categories: Array<{ id: string; name: string }>,
   lang: SupportedLanguage = 'en',
-  catPage = 1
+  catPage = 1,
+  counts?: Record<string, number>
 ): TelegramInlineKeyboardMarkup {
   const pageSize = 9;
   const totalPages = Math.max(1, Math.ceil(categories.length / pageSize));
@@ -122,17 +153,20 @@ export function getCategoryKeyboard(
   const pageCategories = categories.slice(start, start + pageSize);
 
   const catButtons = pageCategories.map(cat => {
+    const countVal = counts && counts[cat.id] !== undefined ? counts[cat.id] : undefined;
+    const suffix = countVal !== undefined ? ` (${countVal})` : '';
     const customSettingKey = `btn.cat.${cat.id}`;
     const custom = uiConfigService.getCachedSetting(customSettingKey, lang);
     if (custom) {
       return ButtonBuilder.buildButton({
         settingKey: customSettingKey,
         lang,
+        suffix,
         callbackData: `cat:${cat.id}:1`,
       });
     }
     return ButtonBuilder.buildButton({
-      text: cat.name,
+      text: `${cat.name}${suffix}`,
       style: 'primary',
       callbackData: `cat:${cat.id}:1`,
     });
@@ -609,42 +643,38 @@ export function getLanguageKeyboard(currentLang: SupportedLanguage = 'en'): Tele
 }
 
 /**
- * Admin Main Menu Keyboard
+ * Admin Main Menu Keyboard — Logically grouped for public release operations
  */
 export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
   return {
     inline_keyboard: filterNonEmptyRows([
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'DASHBOARD', fallbackEmoji: '📊', style: 'primary', callbackData: 'adm:dash' }),
-        ButtonBuilder.buildButton({ text: 'PRODUCTS', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:prod:1' }),
+        ButtonBuilder.buildButton({ text: 'Dashboard', fallbackEmoji: '🏠', style: 'primary', callbackData: 'adm:dash', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Orders', fallbackEmoji: '📦', style: 'default', callbackData: 'adm:ord', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Wallets', fallbackEmoji: '💰', style: 'default', callbackData: 'adm:wal', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'PRICING', fallbackEmoji: '💲', style: 'default', callbackData: 'adm:price' }),
-        ButtonBuilder.buildButton({ text: 'CATEGORIES', fallbackEmoji: '🗂️', style: 'default', callbackData: 'adm:cat' }),
+        ButtonBuilder.buildButton({ text: 'Deposits', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Products', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:prod:1', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Pricing', fallbackEmoji: '💲', style: 'default', callbackData: 'adm:price', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'ORDERS', fallbackEmoji: '📦', style: 'default', callbackData: 'adm:ord' }),
-        ButtonBuilder.buildButton({ text: 'WALLETS', fallbackEmoji: '💰', style: 'default', callbackData: 'adm:wal' }),
+        ButtonBuilder.buildButton({ text: 'Categories', fallbackEmoji: '🗂️', style: 'default', callbackData: 'adm:cat', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Giveaways', fallbackEmoji: '🎁', style: 'default', callbackData: 'adm:gw', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Referrals', fallbackEmoji: '👥', style: 'default', callbackData: 'adm:ref', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'DEPOSITS (Pending)', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep' }),
-        ButtonBuilder.buildButton({ text: 'GIVEAWAYS', fallbackEmoji: '🎁', style: 'default', callbackData: 'adm:gw' }),
-      ]),
-      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Channels', fallbackEmoji: '📢', style: 'default', callbackData: 'adm:ch', forceVisible: true }),
         ButtonBuilder.buildButton({ settingKey: 'btn.adm.ui_editor', lang, callbackData: 'adm:ui', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Settings', fallbackEmoji: '⚙️', style: 'default', callbackData: 'adm:set', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'SUPPLIER SYNC', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sync' }),
-        ButtonBuilder.buildButton({ text: 'SYSTEM HEALTH', fallbackEmoji: '🩺', style: 'default', callbackData: 'adm:hlth' }),
+        ButtonBuilder.buildButton({ text: 'Suppliers', fallbackEmoji: '🏭', style: 'primary', callbackData: 'adm:sup', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Sync Now', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sync', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({
-          text: 'SUPPLIER READ-ONLY DIAG',
-          fallbackEmoji: '🔬',
-          style: 'primary',
-          callbackData: 'adm:sup_diag',
-          forceVisible: true,
-        }),
+        ButtonBuilder.buildButton({ text: 'Diagnostics', fallbackEmoji: '🔬', style: 'primary', callbackData: 'adm:diag', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Launch Audit', fallbackEmoji: '🚀', style: 'success', callbackData: 'adm:audit', forceVisible: true }),
       ]),
       ...(config.binance.diagnosticEnabled
         ? [

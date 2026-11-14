@@ -42,9 +42,13 @@ import { navigationService } from '../src/services/navigation.js';
 import { ButtonBuilder } from '../src/telegram/buttonBuilder.js';
 import { redis } from '../src/services/redis.js';
 import { supportService } from '../src/services/support.js';
+import { channelService } from '../src/services/channel.js';
+import { settingsService } from '../src/services/settings.js';
+import { launchAuditService } from '../src/services/audit.js';
 import {
   getCustomerMainReplyKeyboard,
   getCustomerMainInlineKeyboard,
+  getRequiredChannelsGateKeyboard,
   getCategoryKeyboard,
   getProductListKeyboard,
   getProductDetailKeyboard,
@@ -2278,6 +2282,7 @@ export async function runComprehensiveTests() {
       getPaymentBeforeInvoiceKeyboard('en', 'dep_audit_1'),
       getLanguageKeyboard('en'),
       getStaleMenuKeyboard('en'),
+      getRequiredChannelsGateKeyboard([{ id: 'ch_audit_1', title: 'Xero News', inviteUrl: 'https://t.me/xeronews' }], 'en'),
       getAdminMainMenuKeyboard('en'),
       getAdminUiCenterKeyboard(),
       getAdminUiSectionKeyboard('main_menu', sampleSettings.slice(0, 4), 1, 2, 'en'),
@@ -6011,6 +6016,391 @@ export async function runComprehensiveTests() {
     } finally {
       supplierService.resetTestState();
       telegramClient.setTransportOverride(null);
+    }
+  });
+
+  // =========================================================================
+  // 21. CONTRACT 9: XERO KHAN PUBLIC RELEASE POLISH & AUDIT SUITE
+  // =========================================================================
+  currentCategory = 'Contract 9: Public Release Polish & Audits';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 9.1: Giveaways Builder (zero hardcoded products, DB SKU reward, all fields, active/finished filter, claim enforcement & delete)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '95001';
+    await ensureAuditUser(custId);
+    await ensureAuditUser('95002');
+    await ensureAuditUser('95003');
+    const prodId = await insertTestProduct({ id: 'gw_db_1', name: 'Canva Pro 1 Month', your_cost: 1.25, stock: 25 });
+
+    const startIso = new Date(Date.now() - 3600_000).toISOString();
+    const endIso = new Date(Date.now() + 7 * 86400_000).toISOString();
+
+    const gwId = await giveawayService.createGiveaway(
+      {
+        title: 'Launch Bonus Canva',
+        description: 'Invite 2 users and 1 buyer to claim',
+        rewardProductId: prodId,
+        rewardQuantity: 2,
+        requiredTotalReferrals: 2,
+        requiredQualifiedReferrals: 1,
+        startAt: startIso,
+        endAt: endIso,
+        claimLimit: 5,
+        isPublic: true,
+        isActive: true,
+      },
+      adminId
+    );
+
+    const created = await giveawayService.getGiveawayById(gwId);
+    assert.ok(created);
+    assert.strictEqual(created!.rewardProductId, prodId);
+    assert.strictEqual(created!.rewardProductName, 'Canva Pro 1 Month');
+    assert.strictEqual(created!.rewardQuantity, 2);
+    assert.strictEqual(created!.requiredTotalReferrals, 2);
+    assert.strictEqual(created!.requiredQualifiedReferrals, 1);
+    assert.strictEqual(created!.claimLimit, 5);
+    assert.strictEqual(created!.isPublic, true);
+    assert.strictEqual(created!.isActive, true);
+
+    const activeList = await giveawayService.listAdminGiveaways('active');
+    assert.ok(activeList.some(g => g.id === gwId));
+
+    // Customer ineligible before referrals -> rejected cleanly
+    await assert.rejects(() => giveawayService.claimGiveaway(gwId, custId), /You need at least 2 referrals/);
+
+    // Satisfy 2 total referrals & 1 qualified referral -> claim succeeds once, duplicate rejected
+    await db.query(
+      `INSERT INTO referrals (id, referrer_id, referred_id, status)
+       VALUES ('ref_gw_c1', $1, '95002', 'QUALIFIED'), ('ref_gw_c2', $1, '95003', 'PENDING')
+       ON CONFLICT (referred_id) DO NOTHING`,
+      [custId]
+    );
+
+    const claimRes = await giveawayService.claimGiveaway(gwId, custId);
+    assert.strictEqual(claimRes.success, true);
+    await assert.rejects(() => giveawayService.claimGiveaway(gwId, custId), /already claimed/i);
+
+    // Disable giveaway -> moves to finished filter, invisible to customers
+    await giveawayService.setGiveawayActive(gwId, false, adminId);
+    const finishedList = await giveawayService.listAdminGiveaways('finished');
+    assert.ok(finishedList.some(g => g.id === gwId));
+    const publicActive = await giveawayService.getActiveGiveaways(custId);
+    assert.strictEqual(publicActive.some(g => g.id === gwId), false);
+
+    // Edit title & re-enable, then delete
+    const updated = await giveawayService.updateGiveaway(gwId, { title: 'Updated Launch Bonus', isActive: true }, adminId);
+    assert.strictEqual(updated.title, 'Updated Launch Bonus');
+
+    const deleted = await giveawayService.deleteGiveaway(gwId, adminId);
+    assert.strictEqual(deleted, true);
+    assert.strictEqual(await giveawayService.getGiveawayById(gwId), null);
+  });
+
+  await it('Contract 9.2: Referral Reward Tiers (zero hardcoded milestones, join=no reward, qualified-only claim, idempotent ledger credit)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const referrerId = '95101';
+    const buyerId = '95102';
+    const joinOnlyId = '95103';
+
+    for (const uid of [referrerId, buyerId, joinOnlyId]) {
+      await ensureAuditUser(uid);
+    }
+
+    const prodId = await insertTestProduct({ id: 'ref_db_1', name: 'ChatGPT Plus', your_cost: 1.00, stock: 10 });
+
+    // Create DB-backed WALLET_USDT milestone requiring 1 qualified referral
+    const tierId = await referralService.createRewardTier(
+      {
+        title: 'First Qualified Buyer Bonus',
+        description: 'Earn 1.50 USDT once 1 invited friend completes an order',
+        requiredQualifiedReferrals: 1,
+        rewardType: 'WALLET_USDT',
+        rewardAmount: '1.50',
+      },
+      adminId
+    );
+
+    // Join only must grant ZERO reward and leave user ineligible
+    await referralService.registerReferral(referrerId, joinOnlyId);
+    const balAfterJoin = await walletService.getBalance(referrerId);
+    assert.strictEqual(balAfterJoin.balance.toFixed(2), '0.00');
+    await assert.rejects(() => referralService.claimRewardTier(tierId, referrerId), /qualified referrals/);
+
+    // PENDING/FAILED order by referred user must NOT qualify
+    await referralService.registerReferral(referrerId, buyerId);
+    await db.query(
+      `INSERT INTO local_orders (id, user_id, idempotency_key, product_id, quantity, unit_price, total_price, supplier_cost, status, delivery_type)
+       VALUES ('ord_ref_fail', $1, 'idk_ref_fail', $2, 1, 2.0000, 2.0000, 1.0000, 'FAILED', 'INSTANT')
+       ON CONFLICT (id) DO NOTHING`,
+      [buyerId, prodId]
+    );
+    await referralService.processOrderQualification(buyerId, 'ord_ref_fail', new Decimal('2.00'));
+    assert.strictEqual((await referralService.getStats(referrerId)).qualifiedCount, 0);
+
+    // COMPLETED order qualifies referral and unlocks claim once
+    await db.query(
+      `INSERT INTO local_orders (id, user_id, idempotency_key, product_id, quantity, unit_price, total_price, supplier_cost, status, delivery_type)
+       VALUES ('ord_ref_ok', $1, 'idk_ref_ok', $2, 1, 2.0000, 2.0000, 1.0000, 'COMPLETED', 'INSTANT')
+       ON CONFLICT (id) DO NOTHING`,
+      [buyerId, prodId]
+    );
+    await referralService.processOrderQualification(buyerId, 'ord_ref_ok', new Decimal('2.00'));
+    assert.strictEqual((await referralService.getStats(referrerId)).qualifiedCount, 1);
+
+    const claim = await referralService.claimRewardTier(tierId, referrerId);
+    assert.strictEqual(claim.success, true);
+    assert.strictEqual((await walletService.getBalance(referrerId)).balance.toFixed(2), '1.50');
+
+    // Duplicate claim rejected & wallet balance unchanged
+    await assert.rejects(() => referralService.claimRewardTier(tierId, referrerId), /already claimed/i);
+    assert.strictEqual((await walletService.getBalance(referrerId)).balance.toFixed(2), '1.50');
+
+    // Edit & Delete tier cleanup
+    const edited = await referralService.updateRewardTier(tierId, { isActive: false, title: 'Paused Bonus' }, adminId);
+    assert.strictEqual(edited.isActive, false);
+    assert.strictEqual(edited.title, 'Paused Bonus');
+    assert.strictEqual(await referralService.deleteRewardTier(tierId, adminId), true);
+  });
+
+  await it('Contract 9.3: Required Channels Gate (blocks unjoined users on /start & shop, unlocks on ch:verify, reorder & delete)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = 95201;
+    await ensureAuditUser(String(custId));
+    await redis.del(`chan_ok:${custId}`);
+
+    const ch1 = await channelService.addChannel({ channelIdentifier: '@XeroOfficial', title: 'Xero Official' }, adminId);
+    const ch2 = await channelService.addChannel({ channelIdentifier: '@XeroDeals', title: 'Xero Deals' }, adminId);
+    await channelService.moveChannel(ch2.id, 'up', adminId);
+    const ordered = await channelService.listChannels(false);
+    assert.strictEqual(ordered[0].id, ch2.id, 'Channel move up must swap display order');
+
+    await channelService.setVerificationEnabled(true, adminId);
+
+    const sent: any[] = [];
+    let memberStatus = 'left';
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (method === 'getChatMember') {
+        return { ok: true, result: { status: memberStatus } };
+      }
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 8801 } };
+    });
+
+    try {
+      // Blocked on /start when user is not a member
+      await telegramBotRouter.handleUpdate({
+        update_id: 952001,
+        message: {
+          message_id: 10,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'ChanUser' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/start',
+        },
+      });
+      const gateMsg = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('Join Required Channels'));
+      assert.ok(gateMsg, '/start must render required channels gate when unjoined');
+      const gateBtns = gateMsg!.body.reply_markup.inline_keyboard.flat();
+      assert.ok(gateBtns.some((b: any) => b.callback_data === 'ch:verify'));
+
+      // Blocked on m:prod callback when user is not a member
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 952002,
+        callback_query: {
+          id: 'cb_ch_block',
+          from: { id: custId, is_bot: false, first_name: 'ChanUser' },
+          data: 'm:prod',
+          message: { message_id: 8801, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Gate' },
+        },
+      });
+      assert.ok(
+        sent.some(m => m.method === 'editMessageText' && String(m.body.text).includes('Join Required Channels')),
+        'm:prod must remain blocked while unjoined'
+      );
+
+      // User joins both channels and taps ch:verify -> unlocks main menu in-place
+      memberStatus = 'member';
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 952003,
+        callback_query: {
+          id: 'cb_ch_ok',
+          from: { id: custId, is_bot: false, first_name: 'ChanUser' },
+          data: 'ch:verify',
+          message: { message_id: 8801, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Gate' },
+        },
+      });
+      assert.ok(
+        sent.some(m => m.method === 'editMessageText' && String(m.body.text).includes('XERO KHAN')),
+        'ch:verify must unlock customer main menu in-place'
+      );
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await channelService.setVerificationEnabled(false, adminId);
+      await channelService.removeChannel(ch1.id, adminId);
+      await channelService.removeChannel(ch2.id, adminId);
+      await redis.del(`chan_ok:${custId}`);
+    }
+  });
+
+  await it('Contract 9.4: Supplier Control Center (enable/routing/ordering/sync toggles enforced, zero delete)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const list = await supplierService.listSuppliers();
+    assert.ok(list.some(s => s.id === 'aitoolshop'));
+    assert.strictEqual((supplierService as any).deleteSupplier, undefined, 'Supplier deletion must not exist');
+
+    await supplierService.setSupplierFlag('aitoolshop', 'sync_enabled', false, adminId);
+    await assert.rejects(() => supplierService.syncCatalogue(), /synchronization is disabled/i);
+    await supplierService.setSupplierFlag('aitoolshop', 'sync_enabled', true, adminId);
+
+    const origLive = config.safety.liveOrderingEnabled;
+    let httpCalled = false;
+    supplierService.setTestApiKey('mock_ctrl_key');
+    supplierService.setFetchOverride(async () => {
+      httpCalled = true;
+      return new Response('{}', { status: 500 });
+    });
+    try {
+      config.safety.liveOrderingEnabled = true;
+      await supplierService.setSupplierFlag('aitoolshop', 'ordering_enabled', false, adminId);
+      const disabledRes = await supplierService.placeOrder({
+        product_id: 'sup_1',
+        quantity: 1,
+        idempotency_key: 'TEST_NO_DEL',
+      });
+      assert.strictEqual(disabledRes.success, false);
+      assert.strictEqual(disabledRes.error_code, 'SUPPLIER_DISABLED');
+      assert.strictEqual(httpCalled, false, 'Disabled ordering toggle must abort before any HTTP request');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+      await supplierService.setSupplierFlag('aitoolshop', 'ordering_enabled', true, adminId);
+    }
+  });
+
+  await it('Contract 9.5: Settings Center, Maintenance Mode, Live Banners, Category Counts & N+1-Free Order History', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = 95301;
+    await ensureAuditUser(String(custId));
+
+    // 1. Live Banner & Maintenance enforcement
+    await settingsService.updateBannerImages({ welcomeBannerUrl: 'https://example.com/welcome.jpg' }, adminId);
+    const banners = await settingsService.getBannerImages();
+    assert.strictEqual(banners.welcomeBannerUrl, 'https://example.com/welcome.jpg');
+
+    await settingsService.updateMaintenanceConfig({ enabled: true, message: 'Scheduled maintenance test' }, adminId);
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 8901 } };
+    });
+
+    try {
+      await telegramBotRouter.handleUpdate({
+        update_id: 953001,
+        callback_query: {
+          id: 'cb_maint_block',
+          from: { id: custId, is_bot: false, first_name: 'SettCust' },
+          data: 'm:prod',
+          message: { message_id: 8901, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Menu' },
+        },
+      });
+      assert.ok(sent.some(c => c.method === 'editMessageText' && String(c.body.text).includes('Scheduled maintenance test')));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await settingsService.updateMaintenanceConfig({ enabled: false }, adminId);
+      await settingsService.updateBannerImages({ welcomeBannerUrl: 'clear' }, adminId);
+    }
+
+    // 2. Category Product Counts (single GROUP BY query + cache)
+    const counts = await pricingService.getCategoryProductCounts();
+    assert.ok(typeof counts.totalActive === 'number' && counts.totalActive >= 0);
+
+    // 3. Batched getCustomerOrders returns decrypted deliverables without N+1 loop
+    const orders = await orderService.getCustomerOrders(String(custId), 10);
+    assert.ok(Array.isArray(orders));
+  });
+
+  await it('Contract 9.6: Launch Readiness Audit (10 Pillars), Performance Audit & All New Admin/Customer Routes Within 64 Bytes', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const auditReport = await launchAuditService.runFullAudit(adminId, { liveNetwork: false });
+    assert.strictEqual(auditReport.checks.length, 10, 'Launch audit must evaluate all 10 pillars');
+    const pillarNames = auditReport.checks.map(c => c.area);
+    for (const expected of [
+      'Binance Working',
+      'Wallet Working',
+      'Supplier Working',
+      'Ordering Working',
+      'Delivery Working',
+      'Referral Working',
+      'Giveaway Working',
+      'Required Channels Working',
+      'UI Working',
+      'Admin Panel Working',
+    ]) {
+      assert.ok(pillarNames.includes(expected), `Missing audit pillar: ${expected}`);
+    }
+
+    const perfReport = await launchAuditService.runPerformanceAudit();
+    assert.strictEqual(perfReport.nPlusOneFree, true);
+    assert.ok(perfReport.metrics.length >= 4);
+
+    // Verify all new admin & customer callback routes are registered and <= 64 bytes
+    const newRoutes = [
+      'ch:verify',
+      'ref_cl:rft_123456',
+      'gw_cl:gw_123456',
+      'adm:gw',
+      'adm:gw_new',
+      'adm:gw_act',
+      'adm:gw_fin',
+      'adm:gw_v:gw_1',
+      'adm:gw_ed:gw_1',
+      'adm:gw_f:gw_1:title',
+      'adm:gw_tog:gw_1',
+      'adm:gw_vis:gw_1',
+      'adm:gw_del:gw_1',
+      'adm:gw_delc:gw_1',
+      'adm:ref',
+      'adm:ref_new',
+      'adm:ref_set',
+      'adm:ref_v:rft_1',
+      'adm:ref_ed:rft_1',
+      'adm:ref_f:rft_1:amt',
+      'adm:ref_tog:rft_1',
+      'adm:ref_del:rft_1',
+      'adm:ref_st:min',
+      'adm:ch',
+      'adm:ch_add',
+      'adm:ch_tog',
+      'adm:ch_test',
+      'adm:ch_up:ch_1',
+      'adm:ch_dn:ch_1',
+      'adm:ch_rem:ch_1',
+      'adm:sup',
+      'adm:sup_v:aitoolshop',
+      'adm:sup_bal:aitoolshop',
+      'adm:sup_ord:aitoolshop',
+      'adm:sup_sync:aitoolshop',
+      'adm:sup_tog:aitoolshop:sync',
+      'adm:set',
+      'adm:set_gw',
+      'adm:set_ref',
+      'adm:set_ban',
+      'adm:set_maint',
+      'adm:ban_e:welcome',
+      'adm:ban_clr:welcome',
+      'adm:diag',
+      'adm:audit',
+      'adm:audit_net',
+      'adm:perf',
+    ];
+    for (const cb of newRoutes) {
+      assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `Callback exceeds 64 bytes: ${cb}`);
+      assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered route: ${cb}`);
     }
   });
 

@@ -40,6 +40,117 @@ export interface ProductCatalogItem {
 }
 
 export class PricingService {
+  private readonly globalRuleCacheKey = 'pricing:global_rule';
+  private readonly categoryCountsCacheKey = 'cat_counts';
+
+  private resolvePriceSync(
+    latestCost: string | number | null | undefined,
+    fixedRetailPrice: string | number | null | undefined,
+    fixedMarkup: string | number | null | undefined,
+    percentMarkup: string | number | null | undefined,
+    globalSettings: { defaultPercentMarkup?: string; defaultFixedMarkup?: string }
+  ): ResolvedPrice {
+    const cost = new Decimal(latestCost || '0.0000');
+    let finalPrice: Decimal;
+    let ruleApplied: ResolvedPrice['ruleApplied'];
+
+    if (fixedRetailPrice !== null && fixedRetailPrice !== undefined) {
+      const fixedPrice = new Decimal(fixedRetailPrice);
+      if (fixedPrice.greaterThan(0)) {
+        finalPrice = fixedPrice;
+        ruleApplied = 'FIXED_RETAIL';
+      } else {
+        finalPrice = cost;
+        ruleApplied = 'COST_FLOOR';
+      }
+    } else if (fixedMarkup !== null && fixedMarkup !== undefined) {
+      finalPrice = cost.plus(new Decimal(fixedMarkup));
+      ruleApplied = 'PRODUCT_FIXED_MARKUP';
+    } else if (percentMarkup !== null && percentMarkup !== undefined) {
+      const pct = new Decimal(percentMarkup);
+      finalPrice = cost.times(new Decimal(1).plus(pct));
+      ruleApplied = 'PRODUCT_PERCENT_MARKUP';
+    } else {
+      const defaultPct = new Decimal(globalSettings.defaultPercentMarkup || '0.15');
+      const defaultFixed = new Decimal(globalSettings.defaultFixedMarkup || '0.05');
+      const markupFromPct = cost.times(defaultPct);
+      const effectiveMarkup = Decimal.max(markupFromPct, defaultFixed);
+      finalPrice = cost.plus(effectiveMarkup);
+      ruleApplied = 'GLOBAL_DEFAULT';
+    }
+
+    if (finalPrice.lessThan(cost)) {
+      finalPrice = cost;
+      ruleApplied = 'COST_FLOOR';
+    }
+
+    finalPrice = finalPrice.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    const markup = finalPrice.minus(cost).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+
+    return {
+      supplierCost: cost,
+      customerUnitPrice: finalPrice,
+      markup,
+      ruleApplied,
+    };
+  }
+
+  private async getGlobalPricingSettings(): Promise<{ defaultPercentMarkup?: string; defaultFixedMarkup?: string }> {
+    try {
+      const cached = await redis.get(this.globalRuleCacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {
+      // Cache miss
+    }
+
+    const settingsRow = await db.queryRow<any>("SELECT value FROM system_settings WHERE key = 'pricing_global_rules'");
+    const val = typeof settingsRow?.value === 'string' ? JSON.parse(settingsRow.value) : settingsRow?.value || {};
+    await redis.set(this.globalRuleCacheKey, JSON.stringify(val), 60).catch(() => {});
+    return val;
+  }
+
+  public async invalidateCatalogCaches(productId?: string): Promise<void> {
+    await Promise.all([
+      productId ? redis.del(`price:${productId}`).catch(() => {}) : Promise.resolve(),
+      redis.del(this.globalRuleCacheKey).catch(() => {}),
+      redis.del(this.categoryCountsCacheKey).catch(() => {}),
+    ]);
+  }
+
+  /**
+   * Single-query category & total active product counts (cached 60s in Redis).
+   */
+  public async getCategoryProductCounts(): Promise<{ counts: Record<string, number>; totalActive: number }> {
+    try {
+      const cached = await redis.get(this.categoryCountsCacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {
+      // Cache miss
+    }
+
+    const res = await db.query<{ categoryId: string; cnt: string }>(`
+      SELECT COALESCE(po.category_id, 'cat_ai-tools') as "categoryId",
+             COUNT(*) as cnt
+      FROM supplier_products sp
+      LEFT JOIN product_overrides po ON sp.id = po.product_id
+      WHERE (po.is_hidden IS NULL OR po.is_hidden = FALSE)
+        AND (sp.is_unlimited = TRUE OR sp.latest_stock > 0)
+        AND sp.is_available = TRUE
+      GROUP BY COALESCE(po.category_id, 'cat_ai-tools')
+    `);
+
+    const counts: Record<string, number> = {};
+    let totalActive = 0;
+    for (const r of res.rows) {
+      const n = parseInt(r.cnt || '0', 10);
+      counts[r.categoryId] = n;
+      totalActive += n;
+    }
+
+    const payload = { counts, totalActive };
+    await redis.set(this.categoryCountsCacheKey, JSON.stringify(payload), 60).catch(() => {});
+    return payload;
+  }
   /**
    * Calculate effective retail price following strict 5-tier precedence.
    */
@@ -163,7 +274,7 @@ export class PricingService {
       VALUES ($1, $2, 'SET_FIXED_PRICE', 'product', $3, $4)
     `, [`log_${Date.now()}`, adminId, productId, JSON.stringify({ price: priceDec.toFixed(4) })]);
 
-    await redis.del(`price:${productId}`);
+    await this.invalidateCatalogCaches(productId);
     logger.info('Admin updated fixed retail price', { productId, price: priceDec.toFixed(4), adminId });
   }
 
@@ -187,7 +298,7 @@ export class PricingService {
       VALUES ($1, $2, 'SET_FIXED_MARKUP', 'product', $3, $4)
     `, [`log_${Date.now()}`, adminId, productId, JSON.stringify({ markup: markupDec.toFixed(4) })]);
 
-    await redis.del(`price:${productId}`);
+    await this.invalidateCatalogCaches(productId);
     logger.info('Admin updated fixed markup', { productId, markup: markupDec.toFixed(4), adminId });
   }
 
@@ -209,7 +320,7 @@ export class PricingService {
       VALUES ($1, $2, 'RESET_PRICING', 'product', $3, '{}')
     `, [`log_${Date.now()}`, adminId, productId]);
 
-    await redis.del(`price:${productId}`);
+    await this.invalidateCatalogCaches(productId);
     logger.info('Admin reset product pricing to default', { productId, adminId });
   }
 
@@ -323,7 +434,7 @@ export class PricingService {
     const countRes = await db.queryRow<{ count: string }>(countSql, queryParams);
     const total = parseInt(countRes?.count || '0', 10);
 
-    // Items query
+    // Items query (single query includes pricing override columns — zero N+1 calculatePrice queries)
     const itemsSql = `
       SELECT sp.id, sp.supplier_product_id as "supplierProductId",
              sp.original_name as "originalName",
@@ -335,6 +446,9 @@ export class PricingService {
              sp.supplier_type as "supplierType",
              sp.duration, sp.warranty_summary as "warrantySummary",
              sp.is_available as "isAvailable",
+             po.fixed_retail_price as "fixedRetailPrice",
+             po.fixed_markup as "fixedMarkup",
+             po.percent_markup as "percentMarkup",
              po.display_name_override as "displayNameOverride",
              po.description_override as "descriptionOverride",
              po.is_hidden as "isHidden",
@@ -349,12 +463,20 @@ export class PricingService {
     `;
     queryParams.push(pageSize, offset);
 
-    const rowsRes = await db.query<any>(itemsSql, queryParams);
-    const items: ProductCatalogItem[] = [];
+    const [rowsRes, globalSettings] = await Promise.all([
+      db.query<any>(itemsSql, queryParams),
+      this.getGlobalPricingSettings(),
+    ]);
 
-    for (const r of rowsRes.rows) {
-      const priceCalc = await this.calculatePrice(r.id);
-      items.push({
+    const items: ProductCatalogItem[] = rowsRes.rows.map(r => {
+      const priceCalc = this.resolvePriceSync(
+        r.latestCost,
+        r.fixedRetailPrice,
+        r.fixedMarkup,
+        r.percentMarkup,
+        globalSettings
+      );
+      return {
         id: r.id,
         supplierProductId: r.supplierProductId,
         name: r.displayNameOverride || r.originalName,
@@ -377,8 +499,8 @@ export class PricingService {
         isAvailable: Boolean(r.isAvailable),
         isFeatured: Boolean(r.isFeatured),
         isHidden: Boolean(r.isHidden),
-      });
-    }
+      };
+    });
 
     return { items, total };
   }

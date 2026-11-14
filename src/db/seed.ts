@@ -1,4 +1,5 @@
 import { db } from './index.js';
+import { config } from '../config/env.js';
 import { createLogger } from '../services/logger.js';
 
 const logger = createLogger('Seed');
@@ -95,7 +96,16 @@ export async function seedInitialData(): Promise<void> {
     }
   }
 
-  // 3. Seed Default System Settings
+  // 3. Seed Primary Supplier Control Record (never deletable from UI)
+  await db.query(`
+    INSERT INTO suppliers (
+      id, name, base_url, is_enabled, routing_enabled, ordering_enabled, sync_enabled,
+      created_at, updated_at
+    ) VALUES ($1, $2, $3, TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ON CONFLICT (id) DO NOTHING
+  `, ['aitoolshop', 'AiToolShop Reseller', config.supplier.baseUrl]);
+
+  // 4. Seed Default System Settings
   const defaultSettings = [
     {
       key: 'pricing_global_rules',
@@ -110,6 +120,37 @@ export async function seedInitialData(): Promise<void> {
       value: {
         rewardPercentage: '0.05',      // 5% reward on first qualifying order
         minQualifyingOrderUsdt: '1.00',
+        rewardsEnabled: true,
+      }
+    },
+    {
+      key: 'required_channels_config',
+      value: {
+        verificationEnabled: false,
+        cacheTtlSeconds: 180,
+      }
+    },
+    {
+      key: 'giveaway_config',
+      value: {
+        enabled: true,
+        defaultClaimLimit: 100,
+        notifyAdminOnClaim: true,
+      }
+    },
+    {
+      key: 'maintenance_config',
+      value: {
+        enabled: false,
+        message: '⚠️ *MAINTENANCE IN PROGRESS*\n\nXERO KHAN is undergoing a brief scheduled upgrade. Please check back in a few minutes.',
+      }
+    },
+    {
+      key: 'banner_images',
+      value: {
+        welcomeBannerUrl: '',
+        shopBannerUrl: '',
+        supportBannerUrl: '',
       }
     },
     {

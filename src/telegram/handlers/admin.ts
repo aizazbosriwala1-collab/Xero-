@@ -3,11 +3,17 @@ import { redis } from '../../services/redis.js';
 import { config, getSanitizedConfig } from '../../config/env.js';
 import {
   supplierService,
+  SupplierControlFlag,
   SupplierReadOnlyDiagnosticResult,
   maskSupplierRef,
 } from '../../services/supplier.js';
 import { pricingService } from '../../services/pricing.js';
 import { orderService } from '../../services/order.js';
+import { giveawayService } from '../../services/giveaway.js';
+import { referralService } from '../../services/referral.js';
+import { channelService } from '../../services/channel.js';
+import { settingsService } from '../../services/settings.js';
+import { launchAuditService } from '../../services/audit.js';
 import { manualPaymentService } from '../../services/manualPayment.js';
 import {
   binanceService,
@@ -611,46 +617,921 @@ export class AdminHandler {
       return;
     }
 
-    // Giveaways Overview & Toggle
-    if (data === 'adm:gw' || data.startsWith('adm:gw_tog:')) {
+    // =========================================================================
+    // GIVEAWAYS SYSTEM MANAGEMENT (BUILDER / EDITOR / FILTERED VIEWS)
+    // =========================================================================
+    if (
+      data === 'adm:gw' ||
+      data === 'adm:gw_act' ||
+      data === 'adm:gw_fin' ||
+      data.startsWith('adm:gw_tog:') ||
+      data.startsWith('adm:gw_vis:')
+    ) {
+      let filter: 'active' | 'finished' | 'all' = 'all';
+      if (data === 'adm:gw_act') filter = 'active';
+      if (data === 'adm:gw_fin') filter = 'finished';
+
       if (data.startsWith('adm:gw_tog:')) {
-        const gwId = data.split(':')[2];
-        await db.query('UPDATE giveaways SET is_active = NOT is_active, updated_at = CURRENT_TIMESTAMP WHERE id = $1', [gwId]);
+        const gwId = data.slice('adm:gw_tog:'.length);
+        const curr = await giveawayService.getGiveawayById(gwId);
+        if (curr) {
+          await giveawayService.setGiveawayActive(gwId, !curr.isActive, userId);
+          await this.renderAdminGiveawayDetail(chatId, messageId, gwId, !curr.isActive ? '✅ Giveaway enabled.' : '⏸️ Giveaway disabled.');
+          return;
+        }
       }
 
-      const gws = await db.query<any>(
-        `SELECT id, title, required_qualified_referrals as req, is_active as active, claims_count as claims, claim_limit as lim
-         FROM giveaways ORDER BY created_at DESC LIMIT 8`
-      );
-      let text = `🎁 *DYNAMIC GIVEAWAYS MANAGEMENT*\n\n`;
-      const rows: any[][] = [];
-      if (gws.rows.length === 0) {
-        text += `_No giveaways configured yet._`;
+      if (data.startsWith('adm:gw_vis:')) {
+        const gwId = data.slice('adm:gw_vis:'.length);
+        const curr = await giveawayService.getGiveawayById(gwId);
+        if (curr) {
+          await giveawayService.updateGiveaway(gwId, { isPublic: !curr.isPublic }, userId);
+          await this.renderAdminGiveawayDetail(chatId, messageId, gwId, !curr.isPublic ? '👁️ Visibility set to PUBLIC.' : '🙈 Visibility set to PRIVATE.');
+          return;
+        }
+      }
+
+      const gws = await giveawayService.listAdminGiveaways(filter);
+      const headerLabel =
+        filter === 'active' ? 'ACTIVE GIVEAWAYS' : filter === 'finished' ? 'FINISHED GIVEAWAYS' : 'GIVEAWAYS CONTROL CENTER';
+      let text = `🎁 *${headerLabel}*\n\n`;
+      const rows: any[][] = [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Create Giveaway', fallbackEmoji: '➕', style: 'success', callbackData: 'adm:gw_new', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Active', fallbackEmoji: '🟢', style: filter === 'active' ? 'primary' : 'default', callbackData: 'adm:gw_act', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Finished', fallbackEmoji: '🏁', style: filter === 'finished' ? 'primary' : 'default', callbackData: 'adm:gw_fin', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'All', fallbackEmoji: '📋', style: filter === 'all' ? 'primary' : 'default', callbackData: 'adm:gw', forceVisible: true }),
+        ]),
+      ];
+
+      if (gws.length === 0) {
+        text += `_No ${filter === 'all' ? '' : `${filter} `}giveaways found._\n`;
       } else {
-        for (const g of gws.rows) {
-          const icon = g.active ? '🟢' : '⏸️';
-          text += `${icon} *${g.title}* — Req: ${g.req} | Claims: ${g.claims}/${g.lim}\n`;
+        for (const g of gws.slice(0, 10)) {
+          const icon = g.isActive ? '✅' : '⚠️';
+          text += `${icon} *${this.escapeDiagMarkdown(g.title)}*\n   Reward: ${this.escapeDiagMarkdown(g.rewardProductName)} x${g.rewardQuantity} | Req: ${g.requiredQualifiedReferrals}Q/${g.requiredTotalReferrals}T | Claims: ${g.claimsCount}/${g.claimLimit}\n`;
           rows.push(
             ButtonBuilder.buildActionRow([
               ButtonBuilder.buildButton({
-                text: `${icon} Toggle: ${g.title.slice(0, 22)}`,
-                style: g.active ? 'success' : 'default',
-                callbackData: `adm:gw_tog:${g.id}`,
+                text: `${g.isActive ? '✅' : '⏸️'} ${g.title.slice(0, 28)}`,
+                style: g.isActive ? 'primary' : 'default',
+                callbackData: `adm:gw_v:${g.id}`,
+                forceVisible: true,
               }),
             ])
           );
         }
       }
+
       rows.push(
         ButtonBuilder.buildActionRow([
-          ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main' }),
+          ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
         ])
       );
       await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
       return;
     }
 
-    // Trigger Supplier Catalogue Sync
+    if (data === 'adm:gw_new' || data === 'adm:gw_draft_vis' || data === 'adm:gw_draft_act') {
+      const draftKey = `gw_draft:${userId}`;
+      const existingRaw = data === 'adm:gw_new' ? null : await redis.get(draftKey).catch(() => null);
+      const draft = existingRaw
+        ? JSON.parse(existingRaw)
+        : {
+            title: '',
+            description: '',
+            rewardProductId: '',
+            rewardProductName: '',
+            rewardQuantity: 1,
+            requiredTotalReferrals: 0,
+            requiredQualifiedReferrals: 3,
+            claimLimit: 50,
+            startAt: null,
+            endAt: null,
+            isActive: true,
+            isPublic: true,
+          };
+
+      if (data === 'adm:gw_draft_vis') draft.isPublic = !draft.isPublic;
+      if (data === 'adm:gw_draft_act') draft.isActive = !draft.isActive;
+      await redis.set(draftKey, JSON.stringify(draft), 1800);
+      await this.renderAdminGiveawayDraft(chatId, messageId, draft);
+      return;
+    }
+
+    if (data === 'adm:gw_draft_save') {
+      const raw = await redis.get(`gw_draft:${userId}`).catch(() => null);
+      if (!raw) {
+        await telegramClient.editMessageText(chatId, messageId, '⚠️ Draft expired. Please start again.', {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Create Giveaway', fallbackEmoji: '➕', style: 'primary', callbackData: 'adm:gw_new' }),
+                ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:gw' }),
+              ]),
+            ],
+          },
+        });
+        return;
+      }
+
+      const draft = JSON.parse(raw);
+      try {
+        const newId = await giveawayService.createGiveaway(draft, userId);
+        await redis.del(`gw_draft:${userId}`).catch(() => {});
+        await this.renderAdminGiveawayDetail(chatId, messageId, newId, '✅ Giveaway created & saved to database!');
+      } catch (err: any) {
+        await this.renderAdminGiveawayDraft(chatId, messageId, draft, `⚠️ ${err.message}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:gw_v:') || data.startsWith('adm:gw_ed:')) {
+      const gwId = data.startsWith('adm:gw_v:') ? data.slice('adm:gw_v:'.length) : data.slice('adm:gw_ed:'.length);
+      await this.renderAdminGiveawayDetail(chatId, messageId, gwId);
+      return;
+    }
+
+    if (data.startsWith('adm:gw_del:')) {
+      const gwId = data.slice('adm:gw_del:'.length);
+      const gw = await giveawayService.getGiveawayById(gwId);
+      if (!gw) return;
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `⚠️ *CONFIRM DELETE GIVEAWAY*\n\nDelete *${this.escapeDiagMarkdown(gw.title)}* and all claim records?\nThis cannot be undone.`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'YES, DELETE', fallbackEmoji: '🗑️', style: 'danger', callbackData: `adm:gw_delc:${gwId}`, forceVisible: true }),
+                ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'default', callbackData: `adm:gw_v:${gwId}`, forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:gw_delc:')) {
+      const gwId = data.slice('adm:gw_delc:'.length);
+      await giveawayService.deleteGiveaway(gwId, userId);
+      await telegramClient.editMessageText(chatId, messageId, '✅ Giveaway deleted cleanly.', {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Back to Giveaways', fallbackEmoji: '🎁', style: 'primary', callbackData: 'adm:gw', forceVisible: true }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    if (data.startsWith('adm:gw_prod:')) {
+      const rest = data.slice('adm:gw_prod:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const targetId = lastColon > 0 ? rest.slice(0, lastColon) : 'draft';
+      const page = Math.max(1, parseInt(lastColon > 0 ? rest.slice(lastColon + 1) : '1', 10));
+      await redis.set(`gw_pick_target:${userId}`, targetId, 900);
+
+      const catalog = await pricingService.getCatalog({ page, pageSize: 6, includeHidden: true });
+      const totalPages = Math.max(1, Math.ceil(catalog.total / 6));
+      const rows: any[][] = [];
+      for (const item of catalog.items) {
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: `${item.name.slice(0, 28)} (${item.sellingPrice} USDT)`,
+              style: 'default',
+              callbackData: `adm:gws:${item.id}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+      if (totalPages > 1) {
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({ text: '⬅️ Prev', style: 'primary', callbackData: page > 1 ? `adm:gw_prod:${targetId}:${page - 1}` : 'noop', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: `${page}/${totalPages}`, style: 'default', callbackData: 'noop', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: 'Next ➡️', style: 'primary', callbackData: page < totalPages ? `adm:gw_prod:${targetId}:${page + 1}` : 'noop', forceVisible: true }),
+          ])
+        );
+      }
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'Back',
+            fallbackEmoji: '⬅️',
+            style: 'default',
+            callbackData: targetId === 'draft' ? 'adm:gw_draft_vis' : `adm:gw_v:${targetId}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `🛍️ *SELECT REWARD PRODUCT (FROM DATABASE)*\n\nTotal synced products: \`${catalog.total}\` (Page ${page}/${totalPages}):`,
+        { reply_markup: { inline_keyboard: rows } }
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:gws:')) {
+      const prodId = data.slice('adm:gws:'.length);
+      const targetId = (await redis.get(`gw_pick_target:${userId}`).catch(() => null)) || 'draft';
+      const prod = await db.queryRow<any>('SELECT id, original_name FROM supplier_products WHERE id = $1', [prodId]);
+      if (!prod) return;
+
+      if (targetId === 'draft') {
+        const raw = await redis.get(`gw_draft:${userId}`).catch(() => null);
+        const draft = raw ? JSON.parse(raw) : { rewardQuantity: 1, requiredTotalReferrals: 0, requiredQualifiedReferrals: 3, claimLimit: 50, isActive: true, isPublic: true };
+        draft.rewardProductId = prod.id;
+        draft.rewardProductName = prod.original_name;
+        await redis.set(`gw_draft:${userId}`, JSON.stringify(draft), 1800);
+        await this.renderAdminGiveawayDraft(chatId, messageId, draft, `✅ Reward product set: *${this.escapeDiagMarkdown(prod.original_name)}*`);
+      } else {
+        await giveawayService.updateGiveaway(targetId, { rewardProductId: prod.id }, userId);
+        await this.renderAdminGiveawayDetail(chatId, messageId, targetId, `✅ Reward product updated to *${this.escapeDiagMarkdown(prod.original_name)}*`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:gw_f:')) {
+      const rest = data.slice('adm:gw_f:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const targetId = rest.slice(0, lastColon);
+      const field = rest.slice(lastColon + 1);
+
+      const prompts: Record<string, string> = {
+        title: 'Enter *Giveaway Name*:',
+        desc: 'Enter *Description* (or send `clear`):',
+        qty: 'Enter *Reward Quantity* (integer >= 1):',
+        reqq: 'Enter *Required Qualified Referrals* (integer >= 0):',
+        reqt: 'Enter *Required Total Referrals* (integer >= 0):',
+        lim: 'Enter *Maximum Winners* (`claimLimit`, integer >= 1):',
+        start: 'Enter *Start Time* in ISO UTC (e.g. `2026-11-20T00:00:00Z`) or `clear`:',
+        end: 'Enter *End Time* in ISO UTC (e.g. `2026-12-01T23:59:59Z`) or `clear`:',
+      };
+      await redis.setFsmState(userId, {
+        step: 'ADMIN_GW_EDIT_VALUE',
+        data: { targetId, field },
+      });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `✏️ *EDIT GIVEAWAY FIELD*\n\n${prompts[field] || 'Enter new value:'}`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({
+                  text: 'Cancel',
+                  fallbackEmoji: '❌',
+                  style: 'danger',
+                  callbackData: targetId === 'draft' ? 'adm:gw_draft_vis' : `adm:gw_v:${targetId}`,
+                  forceVisible: true,
+                }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    // =========================================================================
+    // REFERRAL REWARDS & RULES MANAGEMENT (ZERO HARDCODED TIERS)
+    // =========================================================================
+    if (data === 'adm:ref') {
+      await this.renderAdminReferralsHub(chatId, messageId);
+      return;
+    }
+
+    if (data === 'adm:ref_set' || data.startsWith('adm:set_ref_t:') || data.startsWith('adm:ref_st:')) {
+      if (data.startsWith('adm:set_ref_t:')) {
+        const curr = await referralService.getSettings();
+        await referralService.updateSettings({ rewardsEnabled: !curr.rewardsEnabled }, userId);
+      }
+      if (data.startsWith('adm:ref_st:')) {
+        const field = data.slice('adm:ref_st:'.length);
+        await redis.setFsmState(userId, { step: 'ADMIN_REF_SETTINGS_VALUE', data: { field } });
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          field === 'min'
+            ? '✏️ Enter *Minimum Qualifying Order Amount (USDT)* (e.g. `1.00`):'
+            : '✏️ Enter *Referral Reward Percentage* (decimal, e.g. `0.05` = 5%):',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'adm:ref_set', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      const settings = await referralService.getSettings();
+      const text =
+        `⚙️ *REFERRAL THRESHOLD & REWARD RULES*\n\n` +
+        `• Rewards Active: ${settings.rewardsEnabled ? '✅ ENABLED' : '❌ PAUSED'}\n` +
+        `• Min Qualifying COMPLETED Order: \`${settings.minQualifyingOrderUsdt} USDT\`\n` +
+        `• Reward Percentage: \`${settings.rewardPercentage}\`\n\n` +
+        `ℹ️ *Fixed Core Policy:* _Referral join gives ZERO reward. Qualification triggers ONLY on a COMPLETED order._`;
+
+      await telegramClient.editMessageText(chatId, messageId, text, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: settings.rewardsEnabled ? 'Pause Rewards' : 'Enable Rewards',
+                fallbackEmoji: settings.rewardsEnabled ? '⏸️' : '✅',
+                style: settings.rewardsEnabled ? 'danger' : 'success',
+                callbackData: 'adm:set_ref_t:tog',
+                forceVisible: true,
+              }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Edit Min Order USDT', fallbackEmoji: '💲', style: 'primary', callbackData: 'adm:ref_st:min', forceVisible: true }),
+              ButtonBuilder.buildButton({ text: 'Edit Reward %', fallbackEmoji: '📈', style: 'primary', callbackData: 'adm:ref_st:pct', forceVisible: true }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Back to Referrals', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ref', forceVisible: true }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    if (data === 'adm:ref_new' || data === 'adm:ref_draft_type') {
+      const draftKey = `ref_draft:${userId}`;
+      const existingRaw = data === 'adm:ref_new' ? null : await redis.get(draftKey).catch(() => null);
+      const draft = existingRaw
+        ? JSON.parse(existingRaw)
+        : {
+            title: '',
+            description: '',
+            requiredQualifiedReferrals: 3,
+            rewardType: 'WALLET_USDT',
+            rewardAmount: '1.00',
+            rewardProductId: null,
+            rewardProductName: null,
+            rewardQuantity: 1,
+            isActive: true,
+          };
+      if (data === 'adm:ref_draft_type') {
+        draft.rewardType = draft.rewardType === 'WALLET_USDT' ? 'PRODUCT' : 'WALLET_USDT';
+      }
+      await redis.set(draftKey, JSON.stringify(draft), 1800);
+      await this.renderAdminReferralDraft(chatId, messageId, draft);
+      return;
+    }
+
+    if (data === 'adm:ref_draft_save') {
+      const raw = await redis.get(`ref_draft:${userId}`).catch(() => null);
+      if (!raw) {
+        await this.renderAdminReferralsHub(chatId, messageId, '⚠️ Draft expired. Please start again.');
+        return;
+      }
+      const draft = JSON.parse(raw);
+      try {
+        const tierId = await referralService.createRewardTier(draft, userId);
+        await redis.del(`ref_draft:${userId}`).catch(() => {});
+        await this.renderAdminReferralTierDetail(chatId, messageId, tierId, '✅ Milestone tier created!');
+      } catch (err: any) {
+        await this.renderAdminReferralDraft(chatId, messageId, draft, `⚠️ ${err.message}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:ref_v:') || data.startsWith('adm:ref_ed:')) {
+      const tierId = data.startsWith('adm:ref_v:') ? data.slice('adm:ref_v:'.length) : data.slice('adm:ref_ed:'.length);
+      await this.renderAdminReferralTierDetail(chatId, messageId, tierId);
+      return;
+    }
+
+    if (data.startsWith('adm:ref_tog:')) {
+      const tierId = data.slice('adm:ref_tog:'.length);
+      const tier = await referralService.getRewardTierById(tierId);
+      if (tier) {
+        await referralService.updateRewardTier(tierId, { isActive: !tier.isActive }, userId);
+        await this.renderAdminReferralTierDetail(chatId, messageId, tierId, !tier.isActive ? '✅ Tier enabled.' : '⏸️ Tier disabled.');
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:ref_del:')) {
+      const tierId = data.slice('adm:ref_del:'.length);
+      await referralService.deleteRewardTier(tierId, userId);
+      await this.renderAdminReferralsHub(chatId, messageId, '✅ Referral milestone tier deleted.');
+      return;
+    }
+
+    if (data.startsWith('adm:ref_prod:')) {
+      const rest = data.slice('adm:ref_prod:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const targetId = lastColon > 0 ? rest.slice(0, lastColon) : 'draft';
+      const page = Math.max(1, parseInt(lastColon > 0 ? rest.slice(lastColon + 1) : '1', 10));
+      await redis.set(`ref_pick_target:${userId}`, targetId, 900);
+
+      const catalog = await pricingService.getCatalog({ page, pageSize: 6, includeHidden: true });
+      const totalPages = Math.max(1, Math.ceil(catalog.total / 6));
+      const rows: any[][] = [];
+      for (const item of catalog.items) {
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: `${item.name.slice(0, 28)} (${item.sellingPrice} USDT)`,
+              style: 'default',
+              callbackData: `adm:rfs:${item.id}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+      if (totalPages > 1) {
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({ text: '⬅️ Prev', style: 'primary', callbackData: page > 1 ? `adm:ref_prod:${targetId}:${page - 1}` : 'noop', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: `${page}/${totalPages}`, style: 'default', callbackData: 'noop', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: 'Next ➡️', style: 'primary', callbackData: page < totalPages ? `adm:ref_prod:${targetId}:${page + 1}` : 'noop', forceVisible: true }),
+          ])
+        );
+      }
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'Back',
+            fallbackEmoji: '⬅️',
+            style: 'default',
+            callbackData: targetId === 'draft' ? 'adm:ref_draft_type' : `adm:ref_v:${targetId}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `🛍️ *SELECT REFERRAL REWARD PRODUCT*\n\nTotal products: \`${catalog.total}\` (Page ${page}/${totalPages}):`,
+        { reply_markup: { inline_keyboard: rows } }
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:rfs:')) {
+      const prodId = data.slice('adm:rfs:'.length);
+      const targetId = (await redis.get(`ref_pick_target:${userId}`).catch(() => null)) || 'draft';
+      const prod = await db.queryRow<any>('SELECT id, original_name FROM supplier_products WHERE id = $1', [prodId]);
+      if (!prod) return;
+
+      if (targetId === 'draft') {
+        const raw = await redis.get(`ref_draft:${userId}`).catch(() => null);
+        const draft = raw ? JSON.parse(raw) : { requiredQualifiedReferrals: 3, rewardType: 'PRODUCT', rewardQuantity: 1, isActive: true };
+        draft.rewardType = 'PRODUCT';
+        draft.rewardProductId = prod.id;
+        draft.rewardProductName = prod.original_name;
+        await redis.set(`ref_draft:${userId}`, JSON.stringify(draft), 1800);
+        await this.renderAdminReferralDraft(chatId, messageId, draft, `✅ Product selected: *${this.escapeDiagMarkdown(prod.original_name)}*`);
+      } else {
+        await referralService.updateRewardTier(targetId, { rewardType: 'PRODUCT', rewardProductId: prod.id }, userId);
+        await this.renderAdminReferralTierDetail(chatId, messageId, targetId, `✅ Reward product updated to *${this.escapeDiagMarkdown(prod.original_name)}*`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:ref_f:')) {
+      const rest = data.slice('adm:ref_f:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const targetId = rest.slice(0, lastColon);
+      const field = rest.slice(lastColon + 1);
+      const prompts: Record<string, string> = {
+        title: 'Enter *Milestone Tier Title*:',
+        req: 'Enter *Required Qualified Referrals* (integer >= 1):',
+        amt: 'Enter *Wallet Reward USDT Amount* (e.g. `2.50`):',
+        qty: 'Enter *Product Reward Quantity* (integer >= 1):',
+      };
+      await redis.setFsmState(userId, { step: 'ADMIN_REF_EDIT_VALUE', data: { targetId, field } });
+      await telegramClient.editMessageText(chatId, messageId, `✏️ *EDIT REFERRAL TIER*\n\n${prompts[field] || 'Enter new value:'}`, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'Cancel',
+                fallbackEmoji: '❌',
+                style: 'danger',
+                callbackData: targetId === 'draft' ? 'adm:ref_draft_type' : `adm:ref_v:${targetId}`,
+                forceVisible: true,
+              }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    // =========================================================================
+    // REQUIRED CHANNELS MANAGEMENT
+    // =========================================================================
+    if (data === 'adm:ch' || data === 'adm:ch_tog' || data === 'adm:ch_test' || data.startsWith('adm:ch_rem:') || data.startsWith('adm:ch_up:') || data.startsWith('adm:ch_dn:')) {
+      let notice: string | undefined;
+
+      if (data === 'adm:ch_tog') {
+        const curr = await channelService.getConfig();
+        const next = await channelService.setVerificationEnabled(!curr.verificationEnabled, userId);
+        notice = next.verificationEnabled
+          ? '✅ Channel membership verification ENABLED.'
+          : '❌ Channel membership verification DISABLED.';
+      } else if (data.startsWith('adm:ch_rem:')) {
+        const chId = data.slice('adm:ch_rem:'.length);
+        await channelService.removeChannel(chId, userId);
+        notice = '🗑️ Channel removed.';
+      } else if (data.startsWith('adm:ch_up:')) {
+        await channelService.moveChannel(data.slice('adm:ch_up:'.length), 'up', userId);
+        notice = '⬆️ Moved channel up.';
+      } else if (data.startsWith('adm:ch_dn:')) {
+        await channelService.moveChannel(data.slice('adm:ch_dn:'.length), 'down', userId);
+        notice = '⬇️ Moved channel down.';
+      } else if (data === 'adm:ch_test') {
+        const res = await channelService.checkUserMembership(userId, { forceRefresh: true });
+        if (res.details.length === 0) {
+          notice = 'ℹ️ No active required channels configured to test.';
+        } else {
+          notice =
+            '🧪 *Membership Probe Results (Your Admin Account):*\n' +
+            res.details
+              .map(d => `• ${d.joined ? '✅' : '❌'} *${this.escapeDiagMarkdown(d.channel.title)}* (\`${d.memberStatus}\`)`)
+              .join('\n');
+        }
+      }
+
+      await this.renderAdminChannelsHub(chatId, messageId, notice);
+      return;
+    }
+
+    if (data === 'adm:ch_add') {
+      await redis.setFsmState(userId, { step: 'ADMIN_CH_ADD_INPUT' });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `📢 *ADD REQUIRED CHANNEL*\n\n` +
+          `Send the channel details in one line:\n` +
+          `• Public channel: \`@ChannelUsername\` or \`@ChannelUsername | Display Title\`\n` +
+          `• Private channel: \`-1001234567890 | Display Title | https://t.me/+InviteCode\``,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'adm:ch', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    // =========================================================================
+    // SUPPLIER CONTROL CENTER (NO DELETE CAPABILITY)
+    // =========================================================================
+    if (data === 'adm:sup' || data.startsWith('adm:sup_v:') || data.startsWith('adm:sup_bal:') || data.startsWith('adm:sup_ord:') || data.startsWith('adm:sup_sync:') || data.startsWith('adm:sup_tog:')) {
+      if (data === 'adm:sup') {
+        await this.renderAdminSuppliersHub(chatId, messageId);
+        return;
+      }
+
+      if (data.startsWith('adm:sup_v:')) {
+        const supId = data.slice('adm:sup_v:'.length);
+        await this.renderAdminSupplierDetail(chatId, messageId, supId);
+        return;
+      }
+
+      if (data.startsWith('adm:sup_bal:')) {
+        const supId = data.slice('adm:sup_bal:'.length);
+        const bal = await supplierService.getBalance();
+        const notice = bal
+          ? `✅ Live Supplier Balance: \`${bal.balanceUsdt.toFixed(4)} ${bal.currency}\``
+          : '⚠️ Unable to fetch live supplier balance right now.';
+        await this.renderAdminSupplierDetail(chatId, messageId, supId, notice);
+        return;
+      }
+
+      if (data.startsWith('adm:sup_ord:')) {
+        const supId = data.slice('adm:sup_ord:'.length);
+        const list = await supplierService.listOrdersReadOnly();
+        let notice = list.ok
+          ? `📦 *Recent Supplier Orders (${list.orders.length}):*\n` +
+            list.orders
+              .slice(0, 5)
+              .map(o => `• \`${maskSupplierRef(o.order_ref || o.id)}\` — *${o.status || 'UNKNOWN'}*`)
+              .join('\n')
+          : `⚠️ GET /orders failed: ${this.escapeDiagMarkdown(list.error || 'ERROR')}`;
+        if (list.ok && list.orders.length === 0) notice = 'ℹ️ No orders returned by supplier GET /orders.';
+        await this.renderAdminSupplierDetail(chatId, messageId, supId, notice);
+        return;
+      }
+
+      if (data.startsWith('adm:sup_sync:')) {
+        const supId = data.slice('adm:sup_sync:'.length);
+        try {
+          const syncRes = await supplierService.syncCatalogue();
+          await this.renderAdminSupplierDetail(
+            chatId,
+            messageId,
+            supId,
+            `✅ Sync complete: ${syncRes.importedCount} new, ${syncRes.updatedCount} updated (${syncRes.totalCount} total).`
+          );
+        } catch (err: any) {
+          await this.renderAdminSupplierDetail(chatId, messageId, supId, `❌ Sync failed: ${this.escapeDiagMarkdown(err.message)}`);
+        }
+        return;
+      }
+
+      if (data.startsWith('adm:sup_tog:')) {
+        const [, , shortFlag, supId = 'aitoolshop'] = data.split(':');
+        const map: Record<string, SupplierControlFlag> = {
+          en: 'is_enabled',
+          rt: 'routing_enabled',
+          or: 'ordering_enabled',
+          sy: 'sync_enabled',
+        };
+        const field = map[shortFlag];
+        if (!field) return;
+        const curr = await supplierService.getSupplierControl(supId);
+        const currentVal =
+          field === 'is_enabled'
+            ? curr.isEnabled
+            : field === 'routing_enabled'
+            ? curr.routingEnabled
+            : field === 'ordering_enabled'
+            ? curr.orderingEnabled
+            : curr.syncEnabled;
+        await supplierService.setSupplierFlag(supId, field, !currentVal, userId);
+        await this.renderAdminSupplierDetail(chatId, messageId, supId, `✅ Updated \`${field}\` → *${!currentVal ? 'ON' : 'OFF'}*`);
+        return;
+      }
+    }
+
+    // =========================================================================
+    // SETTINGS CENTER (NO-REDEPLOY CONFIGURATION)
+    // =========================================================================
+    if (
+      data === 'adm:set' ||
+      data === 'adm:set_maint' ||
+      data === 'adm:set_gw' ||
+      data === 'adm:set_ban' ||
+      data.startsWith('adm:set_gw_t:') ||
+      data.startsWith('adm:set_e:') ||
+      data.startsWith('adm:ban_e:') ||
+      data.startsWith('adm:ban_clr:')
+    ) {
+      if (data === 'adm:set_maint') {
+        const curr = await settingsService.getMaintenanceConfig();
+        const next = await settingsService.updateMaintenanceConfig({ enabled: !curr.enabled }, userId);
+        await this.renderAdminSettingsCenter(
+          chatId,
+          messageId,
+          next.enabled ? '⚠️ Maintenance Mode ENABLED (customers paused).' : '✅ Maintenance Mode DISABLED (shop live).'
+        );
+        return;
+      }
+
+      if (data === 'adm:set_gw' || data.startsWith('adm:set_gw_t:')) {
+        if (data === 'adm:set_gw_t:en') {
+          const curr = await giveawayService.getSettings();
+          await giveawayService.updateSettings({ enabled: !curr.enabled }, userId);
+        } else if (data === 'adm:set_gw_t:not') {
+          const curr = await giveawayService.getSettings();
+          await giveawayService.updateSettings({ notifyAdminOnClaim: !curr.notifyAdminOnClaim }, userId);
+        }
+        const gs = await giveawayService.getSettings();
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `🎁 *GIVEAWAY GLOBAL SETTINGS*\n\n` +
+            `• Giveaways System: ${gs.enabled ? '✅ ENABLED' : '❌ PAUSED'}\n` +
+            `• Admin Notifications on Claim: ${gs.notifyAdminOnClaim ? '✅ ON' : '❌ OFF'}\n` +
+            `• Default Claim Limit: \`${gs.defaultClaimLimit}\``,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: gs.enabled ? 'Pause Giveaways' : 'Enable Giveaways', style: gs.enabled ? 'danger' : 'success', callbackData: 'adm:set_gw_t:en', forceVisible: true }),
+                  ButtonBuilder.buildButton({ text: gs.notifyAdminOnClaim ? 'Notify: ON' : 'Notify: OFF', style: 'primary', callbackData: 'adm:set_gw_t:not', forceVisible: true }),
+                ]),
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Edit Default Limit', fallbackEmoji: '✏️', style: 'primary', callbackData: 'adm:set_e:gw_lim', forceVisible: true }),
+                  ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:set', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      if (data === 'adm:set_ban' || data.startsWith('adm:ban_clr:')) {
+        if (data.startsWith('adm:ban_clr:')) {
+          const slot = data.slice('adm:ban_clr:'.length);
+          const patch: any = {};
+          if (slot === 'welcome') patch.welcomeBannerUrl = '';
+          if (slot === 'shop') patch.shopBannerUrl = '';
+          if (slot === 'support') patch.supportBannerUrl = '';
+          await settingsService.updateBannerImages(patch, userId);
+        }
+        const ban = await settingsService.getBannerImages();
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `🖼️ *BANNER IMAGES SETTINGS*\n\n` +
+            `• Welcome Banner: ${ban.welcomeBannerUrl ? `✅ Configured` : '_None_'}\n` +
+            `• Shop Banner: ${ban.shopBannerUrl ? `✅ Configured` : '_None_'}\n` +
+            `• Support Banner: ${ban.supportBannerUrl ? `✅ Configured` : '_None_'}\n\n` +
+            `_Send an https:// image URL or Telegram file_id to set a banner, or clear it below._`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Set Welcome Banner', style: 'primary', callbackData: 'adm:ban_e:welcome', forceVisible: true }),
+                  ButtonBuilder.buildButton({ text: 'Clear', style: 'danger', callbackData: 'adm:ban_clr:welcome', forceVisible: true }),
+                ]),
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Set Shop Banner', style: 'primary', callbackData: 'adm:ban_e:shop', forceVisible: true }),
+                  ButtonBuilder.buildButton({ text: 'Clear', style: 'danger', callbackData: 'adm:ban_clr:shop', forceVisible: true }),
+                ]),
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Set Support Banner', style: 'primary', callbackData: 'adm:ban_e:support', forceVisible: true }),
+                  ButtonBuilder.buildButton({ text: 'Clear', style: 'danger', callbackData: 'adm:ban_clr:support', forceVisible: true }),
+                ]),
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Back to Settings', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:set', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      if (data.startsWith('adm:ban_e:')) {
+        const slot = data.slice('adm:ban_e:'.length);
+        await redis.setFsmState(userId, { step: 'ADMIN_SETTINGS_VALUE', data: { kind: `banner_${slot}` } });
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `🖼️ Send an \`https://\` image URL (or Telegram photo \`file_id\`, or \`clear\`) for the *${slot.toUpperCase()}* banner:`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'adm:set_ban', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      if (data.startsWith('adm:set_e:')) {
+        const kind = data.slice('adm:set_e:'.length);
+        const labelMap: Record<string, string> = {
+          welcome: 'Welcome Message (supports `{brand}`)',
+          support: 'Support Prompt Message',
+          maint_msg: 'Maintenance Notice Message',
+          gw_lim: 'Default Giveaway Claim Limit (integer >= 1)',
+        };
+        await redis.setFsmState(userId, { step: 'ADMIN_SETTINGS_VALUE', data: { kind } });
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `✏️ *EDIT SETTING*\n\nSend the new value for *${labelMap[kind] || kind}*:`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'adm:set', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      await this.renderAdminSettingsCenter(chatId, messageId);
+      return;
+    }
+
+    // =========================================================================
+    // DIAGNOSTICS HUB, LAUNCH READINESS AUDIT & PERFORMANCE AUDIT
+    // =========================================================================
+    if (data === 'adm:diag') {
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `🔬 *DIAGNOSTICS & RELEASE AUDIT HUB*\n\nSelect a strictly read-only diagnostic or automated audit:`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Launch Readiness Audit', fallbackEmoji: '🚀', style: 'success', callbackData: 'adm:audit', forceVisible: true }),
+              ]),
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Performance Audit', fallbackEmoji: '⚡', style: 'primary', callbackData: 'adm:perf', forceVisible: true }),
+                ButtonBuilder.buildButton({ text: 'System Health', fallbackEmoji: '🩺', style: 'default', callbackData: 'adm:hlth', forceVisible: true }),
+              ]),
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Supplier Read-Only Diag', fallbackEmoji: '🏭', style: 'primary', callbackData: 'adm:sup_diag', forceVisible: true }),
+              ]),
+              ...(config.binance.diagnosticEnabled
+                ? [
+                    ButtonBuilder.buildActionRow([
+                      ButtonBuilder.buildButton({ text: 'Binance History Diag', fallbackEmoji: '🔬', style: 'primary', callbackData: 'adm:bin_diag', forceVisible: true }),
+                    ]),
+                  ]
+                : []),
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data === 'adm:audit' || data === 'adm:audit_net') {
+      const liveNetwork = data === 'adm:audit_net';
+      const report = await launchAuditService.runFullAudit(userId, { liveNetwork });
+      const overallBadge = report.overallStatus === 'PUBLIC LAUNCH READY' ? '✅ PUBLIC LAUNCH READY' : '❌ ISSUES FOUND';
+      let text =
+        `🚀 *XERO KHAN LAUNCH READINESS AUDIT*\n\n` +
+        `• Verdict: *${overallBadge}*\n` +
+        `• Passed: \`${report.passCount}/10\` | Warnings: \`${report.warnCount}\` | Failures: \`${report.failCount}\`\n` +
+        `• Duration: \`${report.durationMs}ms\`\n\n`;
+
+      for (const c of report.checks) {
+        const icon = c.status === 'PASS' ? '✅' : c.status === 'WARN' ? '⚠️' : '❌';
+        text += `${icon} *${c.area}*\n   ${this.escapeDiagMarkdown(c.summary)}\n`;
+      }
+
+      await telegramClient.editMessageText(chatId, messageId, text, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Re-Run Audit', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:audit', forceVisible: true }),
+              ButtonBuilder.buildButton({ text: '+ Live Supplier Check', fallbackEmoji: '🌐', style: 'primary', callbackData: 'adm:audit_net', forceVisible: true }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Performance Audit', fallbackEmoji: '⚡', style: 'default', callbackData: 'adm:perf', forceVisible: true }),
+              ButtonBuilder.buildButton({ text: 'ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    if (data === 'adm:perf') {
+      const perf = await launchAuditService.runPerformanceAudit();
+      let text =
+        `⚡ *PERFORMANCE & QUERY AUDIT*\n\n` +
+        `• N+1 Query Guard: ${perf.nPlusOneFree ? '✅ OPTIMIZED' : '⚠️ REVIEW NEEDED'}\n` +
+        `• Total Suite Latency: \`${perf.totalDurationMs}ms\`\n\n`;
+
+      for (const m of perf.metrics) {
+        const badge = m.status === 'FAST' ? '✅' : m.status === 'MODERATE' ? '⚠️' : '❌';
+        text += `${badge} *${m.label}:* \`${m.durationMs}ms\` (${m.status})\n`;
+      }
+      text += `\nℹ️ _${this.escapeDiagMarkdown(perf.summary)}_`;
+
+      await telegramClient.editMessageText(chatId, messageId, text, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Run Benchmark Again', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:perf', forceVisible: true }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Diagnostics Hub', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:diag', forceVisible: true }),
+              ButtonBuilder.buildButton({ text: 'ADMIN', fallbackEmoji: '👑', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    // Trigger Supplier Catalogue Sync (in-place fast update)
     if (data === 'adm:sync') {
       await telegramClient.editMessageText(
         chatId,
@@ -665,11 +1546,11 @@ export class AdminHandler {
           `• Stock/Cost Updated Products: *${syncResult.updatedCount}*\n` +
           `• Total Local Catalogue Products: *${syncResult.totalCount}*\n\n` +
           `_All admin pricing rules, display overrides and categories were preserved._`;
-        await telegramClient.sendMessage(chatId, text, {
+        await telegramClient.editMessageText(chatId, messageId, text, {
           reply_markup: getAdminMainMenuKeyboard(),
         });
       } catch (err: any) {
-        await telegramClient.sendMessage(chatId, `❌ *SYNC FAILED*\n\n${err.message}`, {
+        await telegramClient.editMessageText(chatId, messageId, `❌ *SYNC FAILED*\n\n${err.message}`, {
           reply_markup: getAdminMainMenuKeyboard(),
         });
       }
@@ -874,13 +1755,14 @@ export class AdminHandler {
       return;
     }
 
-    // Apply Fixed Markup
+    // Apply Fixed Markup (in-place update)
     if (data.startsWith('adm_set_fm:')) {
       const [, productId, markupStr] = data.split(':');
       await pricingService.setFixedMarkup(productId, markupStr, userId);
       const newPrice = await pricingService.calculatePrice(productId);
-      await telegramClient.sendMessage(
+      await telegramClient.editMessageText(
         chatId,
+        messageId,
         `✅ *PRICING UPDATED*\n\nFixed markup of \`+${markupStr} USDT\` saved. New retail price is \`${newPrice.customerUnitPrice.toFixed(2)} USDT\`.\nCustomer catalogue reflects this immediately without server restart.`,
         {
           reply_markup: {
@@ -895,11 +1777,11 @@ export class AdminHandler {
       return;
     }
 
-    // Reset Pricing
+    // Reset Pricing (in-place update)
     if (data.startsWith('adm_reset_pr:')) {
       const [, productId] = data.split(':');
       await pricingService.resetPricing(productId, userId);
-      await telegramClient.sendMessage(chatId, '✅ *PRICING RESET*\n\nProduct pricing reset to global default rule.', {
+      await telegramClient.editMessageText(chatId, messageId, '✅ *PRICING RESET*\n\nProduct pricing reset to global default rule.', {
         reply_markup: {
           inline_keyboard: [
             ButtonBuilder.buildActionRow([
@@ -1497,6 +2379,162 @@ export class AdminHandler {
       await this.executeAdminSupplierDiagnostic(chatId, userId, submittedRef || undefined);
       return;
     }
+
+    if (fsm.step === 'ADMIN_GW_EDIT_VALUE') {
+      const { targetId = 'draft', field } = fsm.data || {};
+      try {
+        const patch: any = {};
+        if (field === 'title') {
+          if (!text.trim()) throw new Error('Giveaway title cannot be empty.');
+          patch.title = text.trim();
+        } else if (field === 'desc') {
+          patch.description = text.trim().toLowerCase() === 'clear' ? '' : text.trim();
+        } else if (field === 'qty') {
+          const n = parseInt(text, 10);
+          if (!Number.isFinite(n) || n < 1) throw new Error('Quantity must be an integer >= 1.');
+          patch.rewardQuantity = n;
+        } else if (field === 'reqq') {
+          const n = parseInt(text, 10);
+          if (!Number.isFinite(n) || n < 0) throw new Error('Required qualified referrals must be >= 0.');
+          patch.requiredQualifiedReferrals = n;
+        } else if (field === 'reqt') {
+          const n = parseInt(text, 10);
+          if (!Number.isFinite(n) || n < 0) throw new Error('Required total referrals must be >= 0.');
+          patch.requiredTotalReferrals = n;
+        } else if (field === 'lim') {
+          const n = parseInt(text, 10);
+          if (!Number.isFinite(n) || n < 1) throw new Error('Maximum winners must be >= 1.');
+          patch.claimLimit = n;
+        } else if (field === 'start' || field === 'end') {
+          if (text.trim().toLowerCase() === 'clear') {
+            patch[field === 'start' ? 'startAt' : 'endAt'] = null;
+          } else {
+            const d = new Date(text.trim());
+            if (isNaN(d.getTime())) throw new Error('Invalid date/time. Use ISO format e.g. 2026-12-01T00:00:00Z');
+            patch[field === 'start' ? 'startAt' : 'endAt'] = d.toISOString();
+          }
+        }
+
+        await redis.clearFsmState(userId);
+        if (targetId === 'draft') {
+          const raw = await redis.get(`gw_draft:${userId}`).catch(() => null);
+          const draft = raw ? { ...JSON.parse(raw), ...patch } : patch;
+          await redis.set(`gw_draft:${userId}`, JSON.stringify(draft), 1800);
+          await this.renderAdminGiveawayDraft(chatId, undefined, draft, '✅ Field updated!');
+        } else {
+          await giveawayService.updateGiveaway(targetId, patch, userId);
+          await this.renderAdminGiveawayDetail(chatId, undefined, targetId, '✅ Giveaway updated live!');
+        }
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nPlease try again:`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_REF_EDIT_VALUE') {
+      const { targetId = 'draft', field } = fsm.data || {};
+      try {
+        const patch: any = {};
+        if (field === 'title') {
+          if (!text.trim()) throw new Error('Tier title cannot be empty.');
+          patch.title = text.trim();
+        } else if (field === 'req') {
+          const n = parseInt(text, 10);
+          if (!Number.isFinite(n) || n < 1) throw new Error('Required qualified referrals must be >= 1.');
+          patch.requiredQualifiedReferrals = n;
+        } else if (field === 'amt') {
+          const num = Number(text.trim());
+          if (!Number.isFinite(num) || num <= 0) throw new Error('Amount must be > 0.');
+          patch.rewardAmount = text.trim();
+        } else if (field === 'qty') {
+          const n = parseInt(text, 10);
+          if (!Number.isFinite(n) || n < 1) throw new Error('Quantity must be >= 1.');
+          patch.rewardQuantity = n;
+        }
+
+        await redis.clearFsmState(userId);
+        if (targetId === 'draft') {
+          const raw = await redis.get(`ref_draft:${userId}`).catch(() => null);
+          const draft = raw ? { ...JSON.parse(raw), ...patch } : patch;
+          await redis.set(`ref_draft:${userId}`, JSON.stringify(draft), 1800);
+          await this.renderAdminReferralDraft(chatId, undefined, draft, '✅ Tier field updated!');
+        } else {
+          await referralService.updateRewardTier(targetId, patch, userId);
+          await this.renderAdminReferralTierDetail(chatId, undefined, targetId, '✅ Referral tier updated!');
+        }
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nPlease try again:`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_REF_SETTINGS_VALUE') {
+      const { field } = fsm.data || {};
+      try {
+        const num = Number(text.trim());
+        if (!Number.isFinite(num) || num < 0) throw new Error('Enter a valid non-negative number.');
+        await referralService.updateSettings(
+          field === 'min' ? { minQualifyingOrderUsdt: text.trim() } : { rewardPercentage: text.trim() },
+          userId
+        );
+        await redis.clearFsmState(userId);
+        await telegramClient.sendMessage(chatId, '✅ Referral threshold rules updated!', {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Back to Referrals', fallbackEmoji: '👥', style: 'primary', callbackData: 'adm:ref' }),
+              ]),
+            ],
+          },
+        });
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ ${err.message}`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_CH_ADD_INPUT') {
+      try {
+        const parts = text.split('|').map(s => s.trim()).filter(Boolean);
+        const channelIdentifier = parts[0] || '';
+        const title = parts[1] || channelIdentifier;
+        const inviteUrl = parts[2];
+        await channelService.addChannel({ channelIdentifier, title, inviteUrl }, userId);
+        await redis.clearFsmState(userId);
+        await this.renderAdminChannelsHub(chatId, undefined, `✅ Added channel *${this.escapeDiagMarkdown(title)}*.`);
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nTry again (e.g. \`@MyChannel | My Channel\`):`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_SETTINGS_VALUE') {
+      const { kind } = fsm.data || {};
+      try {
+        if (kind === 'welcome') {
+          await uiConfigService.upsertSetting({ settingKey: 'msg.welcome', languageCode: 'en', textValue: text, adminId: userId });
+        } else if (kind === 'support') {
+          await uiConfigService.upsertSetting({ settingKey: 'msg.support_prompt', languageCode: 'en', textValue: text, adminId: userId });
+        } else if (kind === 'maint_msg') {
+          await settingsService.updateMaintenanceConfig({ message: text }, userId);
+        } else if (kind === 'gw_lim') {
+          const lim = parseInt(text, 10);
+          if (!Number.isFinite(lim) || lim < 1) throw new Error('Limit must be an integer >= 1.');
+          await giveawayService.updateSettings({ defaultClaimLimit: lim }, userId);
+        } else if (kind === 'banner_welcome') {
+          await settingsService.updateBannerImages({ welcomeBannerUrl: text }, userId);
+        } else if (kind === 'banner_shop') {
+          await settingsService.updateBannerImages({ shopBannerUrl: text }, userId);
+        } else if (kind === 'banner_support') {
+          await settingsService.updateBannerImages({ supportBannerUrl: text }, userId);
+        }
+        await redis.clearFsmState(userId);
+        await this.renderAdminSettingsCenter(chatId, undefined, '✅ Setting updated live without redeploy!');
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}`);
+      }
+      return;
+    }
   }
 
   private escapeDiagMarkdown(val: string): string {
@@ -1987,6 +3025,508 @@ export class AdminHandler {
         orderId,
         error: auditErr?.message,
       });
+    }
+  }
+
+  // ===========================================================================
+  // RENDER HELPERS FOR GIVEAWAYS, REFERRALS, CHANNELS, SUPPLIERS & SETTINGS
+  // ===========================================================================
+
+  private async renderAdminGiveawayDraft(
+    chatId: number,
+    messageId: number | undefined,
+    draft: any,
+    notice?: string
+  ): Promise<void> {
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `🎁 *CREATE NEW GIVEAWAY*\n\n` +
+      `• Name: *${this.escapeDiagMarkdown(draft.title || 'Not set')}*\n` +
+      `• Reward Product: *${this.escapeDiagMarkdown(draft.rewardProductName || 'Not selected')}*\n` +
+      `• Reward Qty: \`${draft.rewardQuantity || 1}\`\n` +
+      `• Req Qualified Referrals: \`${draft.requiredQualifiedReferrals ?? 3}\`\n` +
+      `• Req Total Referrals: \`${draft.requiredTotalReferrals ?? 0}\`\n` +
+      `• Max Winners: \`${draft.claimLimit || 50}\`\n` +
+      `• Start Time: \`${draft.startAt || 'Immediate'}\`\n` +
+      `• End Time: \`${draft.endAt || 'No expiry'}\`\n` +
+      `• Status: ${draft.isActive !== false ? '✅ Active' : '⏸️ Inactive'} | ${draft.isPublic !== false ? '👁️ Public' : '🙈 Private'}\n` +
+      (draft.description ? `• Description: _${this.escapeDiagMarkdown(draft.description)}_\n` : '');
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Set Name', fallbackEmoji: '✏️', style: 'primary', callbackData: 'adm:gw_f:draft:title', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Pick Product (DB)', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:gw_prod:draft:1', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Reward Qty', style: 'default', callbackData: 'adm:gw_f:draft:qty', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Req Qualified', style: 'default', callbackData: 'adm:gw_f:draft:reqq', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Req Total', style: 'default', callbackData: 'adm:gw_f:draft:reqt', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Max Winners', style: 'default', callbackData: 'adm:gw_f:draft:lim', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Start Time', style: 'default', callbackData: 'adm:gw_f:draft:start', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'End Time', style: 'default', callbackData: 'adm:gw_f:draft:end', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Description', style: 'default', callbackData: 'adm:gw_f:draft:desc', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: draft.isPublic !== false ? 'Public: YES' : 'Public: NO', style: 'default', callbackData: 'adm:gw_draft_vis', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: draft.isActive !== false ? 'Active: YES' : 'Active: NO', style: 'default', callbackData: 'adm:gw_draft_act', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'SAVE & PUBLISH GIVEAWAY', fallbackEmoji: '✅', style: 'success', callbackData: 'adm:gw_draft_save', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '⬅️', style: 'danger', callbackData: 'adm:gw', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminGiveawayDetail(
+    chatId: number,
+    messageId: number | undefined,
+    giveawayId: string,
+    notice?: string
+  ): Promise<void> {
+    const gw = await giveawayService.getGiveawayById(giveawayId);
+    if (!gw) {
+      const text = '⚠️ Giveaway not found.';
+      if (messageId) {
+        await telegramClient.editMessageText(chatId, messageId, text);
+      } else {
+        await telegramClient.sendMessage(chatId, text);
+      }
+      return;
+    }
+
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `🎁 *GIVEAWAY DETAILS & EDITOR*\n\n` +
+      `• Title: *${this.escapeDiagMarkdown(gw.title)}*\n` +
+      `• Reward Product: *${this.escapeDiagMarkdown(gw.rewardProductName)}* (\`${gw.rewardProductId || 'NONE'}\`)\n` +
+      `• Reward Qty: \`${gw.rewardQuantity}\`\n` +
+      `• Req Qualified Referrals: \`${gw.requiredQualifiedReferrals}\`\n` +
+      `• Req Total Referrals: \`${gw.requiredTotalReferrals}\`\n` +
+      `• Winners Claimed: \`${gw.claimsCount} / ${gw.claimLimit}\`\n` +
+      `• Start Time: \`${gw.startAt || 'Immediate'}\`\n` +
+      `• End Time: \`${gw.endAt || 'No expiry'}\`\n` +
+      `• Active: ${gw.isActive ? '✅ ACTIVE' : '⏸️ DISABLED'} | Visibility: ${gw.isPublic ? '👁️ PUBLIC' : '🙈 PRIVATE'}\n` +
+      (gw.description ? `• Description: _${this.escapeDiagMarkdown(gw.description)}_\n` : '');
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Edit Name', style: 'primary', callbackData: `adm:gw_f:${gw.id}:title`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Change Product', style: 'primary', callbackData: `adm:gw_prod:${gw.id}:1`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Edit Qty', style: 'default', callbackData: `adm:gw_f:${gw.id}:qty`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Req Qualified', style: 'default', callbackData: `adm:gw_f:${gw.id}:reqq`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Req Total', style: 'default', callbackData: `adm:gw_f:${gw.id}:reqt`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Max Winners', style: 'default', callbackData: `adm:gw_f:${gw.id}:lim`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Start Time', style: 'default', callbackData: `adm:gw_f:${gw.id}:start`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'End Time', style: 'default', callbackData: `adm:gw_f:${gw.id}:end`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Description', style: 'default', callbackData: `adm:gw_f:${gw.id}:desc`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: gw.isPublic ? 'Set Private' : 'Set Public', style: 'default', callbackData: `adm:gw_vis:${gw.id}`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: gw.isActive ? 'Disable Giveaway' : 'Enable Giveaway',
+            fallbackEmoji: gw.isActive ? '⏸️' : '✅',
+            style: gw.isActive ? 'danger' : 'success',
+            callbackData: `adm:gw_tog:${gw.id}`,
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: 'Delete Giveaway',
+            fallbackEmoji: '🗑️',
+            style: 'danger',
+            callbackData: `adm:gw_del:${gw.id}`,
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Back to Giveaways', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:gw', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminReferralsHub(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const [settings, tiers] = await Promise.all([
+      referralService.getSettings(),
+      referralService.listRewardTiers({ activeOnly: false }),
+    ]);
+
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `👥 *REFERRAL REWARDS CONTROL CENTER*\n\n` +
+      `• System Status: ${settings.rewardsEnabled ? '✅ ENABLED' : '❌ PAUSED'}\n` +
+      `• Min Qualifying Order: \`${settings.minQualifyingOrderUsdt} USDT\` (COMPLETED only)\n` +
+      `• Configured Tiers: \`${tiers.length}\`\n\n`;
+
+    const rows: any[][] = [
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Create Reward Tier', fallbackEmoji: '➕', style: 'success', callbackData: 'adm:ref_new', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Threshold Rules', fallbackEmoji: '⚙️', style: 'primary', callbackData: 'adm:ref_set', forceVisible: true }),
+      ]),
+    ];
+
+    if (tiers.length === 0) {
+      text += `_No referral reward tiers configured yet. Add one above._`;
+    } else {
+      for (const tier of tiers) {
+        const rewardLabel =
+          tier.rewardType === 'WALLET_USDT'
+            ? `${tier.rewardAmount} USDT`
+            : `${tier.rewardProductName || 'Product'} x${tier.rewardQuantity}`;
+        text += `${tier.isActive ? '✅' : '⏸️'} *${this.escapeDiagMarkdown(tier.title)}* — ${tier.requiredQualifiedReferrals} Qualified → ${this.escapeDiagMarkdown(rewardLabel)}\n`;
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: `${tier.isActive ? '✅' : '⏸️'} ${tier.title.slice(0, 26)}`,
+              style: tier.isActive ? 'primary' : 'default',
+              callbackData: `adm:ref_v:${tier.id}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+      ])
+    );
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: { inline_keyboard: rows } });
+    }
+  }
+
+  private async renderAdminReferralDraft(
+    chatId: number,
+    messageId: number | undefined,
+    draft: any,
+    notice?: string
+  ): Promise<void> {
+    const isWallet = draft.rewardType !== 'PRODUCT';
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `🎁 *CREATE REFERRAL REWARD TIER*\n\n` +
+      `• Title: *${this.escapeDiagMarkdown(draft.title || 'Not set')}*\n` +
+      `• Req Qualified Referrals: \`${draft.requiredQualifiedReferrals || 3}\`\n` +
+      `• Reward Type: *${isWallet ? 'WALLET_USDT' : 'PRODUCT'}*\n` +
+      (isWallet
+        ? `• Reward Amount: \`${draft.rewardAmount || '1.00'} USDT\`\n`
+        : `• Reward Product: *${this.escapeDiagMarkdown(draft.rewardProductName || 'Not selected')}* (x${draft.rewardQuantity || 1})\n`);
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Set Title', fallbackEmoji: '✏️', style: 'primary', callbackData: 'adm:ref_f:draft:title', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Req Qualified', style: 'primary', callbackData: 'adm:ref_f:draft:req', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: `Type: ${isWallet ? 'WALLET' : 'PRODUCT'}`, fallbackEmoji: '🔄', style: 'default', callbackData: 'adm:ref_draft_type', forceVisible: true }),
+          isWallet
+            ? ButtonBuilder.buildButton({ text: 'Set USDT Amount', fallbackEmoji: '💲', style: 'primary', callbackData: 'adm:ref_f:draft:amt', forceVisible: true })
+            : ButtonBuilder.buildButton({ text: 'Pick Product (DB)', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:ref_prod:draft:1', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'SAVE MILESTONE TIER', fallbackEmoji: '✅', style: 'success', callbackData: 'adm:ref_draft_save', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '⬅️', style: 'danger', callbackData: 'adm:ref', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminReferralTierDetail(
+    chatId: number,
+    messageId: number | undefined,
+    tierId: string,
+    notice?: string
+  ): Promise<void> {
+    const tier = await referralService.getRewardTierById(tierId);
+    if (!tier) {
+      await this.renderAdminReferralsHub(chatId, messageId, '⚠️ Tier not found.');
+      return;
+    }
+
+    const isWallet = tier.rewardType === 'WALLET_USDT';
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `🎁 *REFERRAL TIER EDITOR*\n\n` +
+      `• Title: *${this.escapeDiagMarkdown(tier.title)}*\n` +
+      `• Required Qualified Referrals: \`${tier.requiredQualifiedReferrals}\`\n` +
+      `• Reward Type: *${tier.rewardType}*\n` +
+      (isWallet
+        ? `• Wallet Credit: \`${tier.rewardAmount} USDT\`\n`
+        : `• Product: *${this.escapeDiagMarkdown(tier.rewardProductName || 'None')}* (x${tier.rewardQuantity})\n`) +
+      `• Status: ${tier.isActive ? '✅ ACTIVE' : '⏸️ DISABLED'}`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Edit Title', style: 'primary', callbackData: `adm:ref_f:${tier.id}:title`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Req Qualified', style: 'primary', callbackData: `adm:ref_f:${tier.id}:req`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          isWallet
+            ? ButtonBuilder.buildButton({ text: 'Edit USDT Amount', style: 'primary', callbackData: `adm:ref_f:${tier.id}:amt`, forceVisible: true })
+            : ButtonBuilder.buildButton({ text: 'Pick Product (DB)', style: 'primary', callbackData: `adm:ref_prod:${tier.id}:1`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Edit Qty', style: 'default', callbackData: `adm:ref_f:${tier.id}:qty`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: tier.isActive ? 'Disable Tier' : 'Enable Tier',
+            fallbackEmoji: tier.isActive ? '⏸️' : '✅',
+            style: tier.isActive ? 'danger' : 'success',
+            callbackData: `adm:ref_tog:${tier.id}`,
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({ text: 'Delete Tier', fallbackEmoji: '🗑️', style: 'danger', callbackData: `adm:ref_del:${tier.id}`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Back to Referrals', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ref', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminChannelsHub(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const [cfg, channels] = await Promise.all([
+      channelService.getConfig(),
+      channelService.listChannels(false),
+    ]);
+
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `📢 *REQUIRED CHANNELS MANAGER*\n\n` +
+      `• Verification Gate: ${cfg.verificationEnabled ? '✅ ENABLED' : '❌ DISABLED'}\n` +
+      `• Configured Channels: \`${channels.length}\`\n\n`;
+
+    const rows: any[][] = [
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Add Channel', fallbackEmoji: '➕', style: 'success', callbackData: 'adm:ch_add', forceVisible: true }),
+        ButtonBuilder.buildButton({
+          text: cfg.verificationEnabled ? 'Disable Verification' : 'Enable Verification',
+          fallbackEmoji: cfg.verificationEnabled ? '❌' : '✅',
+          style: cfg.verificationEnabled ? 'danger' : 'success',
+          callbackData: 'adm:ch_tog',
+          forceVisible: true,
+        }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Test Membership Check', fallbackEmoji: '🧪', style: 'primary', callbackData: 'adm:ch_test', forceVisible: true }),
+      ]),
+    ];
+
+    if (channels.length === 0) {
+      text += `_No required channels added yet._`;
+    } else {
+      channels.forEach((ch, idx) => {
+        text += `${idx + 1}. *${this.escapeDiagMarkdown(ch.title)}* (\`${this.escapeDiagMarkdown(ch.channelIdentifier)}\`)\n`;
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({ text: '⬆️', style: 'default', callbackData: `adm:ch_up:${ch.id}`, forceVisible: true }),
+            ButtonBuilder.buildButton({ text: '⬇️', style: 'default', callbackData: `adm:ch_dn:${ch.id}`, forceVisible: true }),
+            ButtonBuilder.buildButton({ text: `Remove ${ch.title.slice(0, 16)}`, fallbackEmoji: '🗑️', style: 'danger', callbackData: `adm:ch_rem:${ch.id}`, forceVisible: true }),
+          ])
+        );
+      });
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+      ])
+    );
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: { inline_keyboard: rows } });
+    }
+  }
+
+  private async renderAdminSuppliersHub(chatId: number, messageId: number | undefined): Promise<void> {
+    const suppliers = await supplierService.listSuppliers();
+    let text = `🏭 *SUPPLIER CONTROL CENTER*\n\n_Suppliers are managed safely via operational toggles (deletion is disabled to protect order history)._\n\n`;
+    const rows: any[][] = [];
+
+    for (const s of suppliers) {
+      const statusBadge = s.isEnabled ? '✅ ENABLED' : '❌ DISABLED';
+      text +=
+        `• *${this.escapeDiagMarkdown(s.name)}* (${statusBadge})\n` +
+        `  Routing: ${s.routingEnabled ? '✅' : '❌'} | Ordering: ${s.orderingEnabled ? '✅' : '❌'} | Sync: ${s.syncEnabled ? '✅' : '❌'}\n` +
+        (s.lastBalanceUsdt ? `  Last Balance: \`${s.lastBalanceUsdt} USDT\`\n` : '');
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: `Manage ${s.name}`,
+            fallbackEmoji: '🏭',
+            style: 'primary',
+            callbackData: `adm:sup_v:${s.id}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+      ])
+    );
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: { inline_keyboard: rows } });
+    }
+  }
+
+  private async renderAdminSupplierDetail(
+    chatId: number,
+    messageId: number | undefined,
+    supplierId: string,
+    notice?: string
+  ): Promise<void> {
+    const s = await supplierService.getSupplierControl(supplierId);
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `🏭 *SUPPLIER: ${this.escapeDiagMarkdown(s.name.toUpperCase())}*\n\n` +
+      `• Status: ${s.isEnabled ? '✅ Enabled' : '❌ Disabled'}\n` +
+      `• Routing: ${s.routingEnabled ? '✅ ON' : '❌ OFF'}\n` +
+      `• Ordering: ${s.orderingEnabled ? '✅ ON' : '❌ OFF'}\n` +
+      `• Catalogue Sync: ${s.syncEnabled ? '✅ ON' : '❌ OFF'}\n` +
+      `• Env Live Safety Gate: \`LIVE_ORDERING_ENABLED=${config.safety.liveOrderingEnabled}\`\n` +
+      `• Last Balance: \`${s.lastBalanceUsdt ? `${s.lastBalanceUsdt} USDT` : 'Not queried'}\`\n` +
+      `• Last Sync: \`${s.lastSyncAt || 'Not synced yet'}\``;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Check Balance', fallbackEmoji: '💰', style: 'primary', callbackData: `adm:sup_bal:${s.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Orders (Read-Only)', fallbackEmoji: '📦', style: 'primary', callbackData: `adm:sup_ord:${s.id}`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Sync Catalogue', fallbackEmoji: '🔄', style: 'primary', callbackData: `adm:sup_sync:${s.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Read-Only Diag', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:sup_diag', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: s.isEnabled ? 'Disable Supplier' : 'Enable Supplier', style: s.isEnabled ? 'danger' : 'success', callbackData: `adm:sup_tog:en:${s.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: s.routingEnabled ? 'Routing: ON' : 'Routing: OFF', style: s.routingEnabled ? 'success' : 'danger', callbackData: `adm:sup_tog:rt:${s.id}`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: s.orderingEnabled ? 'Ordering: ON' : 'Ordering: OFF', style: s.orderingEnabled ? 'success' : 'danger', callbackData: `adm:sup_tog:or:${s.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: s.syncEnabled ? 'Sync: ON' : 'Sync: OFF', style: s.syncEnabled ? 'success' : 'danger', callbackData: `adm:sup_tog:sy:${s.id}`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Back to Suppliers', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSettingsCenter(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const maint = await settingsService.getMaintenanceConfig();
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `⚙️ *XERO KHAN SETTINGS CENTER*\n\n` +
+      `Configure live messages, maintenance mode, banners, channels, giveaways & referrals without redeploying:\n\n` +
+      `• Maintenance Mode: ${maint.enabled ? '⚠️ ENABLED' : '✅ LIVE (OFF)'}`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Welcome Message', fallbackEmoji: '✏️', style: 'primary', callbackData: 'adm:set_e:welcome', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Support Message', fallbackEmoji: '🎧', style: 'primary', callbackData: 'adm:set_e:support', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: maint.enabled ? 'Disable Maintenance' : 'Enable Maintenance',
+            fallbackEmoji: '🚧',
+            style: maint.enabled ? 'success' : 'danger',
+            callbackData: 'adm:set_maint',
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({ text: 'Maintenance Msg', fallbackEmoji: '✏️', style: 'default', callbackData: 'adm:set_e:maint_msg', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Channel Settings', fallbackEmoji: '📢', style: 'default', callbackData: 'adm:ch', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Banner Images', fallbackEmoji: '🖼️', style: 'default', callbackData: 'adm:set_ban', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Giveaway Settings', fallbackEmoji: '🎁', style: 'default', callbackData: 'adm:set_gw', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Referral Settings', fallbackEmoji: '👥', style: 'default', callbackData: 'adm:ref_set', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'UI Labels & Buttons', fallbackEmoji: '🎨', style: 'primary', callbackData: 'adm:ui', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
     }
   }
 }

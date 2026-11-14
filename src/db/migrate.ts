@@ -12,6 +12,7 @@ const MIGRATIONS: Array<{ version: number; name: string; filename: string }> = [
   { version: 1, name: '001_initial_schema', filename: '001_initial_schema.sql' },
   { version: 2, name: '002_ui_customization', filename: '002_ui_customization.sql' },
   { version: 3, name: '003_binance_order_id', filename: '003_binance_order_id.sql' },
+  { version: 4, name: '004_public_release_polish', filename: '004_public_release_polish.sql' },
 ];
 
 function readMigrationSql(filename: string): string {
