@@ -1,6 +1,7 @@
 import Decimal from 'decimal.js';
 import { db } from '../db/index.js';
 import { redis } from './redis.js';
+import { menuCache } from '../telegram/menuCache.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('PricingService');
@@ -42,6 +43,7 @@ export interface ProductCatalogItem {
 export class PricingService {
   private readonly globalRuleCacheKey = 'pricing:global_rule';
   private readonly categoryCountsCacheKey = 'cat_counts';
+  private readonly catalogVersionKey = 'catalog:ver';
 
   private resolvePriceSync(
     latestCost: string | number | null | undefined,
@@ -95,6 +97,18 @@ export class PricingService {
     };
   }
 
+  private async getCatalogVersion(): Promise<string> {
+    try {
+      const v = await redis.get(this.catalogVersionKey);
+      if (v) return v;
+      const init = String(Date.now());
+      await redis.set(this.catalogVersionKey, init, 3600);
+      return init;
+    } catch {
+      return '1';
+    }
+  }
+
   private async getGlobalPricingSettings(): Promise<{ defaultPercentMarkup?: string; defaultFixedMarkup?: string }> {
     try {
       const cached = await redis.get(this.globalRuleCacheKey);
@@ -109,12 +123,52 @@ export class PricingService {
     return val;
   }
 
+  public async invalidateCategoryCache(): Promise<void> {
+    menuCache.invalidateAll();
+    await Promise.all([
+      redis.del('cat:list:vis').catch(() => {}),
+      redis.del('cat:list:all').catch(() => {}),
+      redis.del(this.categoryCountsCacheKey).catch(() => {}),
+    ]);
+  }
+
   public async invalidateCatalogCaches(productId?: string): Promise<void> {
+    menuCache.invalidateAll();
+    const nextVer = String(Date.now());
     await Promise.all([
       productId ? redis.del(`price:${productId}`).catch(() => {}) : Promise.resolve(),
       redis.del(this.globalRuleCacheKey).catch(() => {}),
       redis.del(this.categoryCountsCacheKey).catch(() => {}),
+      redis.del('cat:list:vis').catch(() => {}),
+      redis.del('cat:list:all').catch(() => {}),
+      redis.set(this.catalogVersionKey, nextVer, 3600).catch(() => {}),
     ]);
+  }
+
+  /**
+   * Cached product categories list (60s TTL in Redis)
+   */
+  public async getCategories(visibleOnly = true): Promise<Array<{ id: string; slug: string; name: string; isVisible: boolean }>> {
+    const cacheKey = visibleOnly ? 'cat:list:vis' : 'cat:list:all';
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {
+      // Cache miss
+    }
+
+    const where = visibleOnly ? 'WHERE is_visible = TRUE' : '';
+    const res = await db.query<any>(
+      `SELECT id, slug, name, is_visible as "isVisible" FROM product_categories ${where} ORDER BY display_order ASC`
+    );
+    const list = res.rows.map(r => ({
+      id: r.id,
+      slug: r.slug,
+      name: r.name,
+      isVisible: Boolean(r.isVisible),
+    }));
+    await redis.set(cacheKey, JSON.stringify(list), 60).catch(() => {});
+    return list;
   }
 
   /**
@@ -325,9 +379,18 @@ export class PricingService {
   }
 
   /**
-   * Fetch a single product with resolved retail pricing (avoids scanning the full catalogue on product clicks).
+   * Fetch a single product with resolved retail pricing (Redis-cached 45s to eliminate DB hits on product/qty clicks).
    */
   public async getCatalogItemById(productId: string): Promise<ProductCatalogItem | null> {
+    const ver = await this.getCatalogVersion();
+    const itemCacheKey = `catalog:item:v${ver}:${productId}`;
+    try {
+      const cached = await redis.get(itemCacheKey);
+      if (cached) return JSON.parse(cached) as ProductCatalogItem;
+    } catch {
+      // Cache miss
+    }
+
     const row = await db.queryRow<any>(
       `SELECT sp.id, sp.supplier_product_id as "supplierProductId",
               sp.original_name as "originalName",
@@ -353,7 +416,7 @@ export class PricingService {
     if (!row) return null;
 
     const priceCalc = await this.calculatePrice(row.id);
-    return {
+    const item: ProductCatalogItem = {
       id: row.id,
       supplierProductId: row.supplierProductId,
       name: row.displayNameOverride || row.originalName,
@@ -377,10 +440,12 @@ export class PricingService {
       isFeatured: Boolean(row.isFeatured),
       isHidden: Boolean(row.isHidden),
     };
+    await redis.set(itemCacheKey, JSON.stringify(item), 45).catch(() => {});
+    return item;
   }
 
   /**
-   * Get all active catalogue products for customer view (respecting filters, categories, search).
+   * Get all active catalogue products for customer view (Redis-cached for category & featured pages).
    */
   public async getCatalog(params: {
     categoryId?: string;
@@ -393,6 +458,19 @@ export class PricingService {
     const page = Math.max(1, params.page || 1);
     const pageSize = Math.min(250, Math.max(1, params.pageSize || 10));
     const offset = (page - 1) * pageSize;
+
+    const cacheable = !params.search && !params.includeHidden;
+    let catalogCacheKey = '';
+    if (cacheable) {
+      const ver = await this.getCatalogVersion();
+      catalogCacheKey = `catalog:p:v${ver}:${params.categoryId || 'all'}:${Boolean(params.featuredOnly)}:${page}:${pageSize}`;
+      try {
+        const cached = await redis.get(catalogCacheKey);
+        if (cached) return JSON.parse(cached) as { items: ProductCatalogItem[]; total: number };
+      } catch {
+        // Cache miss
+      }
+    }
 
     let whereClause = 'WHERE 1=1';
     const queryParams: any[] = [];
@@ -502,7 +580,11 @@ export class PricingService {
       };
     });
 
-    return { items, total };
+    const payload = { items, total };
+    if (cacheable && catalogCacheKey) {
+      await redis.set(catalogCacheKey, JSON.stringify(payload), 45).catch(() => {});
+    }
+    return payload;
   }
 }
 

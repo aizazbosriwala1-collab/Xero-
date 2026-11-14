@@ -45,6 +45,8 @@ import { supportService } from '../src/services/support.js';
 import { channelService } from '../src/services/channel.js';
 import { settingsService } from '../src/services/settings.js';
 import { launchAuditService } from '../src/services/audit.js';
+import { perfTracker } from '../src/services/perfTracker.js';
+import { menuCache } from '../src/telegram/menuCache.js';
 import {
   getCustomerMainReplyKeyboard,
   getCustomerMainInlineKeyboard,
@@ -56,8 +58,10 @@ import {
   getMoreDetailsKeyboard,
   getWalletKeyboard,
   getDepositMethodsKeyboard,
+  getSupportMenuKeyboard,
   getBinanceInvoiceKeyboard,
   getPaymentBeforeInvoiceKeyboard,
+  preloadCommonMenus,
   getLanguageKeyboard,
   getStaleMenuKeyboard,
   getAdminMainMenuKeyboard,
@@ -6402,6 +6406,348 @@ export async function runComprehensiveTests() {
       assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `Callback exceeds 64 bytes: ${cb}`);
       assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered route: ${cb}`);
     }
+  });
+
+  // =========================================================================
+  // 22. CONTRACT 10: PAYMENT UX & PERFORMANCE POLISH
+  // =========================================================================
+  currentCategory = 'Payment UX & Performance Polish';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 10.1: Simplified Easypaisa/JazzCash UX (PKR rate/min/max, Account Title/Number, Screenshot + Phone, zero TXID prompt, OCR caption suggest)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = 96001;
+    await ensureAuditUser(String(custId));
+    await db.query('UPDATE users SET username = $1 WHERE id = $2', ['ali_pkr', String(custId)]);
+
+    await manualPaymentService.updateDepositSettings(
+      { pkrPerUsd: '290', minPkr: '30', maxPkr: '6000', allowCustomCredit: true, autoSuggestCredit: true },
+      adminId
+    );
+    await db.query("UPDATE payment_methods SET is_enabled = TRUE WHERE code IN ('EASYPAISA', 'JAZZCASH')");
+    await redis.del('pm:list:all');
+    await redis.del('pm:list:active');
+
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9610 } };
+    });
+
+    try {
+      // 1. Tapping Easypaisa shows PKR details & asks for screenshot (NO USD or TXID requirement)
+      await telegramBotRouter.handleUpdate({
+        update_id: 960001,
+        callback_query: {
+          id: 'cb_ep_1',
+          from: { id: custId, is_bot: false, first_name: 'Ali', username: 'ali_pkr' },
+          data: 'dep_m:easypaisa',
+          message: { message_id: 9610, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Pay' },
+        },
+      });
+      const epMsg = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Easypaisa Deposit'));
+      assert.ok(epMsg, 'Must render Easypaisa Deposit screen');
+      const epText = String(epMsg!.body.text);
+      assert.ok(epText.includes('1 USD = 290 PKR'));
+      assert.ok(epText.includes('30 PKR'));
+      assert.ok(epText.includes('6000 PKR'));
+      assert.ok(epText.includes('Muhammad Abbas'));
+      assert.ok(epText.includes('03705851403'));
+      assert.ok(epText.includes('Payment Screenshot'));
+      assert.ok(epText.includes('Sender Phone Number'));
+      assert.ok(epText.includes('03001234567'));
+      assert.strictEqual(/TXID|reference number/i.test(epText), false, 'Must never ask customer for TXID or reference number');
+
+      // 2. Customer sends Screenshot with optional PKR caption "Paid Rs. 580" -> prompts for Sender Phone
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 960002,
+        message: {
+          message_id: 12,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'Ali', username: 'ali_pkr' },
+          date: Math.floor(Date.now() / 1000),
+          photo: [{ file_id: 'proof_photo_file_960', file_unique_id: 'uniq_960', width: 800, height: 1200 }],
+          caption: 'Paid Rs. 580 via Easypaisa',
+        },
+      });
+      assert.ok(
+        sent.some(m => m.method === 'sendMessage' && String(m.body.text).includes('Sender Phone Number')),
+        'Screenshot upload must transition cleanly to Sender Phone prompt'
+      );
+
+      // 3. Customer sends formatted phone number +92 300-1234567 -> normalized & saved without TXID
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 960003,
+        message: {
+          message_id: 13,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'Ali', username: 'ali_pkr' },
+          date: Math.floor(Date.now() / 1000),
+          text: '+92 300-1234567',
+        },
+      });
+      const conf = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('PAYMENT SUBMITTED'));
+      assert.ok(conf, 'Sending phone number must submit deposit for admin review');
+      assert.ok(String(conf!.body.text).includes('03001234567'));
+      assert.ok(String(conf!.body.text).includes('580.00 PKR'));
+      assert.ok(String(conf!.body.text).includes('$2.00 USD'));
+
+      // Verify JazzCash screen as well
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 960004,
+        callback_query: {
+          id: 'cb_jc_1',
+          from: { id: custId, is_bot: false, first_name: 'Ali', username: 'ali_pkr' },
+          data: 'dep_m:jazzcash',
+          message: { message_id: 9610, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Pay' },
+        },
+      });
+      assert.ok(sent.some(m => m.method === 'editMessageText' && String(m.body.text).includes('JazzCash Deposit')));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await redis.clearFsmState(String(custId));
+    }
+  });
+
+  await it('Contract 10.2: Admin Deposit Review (@username, sender phone, screenshot view, suggested USD, preset USD & Custom USD credit)', 'mock_integration', async () => {
+    const adminId = Number(config.telegram.adminIds[0]);
+    const custId = '96001';
+    const subNoPkr = await manualPaymentService.submitLocalDeposit({
+      userId: custId,
+      methodCode: 'EASYPAISA',
+      senderPhone: '03119998877',
+      proofFileId: 'proof_photo_962',
+    });
+
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9620 } };
+    });
+
+    try {
+      const aliDep = await db.queryRow<any>("SELECT id FROM deposits WHERE user_id = $1 AND status = 'PENDING_REVIEW' ORDER BY created_at ASC LIMIT 1", [custId]);
+      assert.ok(aliDep, 'Expected pending Ali deposit from Contract 10.1');
+
+      // 1. Open adm:dep (proves pending queue renders) and adm:dep_v:<aliDep.id>
+      await telegramBotRouter.handleUpdate({
+        update_id: 960100,
+        callback_query: {
+          id: 'cb_adm_dep_0',
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          data: 'adm:dep',
+          message: { message_id: 9620, chat: { id: adminId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+      assert.ok(sent.some(m => m.method === 'editMessageText' && String(m.body.text).includes('PENDING DEPOSIT REVIEW')));
+
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 960101,
+        callback_query: {
+          id: 'cb_adm_dep_1',
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          data: `adm:dep_v:${aliDep.id}`,
+          message: { message_id: 9620, chat: { id: adminId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+
+      const rev = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('PENDING DEPOSIT REVIEW'));
+      assert.ok(rev, 'Admin deposit review screen must render');
+      const revText = String(rev!.body.text);
+      assert.ok(revText.includes('@ali\\_pkr') || revText.includes('@ali_pkr'), 'Customer @username must be displayed');
+      assert.ok(revText.includes('Sender Number'));
+      assert.ok(revText.includes('Screenshot: ✅ Attached'));
+      assert.ok(revText.includes('580 PKR'));
+      assert.ok(revText.includes('$2.00 USD'));
+      assert.ok(revText.includes('Current Exchange Rate: `1 USD = 290 PKR`'));
+
+      const flatBtns = rev!.body.reply_markup.inline_keyboard.flat();
+      assert.ok(flatBtns.some((b: any) => String(b.text).includes('Accept Suggestion')));
+      for (const expectedText of ['0.10$', '0.25$', '0.50$', '1$', '2$', '5$']) {
+        assert.ok(flatBtns.some((b: any) => b.text === expectedText), `Missing quick preset button ${expectedText}`);
+      }
+      assert.ok(flatBtns.some((b: any) => String(b.text).includes('Custom USD')));
+      assert.ok(flatBtns.some((b: any) => String(b.text).includes('Reject')));
+      assert.ok(flatBtns.some((b: any) => String(b.text).includes('View Screenshot')));
+
+      // 2. Admin taps View Screenshot -> sends attached photo
+      const picBtn = flatBtns.find((b: any) => String(b.callback_data).startsWith('adm_dep_pic:'));
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 960102,
+        callback_query: {
+          id: 'cb_adm_pic',
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          data: picBtn.callback_data,
+          message: { message_id: 9620, chat: { id: adminId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Rev' },
+        },
+      });
+      assert.ok(sent.some(m => m.method === 'sendPhoto'), 'View Screenshot must send customer photo');
+
+      // 3. Admin approves with Preset 0.25$ on first deposit -> wallet credited atomically
+      const dep1Row = await db.queryRow<any>("SELECT id FROM deposits WHERE user_id = $1 AND status = 'PENDING_REVIEW' ORDER BY created_at ASC LIMIT 1", [custId]);
+      const beforeBal = (await walletService.getBalance(custId)).balance;
+
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 960103,
+        callback_query: {
+          id: 'cb_adm_025',
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          data: `adm_app_amt:${dep1Row.id}:0.25`,
+          message: { message_id: 9620, chat: { id: adminId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Rev' },
+        },
+      });
+      const afterPresetBal = (await walletService.getBalance(custId)).balance;
+      assert.strictEqual(afterPresetBal.minus(beforeBal).toFixed(2), '0.25');
+
+      // Double-approval of same deposit must be rejected safely with zero extra credit
+      await assert.rejects(() => manualPaymentService.approveDeposit(dep1Row.id, String(adminId), { customUsdAmount: '0.25' }), /status is VERIFIED/);
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(2), afterPresetBal.toFixed(2));
+
+      // 4. Admin opens Custom USD on subNoPkr and types 1.37 -> exact $1.37 credited
+      await telegramBotRouter.handleUpdate({
+        update_id: 960104,
+        callback_query: {
+          id: 'cb_adm_cust_prompt',
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          data: `adm_app_cust:${subNoPkr.depositId}`,
+          message: { message_id: 9620, chat: { id: adminId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Rev' },
+        },
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 960105,
+        message: {
+          message_id: 50,
+          chat: { id: adminId, type: 'private' },
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          date: Math.floor(Date.now() / 1000),
+          text: '1.37',
+        },
+      });
+      const afterCustomBal = (await walletService.getBalance(custId)).balance;
+      assert.strictEqual(afterCustomBal.minus(afterPresetBal).toFixed(2), '1.37');
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await redis.clearFsmState(String(adminId));
+    }
+  });
+
+  await it('Contract 10.3: Exchange Rate & Deposit Settings live update + allowCustomCredit gate + instant suggested USD recalculation', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '96002';
+    await ensureAuditUser(custId);
+
+    try {
+      await manualPaymentService.updateDepositSettings(
+        { pkrPerUsd: '300', minPkr: '50', maxPkr: '9000', allowCustomCredit: false, autoSuggestCredit: true },
+        adminId
+      );
+
+      const cfg = await manualPaymentService.getDepositSettings();
+      assert.strictEqual(cfg.pkrPerUsd, '300');
+      assert.strictEqual(cfg.minPkr, '50');
+      assert.strictEqual(cfg.maxPkr, '9000');
+      assert.strictEqual(cfg.allowCustomCredit, false);
+
+      // Submit deposit with 600 PKR -> at 300 PKR/USD = 2.00 USD suggested
+      const sub = await manualPaymentService.submitLocalDeposit({
+        userId: custId,
+        methodCode: 'JAZZCASH',
+        senderPhone: '03215554433',
+        proofFileId: 'proof_300rate',
+        ocrText: 'PKR 600 received',
+      });
+      assert.strictEqual(sub.submittedPkrAmount, '600.00');
+      assert.strictEqual(sub.suggestedUsdAmount, '2.00');
+
+      // Custom USD input blocked while allowCustomCredit=false
+      await assert.rejects(
+        () => manualPaymentService.approveDeposit(sub.depositId, adminId, { customUsdAmount: '2.50', isCustomInput: true }),
+        /disabled in Deposit Settings/i
+      );
+
+      // Clean up pending deposit via reject
+      await manualPaymentService.rejectDeposit(sub.depositId, adminId, 'Test cleanup');
+    } finally {
+      await manualPaymentService.updateDepositSettings(
+        { pkrPerUsd: '290', minPkr: '30', maxPkr: '6000', allowCustomCredit: true, autoSuggestCredit: true },
+        adminId
+      );
+    }
+  });
+
+  await it('Contract 10.4: PerfTracker (>500ms slow detection), Prebuilt MenuCache & Redis Cache Hits + All New Callbacks <= 64 Bytes', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    perfTracker.resetHistory();
+
+    // 1. Prebuild menus & verify cache hits
+    menuCache.invalidateAll();
+    const warmed = preloadCommonMenus();
+    assert.ok(warmed >= 10, 'preloadCommonMenus must warm all customer/admin/wallet/deposit/support menus');
+    const main1 = getCustomerMainInlineKeyboard(false, 'en');
+    const main2 = getCustomerMainInlineKeyboard(false, 'en');
+    assert.strictEqual(main1, main2, 'Main menu keyboard must be served from MenuCache');
+    assert.strictEqual(getWalletKeyboard('en'), getWalletKeyboard('en'));
+    assert.strictEqual(getDepositMethodsKeyboard('en'), getDepositMethodsKeyboard('en'));
+    assert.strictEqual(getSupportMenuKeyboard('en'), getSupportMenuKeyboard('en'));
+
+    // 2. PerfTracker captures DB queries inside callback context + flags >500ms slow callbacks
+    const { metrics } = await perfTracker.run('test:fast_cb', async () => {
+      await db.queryRow('SELECT 1 as ping');
+    });
+    assert.strictEqual(metrics.callbackName, 'test:fast_cb');
+    assert.ok(metrics.dbQueryCount >= 1, 'PerfTracker must record DB queries executed inside callback');
+    assert.strictEqual(metrics.slow, false);
+
+    const { metrics: slowMetrics } = await perfTracker.run('test:slow_cb', async () => {
+      await new Promise(resolve => setTimeout(resolve, 515));
+    });
+    assert.strictEqual(slowMetrics.slow, true, 'Callbacks >500ms must be flagged slow');
+
+    // 3. Redis cache hit check for categories & catalog (second call executes zero DB queries)
+    await pricingService.invalidateCategoryCache();
+    await pricingService.getCategories(true); // prime cache
+    const { metrics: cachedCatMetrics } = await perfTracker.run('test:cat_cached', async () => {
+      await pricingService.getCategories(true);
+      await pricingService.getCatalog({ page: 1, pageSize: 6 });
+    });
+    const { metrics: secondCatMetrics } = await perfTracker.run('test:cat_second', async () => {
+      await pricingService.getCategories(true);
+    });
+    assert.strictEqual(secondCatMetrics.dbQueryCount, 0, 'Cached getCategories must execute zero DB queries on Redis hit');
+    void cachedCatMetrics;
+
+    // 4. Performance Audit report includes callback telemetry & slow callback list
+    const perfAudit = await launchAuditService.runPerformanceAudit();
+    assert.ok(perfAudit.recentCallbacks.length >= 3);
+    assert.ok(perfAudit.slowCallbacks.some(s => s.callbackName === 'test:slow_cb'));
+    assert.ok(perfAudit.metrics.some(m => m.label.includes('Categories')));
+
+    // 5. Verify all new deposit/settings callback routes are registered & <= 64 bytes
+    const sampleDepId = 'dep_man_1760000000000_abc12';
+    const paymentRoutes = [
+      `adm:dep_v:${sampleDepId}`,
+      `adm_dep_pic:${sampleDepId}`,
+      `adm_app_amt:${sampleDepId}:0.25`,
+      `adm_app_amt:${sampleDepId}:5.00`,
+      `adm_app_cust:${sampleDepId}`,
+      'adm:dep_set',
+      'adm:dep_set_t:custom',
+      'adm:dep_set_t:suggest',
+      'adm:dep_set_e:rate',
+      'adm:dep_set_e:min',
+      'adm:dep_set_e:max',
+    ];
+    for (const cb of paymentRoutes) {
+      assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `Callback exceeds 64 bytes: ${cb}`);
+      assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered route: ${cb}`);
+    }
+    void adminId;
   });
 
   // SUMMARY & STATS DYNAMIC COMPUTATION

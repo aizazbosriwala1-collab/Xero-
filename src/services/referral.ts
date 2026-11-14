@@ -1,5 +1,6 @@
 import Decimal from 'decimal.js';
 import { db } from '../db/index.js';
+import { redis } from './redis.js';
 import { walletService } from './wallet.js';
 import { createLogger } from './logger.js';
 
@@ -160,14 +161,35 @@ export class ReferralService {
     };
   }
 
+  private readonly settingsCacheKey = 'sys:referral_rules';
+  private readonly tiersCacheActiveKey = 'ref:tiers:active';
+  private readonly tiersCacheAllKey = 'ref:tiers:all';
+
+  private async invalidateCaches(): Promise<void> {
+    await Promise.all([
+      redis.del(this.settingsCacheKey).catch(() => {}),
+      redis.del(this.tiersCacheActiveKey).catch(() => {}),
+      redis.del(this.tiersCacheAllKey).catch(() => {}),
+    ]);
+  }
+
   public async getSettings(): Promise<ReferralSettings> {
+    try {
+      const cached = await redis.get(this.settingsCacheKey);
+      if (cached) return JSON.parse(cached) as ReferralSettings;
+    } catch {
+      // Cache miss
+    }
+
     const row = await db.queryRow<any>("SELECT value FROM system_settings WHERE key = 'referral_rules'");
     const val = typeof row?.value === 'string' ? JSON.parse(row.value) : row?.value || {};
-    return {
+    const cfg: ReferralSettings = {
       minQualifyingOrderUsdt: String(val.minQualifyingOrderUsdt || '1.00'),
       rewardPercentage: String(val.rewardPercentage || '0.05'),
       rewardsEnabled: val.rewardsEnabled !== false,
     };
+    await redis.set(this.settingsCacheKey, JSON.stringify(cfg), 60).catch(() => {});
+    return cfg;
   }
 
   public async updateSettings(patch: Partial<ReferralSettings>, adminId: string): Promise<ReferralSettings> {
@@ -195,6 +217,7 @@ export class ReferralService {
        VALUES ($1, $2, 'UPDATE_REFERRAL_SETTINGS', 'system_settings', 'referral_rules', $3)`,
       [`log_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, adminId, JSON.stringify(next)]
     );
+    await this.invalidateCaches();
     return next;
   }
 
@@ -203,22 +226,36 @@ export class ReferralService {
   // =========================================================================
 
   public async listRewardTiers(options?: { activeOnly?: boolean; userId?: string }): Promise<ReferralRewardTier[]> {
-    const whereClause = options?.activeOnly ? 'WHERE rt.is_active = TRUE' : '';
-    const res = await db.query<any>(`
-      SELECT rt.id, rt.title, rt.description,
-             rt.required_qualified_referrals as "requiredQualifiedReferrals",
-             rt.reward_type as "rewardType",
-             rt.reward_product_id as "rewardProductId",
-             COALESCE(po.display_name_override, sp.original_name) as "rewardProductName",
-             rt.reward_amount as "rewardAmount",
-             rt.reward_quantity as "rewardQuantity",
-             rt.is_active as "isActive"
-      FROM referral_reward_tiers rt
-      LEFT JOIN supplier_products sp ON rt.reward_product_id = sp.id
-      LEFT JOIN product_overrides po ON rt.reward_product_id = po.product_id
-      ${whereClause}
-      ORDER BY rt.required_qualified_referrals ASC, rt.created_at ASC
-    `);
+    const activeOnly = Boolean(options?.activeOnly);
+    const cacheKey = activeOnly ? this.tiersCacheActiveKey : this.tiersCacheAllKey;
+    let rawRows: any[] | null = null;
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) rawRows = JSON.parse(cached);
+    } catch {
+      // Cache miss
+    }
+
+    if (!rawRows) {
+      const whereClause = activeOnly ? 'WHERE rt.is_active = TRUE' : '';
+      const res = await db.query<any>(`
+        SELECT rt.id, rt.title, rt.description,
+               rt.required_qualified_referrals as "requiredQualifiedReferrals",
+               rt.reward_type as "rewardType",
+               rt.reward_product_id as "rewardProductId",
+               COALESCE(po.display_name_override, sp.original_name) as "rewardProductName",
+               rt.reward_amount as "rewardAmount",
+               rt.reward_quantity as "rewardQuantity",
+               rt.is_active as "isActive"
+        FROM referral_reward_tiers rt
+        LEFT JOIN supplier_products sp ON rt.reward_product_id = sp.id
+        LEFT JOIN product_overrides po ON rt.reward_product_id = po.product_id
+        ${whereClause}
+        ORDER BY rt.required_qualified_referrals ASC, rt.created_at ASC
+      `);
+      rawRows = res.rows;
+      await redis.set(cacheKey, JSON.stringify(rawRows), 45).catch(() => {});
+    }
 
     let qualifiedCount = 0;
     const claimedSet = new Set<string>();
@@ -231,7 +268,7 @@ export class ReferralService {
       for (const c of claims.rows) claimedSet.add(c.tier_id);
     }
 
-    return res.rows.map(r => {
+    return rawRows.map(r => {
       const req = Number(r.requiredQualifiedReferrals || 0);
       const userClaimed = options?.userId ? claimedSet.has(r.id) : undefined;
       const userEligible = options?.userId ? qualifiedCount >= req && !userClaimed : undefined;
@@ -311,6 +348,7 @@ export class ReferralService {
       [`log_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, adminId, id, JSON.stringify(params)]
     );
 
+    await this.invalidateCaches();
     return id;
   }
 
@@ -365,6 +403,7 @@ export class ReferralService {
       [`log_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, adminId, tierId, JSON.stringify(patch)]
     );
 
+    await this.invalidateCaches();
     return (await this.getRewardTierById(tierId))!;
   }
 
@@ -387,6 +426,7 @@ export class ReferralService {
         JSON.stringify({ title: existing.title }),
       ]
     );
+    await this.invalidateCaches();
     return true;
   }
 

@@ -7,6 +7,10 @@ import { pricingService } from './pricing.js';
 import { encryptionService } from './encryption.js';
 import { channelService } from './channel.js';
 import { uiConfigService } from './uiConfig.js';
+import { manualPaymentService } from './manualPayment.js';
+import { giveawayService } from './giveaway.js';
+import { referralService } from './referral.js';
+import { perfTracker, CallbackPerfRecord } from './perfTracker.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('LaunchAuditService');
@@ -37,6 +41,8 @@ export interface PerformanceMetric {
 
 export interface PerformanceAuditReport {
   metrics: PerformanceMetric[];
+  recentCallbacks: CallbackPerfRecord[];
+  slowCallbacks: CallbackPerfRecord[];
   nPlusOneFree: boolean;
   totalDurationMs: number;
   summary: string;
@@ -359,21 +365,38 @@ export class LaunchAuditService {
     metrics.push({ label: 'Redis Set/Get Roundtrip', durationMs: redisMs, status: classify(redisMs) });
 
     const t3 = Date.now();
+    await pricingService.getCategories(true);
     await pricingService.getCategoryProductCounts();
     const catCountMs = Date.now() - t3;
-    metrics.push({ label: 'Category Counts (Batched/Cached)', durationMs: catCountMs, status: classify(catCountMs) });
+    metrics.push({ label: 'Categories + Counts (Redis Cached)', durationMs: catCountMs, status: classify(catCountMs) });
 
     const t4 = Date.now();
     await pricingService.getCatalog({ page: 1, pageSize: 10 });
+    await pricingService.getCatalog({ featuredOnly: true, page: 1, pageSize: 6 });
     const catalogMs = Date.now() - t4;
-    metrics.push({ label: 'Catalog Page (Single-Query Pricing)', durationMs: catalogMs, status: classify(catalogMs) });
+    metrics.push({ label: 'Catalog + Featured (Single-Query/Cached)', durationMs: catalogMs, status: classify(catalogMs) });
 
+    const t5 = Date.now();
+    await Promise.all([
+      manualPaymentService.getDepositSettings(),
+      giveawayService.getActiveGiveaways(),
+      referralService.listRewardTiers({ activeOnly: true }),
+      channelService.listChannels(true),
+    ]);
+    const promoMs = Date.now() - t5;
+    metrics.push({ label: 'Settings + Promos + Channels (Redis Cached)', durationMs: promoMs, status: classify(promoMs) });
+
+    const recentCallbacks = perfTracker.getRecentCallbacks(8);
+    const slowCallbacks = perfTracker.getSlowCallbacks(8);
     const totalDurationMs = Date.now() - overallStart;
     return {
       metrics,
+      recentCallbacks,
+      slowCallbacks,
       nPlusOneFree: true,
       totalDurationMs,
-      summary: `Total latency: ${totalDurationMs}ms | Single-query Catalog, Giveaways, Referrals & Order History enabled.`,
+      summary:
+        `Total latency: ${totalDurationMs}ms | Slow (>500ms) callbacks observed: ${slowCallbacks.length} | Redis + Prebuilt Menus active.`,
     };
   }
 }

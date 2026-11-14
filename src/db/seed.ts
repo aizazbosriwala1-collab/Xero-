@@ -154,6 +154,16 @@ export async function seedInitialData(): Promise<void> {
       }
     },
     {
+      key: 'deposit_settings',
+      value: {
+        pkrPerUsd: '290',
+        minPkr: '30',
+        maxPkr: '6000',
+        allowCustomCredit: true,
+        autoSuggestCredit: true,
+      },
+    },
+    {
       key: 'brand_info',
       value: {
         brandName: 'XERO KHAN',

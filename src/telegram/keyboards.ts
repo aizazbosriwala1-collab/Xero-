@@ -7,6 +7,7 @@ import { ButtonBuilder } from './buttonBuilder.js';
 import { SupportedLanguage, t } from '../services/i18n.js';
 import { uiConfigService, UISection, UISettingRecord } from '../services/uiConfig.js';
 import { config } from '../config/env.js';
+import { menuCache } from './menuCache.js';
 
 function filterNonEmptyRows(rows: TelegramInlineKeyboardButton[][]): TelegramInlineKeyboardButton[][] {
   return rows.filter(r => r.length > 0);
@@ -41,6 +42,10 @@ export function getCustomerMainInlineKeyboard(
   isAdmin = false,
   lang: SupportedLanguage = 'en'
 ): TelegramInlineKeyboardMarkup {
+  const cacheKey = `main_inline:${lang}:${isAdmin ? '1' : '0'}`;
+  const cached = menuCache.get(cacheKey);
+  if (cached) return cached;
+
   const rows: TelegramInlineKeyboardButton[][] = [
     ButtonBuilder.buildActionRow([
       ButtonBuilder.buildButton({ settingKey: 'btn.menu.products', lang, callbackData: 'm:prod' }),
@@ -73,7 +78,7 @@ export function getCustomerMainInlineKeyboard(
     );
   }
 
-  return { inline_keyboard: filterNonEmptyRows(rows) };
+  return menuCache.set(cacheKey, { inline_keyboard: filterNonEmptyRows(rows) });
 }
 
 /**
@@ -146,6 +151,17 @@ export function getCategoryKeyboard(
   catPage = 1,
   counts?: Record<string, number>
 ): TelegramInlineKeyboardMarkup {
+  const countSig = counts
+    ? Object.keys(counts)
+        .sort()
+        .map(k => `${k}:${counts[k]}`)
+        .join(',')
+    : '';
+  const catSig = categories.map(c => `${c.id}:${c.name}`).join('|');
+  const cacheKey = `shop_cat:${lang}:${catPage}:${catSig}:${countSig}`;
+  const cached = menuCache.get(cacheKey);
+  if (cached) return cached;
+
   const pageSize = 9;
   const totalPages = Math.max(1, Math.ceil(categories.length / pageSize));
   const safePage = Math.min(Math.max(1, catPage), totalPages);
@@ -216,7 +232,7 @@ export function getCategoryKeyboard(
     ])
   );
 
-  return { inline_keyboard: filterNonEmptyRows(rows) };
+  return menuCache.set(cacheKey, { inline_keyboard: filterNonEmptyRows(rows) });
 }
 
 /**
@@ -499,7 +515,11 @@ export function getProductCardKeyboard(
  * Wallet Screen Keyboard
  */
 export function getWalletKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
-  return {
+  const cacheKey = `wallet:${lang}`;
+  const cached = menuCache.get(cacheKey);
+  if (cached) return cached;
+
+  return menuCache.set(cacheKey, {
     inline_keyboard: filterNonEmptyRows([
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ settingKey: 'btn.wall.add_funds', lang, callbackData: 'm:dep', forceVisible: true }),
@@ -511,14 +531,18 @@ export function getWalletKeyboard(lang: SupportedLanguage = 'en'): TelegramInlin
         ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
       ]),
     ]),
-  };
+  });
 }
 
 /**
  * Payment Methods Keyboard
  */
 export function getDepositMethodsKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
-  return {
+  const cacheKey = `dep_methods:${lang}`;
+  const cached = menuCache.get(cacheKey);
+  if (cached) return cached;
+
+  return menuCache.set(cacheKey, {
     inline_keyboard: filterNonEmptyRows([
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ settingKey: 'btn.dep.binance', lang, callbackData: 'dep_m:binance' }),
@@ -531,7 +555,26 @@ export function getDepositMethodsKeyboard(lang: SupportedLanguage = 'en'): Teleg
       ]),
       ButtonBuilder.buildNavigationRow('m:wall', lang),
     ]),
-  };
+  });
+}
+
+/**
+ * Support Menu Keyboard (prebuilt & cached)
+ */
+export function getSupportMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
+  const cacheKey = `support:${lang}`;
+  const cached = menuCache.get(cacheKey);
+  if (cached) return cached;
+
+  return menuCache.set(cacheKey, {
+    inline_keyboard: filterNonEmptyRows([
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ settingKey: 'btn.wall.add_funds', lang, callbackData: 'm:dep', forceVisible: true }),
+        ButtonBuilder.buildButton({ settingKey: 'btn.menu.orders', lang, callbackData: 'm:ord', forceVisible: true }),
+      ]),
+      ButtonBuilder.buildNavigationRow('m:home', lang),
+    ]),
+  });
 }
 
 /**
@@ -646,7 +689,11 @@ export function getLanguageKeyboard(currentLang: SupportedLanguage = 'en'): Tele
  * Admin Main Menu Keyboard — Logically grouped for public release operations
  */
 export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
-  return {
+  const cacheKey = `admin_main:${lang}:${config.binance.diagnosticEnabled ? '1' : '0'}`;
+  const cached = menuCache.get(cacheKey);
+  if (cached) return cached;
+
+  return menuCache.set(cacheKey, {
     inline_keyboard: filterNonEmptyRows([
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ text: 'Dashboard', fallbackEmoji: '🏠', style: 'primary', callbackData: 'adm:dash', forceVisible: true }),
@@ -693,7 +740,23 @@ export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): Telegr
         ButtonBuilder.buildButton({ settingKey: 'btn.adm.exit', lang, callbackData: 'm:home', forceVisible: true }),
       ]),
     ]),
-  };
+  });
+}
+
+/**
+ * Prebuild and warm common menus in memory so initial navigation is instant.
+ */
+export function preloadCommonMenus(): number {
+  const langs: SupportedLanguage[] = ['en', 'ur', 'ur-ro'];
+  for (const lang of langs) {
+    getCustomerMainInlineKeyboard(false, lang);
+    getCustomerMainInlineKeyboard(true, lang);
+    getWalletKeyboard(lang);
+    getDepositMethodsKeyboard(lang);
+    getSupportMenuKeyboard(lang);
+    getAdminMainMenuKeyboard(lang);
+  }
+  return menuCache.size();
 }
 
 /**

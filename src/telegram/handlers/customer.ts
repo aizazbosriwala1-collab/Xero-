@@ -26,6 +26,7 @@ import {
   getMoreDetailsKeyboard,
   getWalletKeyboard,
   getDepositMethodsKeyboard,
+  getSupportMenuKeyboard,
   getBinanceInvoiceKeyboard,
   getPaymentBeforeInvoiceKeyboard,
   getLanguageKeyboard,
@@ -275,11 +276,11 @@ export class CustomerHandler {
       return;
     }
 
-    // Navigation: Categories Grid (with cached product counts)
+    // Navigation: Categories Grid (Redis cached categories & product counts)
     if (data === 'm:prod' || data.startsWith('catp:')) {
       const catPage = data.startsWith('catp:') ? Math.max(1, parseInt(data.split(':')[1] || '1', 10)) : 1;
       const [categories, catCounts] = await Promise.all([
-        db.query<any>('SELECT id, name FROM product_categories WHERE is_visible = TRUE ORDER BY display_order ASC'),
+        pricingService.getCategories(true),
         pricingService.getCategoryProductCounts(),
       ]);
       await navigationService.saveState(userId, { screen: 'categories', page: catPage });
@@ -292,7 +293,7 @@ export class CustomerHandler {
         messageId,
         userId,
         text,
-        getCategoryKeyboard(categories.rows, lang, catPage, catCounts.counts)
+        getCategoryKeyboard(categories, lang, catPage, catCounts.counts)
       );
       return;
     }
@@ -622,19 +623,39 @@ export class CustomerHandler {
       return;
     }
 
-    // Method: Easypaisa or JazzCash
+    // Method: Easypaisa or JazzCash (Simplified PKR UX: Screenshot + Sender Phone, NO TXID or USD prompt)
     if (data === 'dep_m:easypaisa' || data === 'dep_m:jazzcash') {
       const code = data === 'dep_m:easypaisa' ? 'EASYPAISA' : 'JAZZCASH';
-      const method = await manualPaymentService.getMethodByCode(code);
-      if (!method) return;
+      const [method, depCfg] = await Promise.all([
+        manualPaymentService.getMethodByCode(code),
+        manualPaymentService.getDepositSettings(),
+      ]);
+      if (!method || !method.isEnabled) {
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          `⚠️ *${code === 'EASYPAISA' ? 'Easypaisa' : 'JazzCash'}* is currently unavailable. Please choose another deposit method.`,
+          getBackHomeKeyboard('m:dep', lang)
+        );
+        return;
+      }
 
-      await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_AMOUNT', data: { methodCode: code } });
+      await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_PROOF', data: { methodCode: code } });
+      const title = code === 'EASYPAISA' ? 'Easypaisa Deposit' : 'JazzCash Deposit';
       const prompt =
-        `📱 *${method.name}*\n\n` +
-        `Account Title: \`${method.accountTitle}\`\n` +
-        `Account Number: \`${method.accountNumber}\`\n\n` +
-        `Instructions: ${method.instructions}\n\n` +
-        `Please enter the amount you wish to deposit in USDT equivalent (Min: ${method.minAmount}, Max: ${method.maxAmount}):`;
+        `💰 *${title}*\n\n` +
+        `*Exchange Rate:*\n\`1 USD = ${depCfg.pkrPerUsd} PKR\`\n\n` +
+        `*Minimum:*\n\`${depCfg.minPkr} PKR\`\n\n` +
+        `*Maximum:*\n\`${depCfg.maxPkr} PKR\`\n\n` +
+        `Send payment to:\n\n` +
+        `*Account Title:*\n\`${method.accountTitle}\`\n\n` +
+        `*Number:*\n\`${method.accountNumber}\`\n\n` +
+        `After payment send:\n\n` +
+        `✅ *Payment Screenshot*\n` +
+        `✅ *Sender Phone Number*\n\n` +
+        `Example:\n\`03001234567\`\n\n` +
+        `📸 Please upload your *Payment Screenshot* now:`;
 
       await this.renderMenu(chatId, messageId, userId, prompt, getBackHomeKeyboard('m:dep', lang));
       return;
@@ -866,7 +887,7 @@ export class CustomerHandler {
     if (data === 'm:supp') {
       await redis.setFsmState(userId, { step: 'AWAITING_SUPPORT_MESSAGE' });
       const text = uiConfigService.getText('msg.support_prompt', lang) || t('support_prompt', lang);
-      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
+      await this.renderMenu(chatId, messageId, userId, text, getSupportMenuKeyboard(lang));
       return;
     }
 
@@ -1082,7 +1103,53 @@ export class CustomerHandler {
       return;
     }
 
-    // FSM: Manual Payment Amount
+    // FSM: Simplified Local Payment Phone Number (No TXID required)
+    if (fsm.step === 'AWAITING_MANUAL_PHONE') {
+      const { methodCode, proofFileId, ocrText } = fsm.data || {};
+      if (!proofFileId) {
+        await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_PROOF', data: { methodCode } });
+        await telegramClient.sendMessage(
+          chatId,
+          '📸 Please upload your *Payment Screenshot* first before entering your phone number:',
+          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
+        );
+        return;
+      }
+
+      try {
+        const sub = await manualPaymentService.submitLocalDeposit({
+          userId,
+          methodCode,
+          senderPhone: text,
+          proofFileId,
+          ocrText,
+        });
+        await redis.clearFsmState(userId);
+
+        const confirmMsg =
+          `✅ *PAYMENT SUBMITTED FOR REVIEW*\n\n` +
+          `• Deposit ID: \`${sub.depositId}\`\n` +
+          `• Method: *${methodCode === 'EASYPAISA' ? 'Easypaisa' : 'JazzCash'}*\n` +
+          `• Screenshot: ✅ Attached\n` +
+          `• Sender Number: \`${sub.senderPhone}\`\n` +
+          (sub.submittedPkrAmount ? `• Detected Paid: \`${sub.submittedPkrAmount} PKR\`\n` : '') +
+          (sub.suggestedUsdAmount ? `• Estimated Credit: \`$${sub.suggestedUsdAmount} USD\`\n` : '') +
+          `\nOur admin team will verify your receipt and credit your wallet balance shortly.`;
+
+        await telegramClient.sendMessage(chatId, confirmMsg, {
+          reply_markup: getBackHomeKeyboard('m:wall', lang),
+        });
+      } catch (err: any) {
+        await telegramClient.sendMessage(
+          chatId,
+          `⚠️ *INVALID PHONE NUMBER*\n\n${err.message}\n\nExample: \`03001234567\``,
+          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
+        );
+      }
+      return;
+    }
+
+    // Legacy FSM fallback steps (kept compatible if triggered explicitly)
     if (fsm.step === 'AWAITING_MANUAL_AMOUNT') {
       const methodCode = fsm.data?.methodCode;
       let amountDec: Decimal;
@@ -1109,7 +1176,6 @@ export class CustomerHandler {
       return;
     }
 
-    // FSM: Manual Payment TXID
     if (fsm.step === 'AWAITING_MANUAL_TXID') {
       const { methodCode, amount } = fsm.data || {};
       await redis.setFsmState(userId, {
@@ -1192,6 +1258,27 @@ export class CustomerHandler {
     if (fsm?.step === 'AWAITING_MANUAL_PROOF') {
       const { methodCode, amount, txid } = fsm.data || {};
       const largestPhoto = msg.photo[msg.photo.length - 1];
+
+      // Simplified Easypaisa/JazzCash flow: no TXID -> save screenshot + caption OCR text and request sender phone
+      if (!txid) {
+        await redis.setFsmState(userId, {
+          step: 'AWAITING_MANUAL_PHONE',
+          data: {
+            methodCode,
+            proofFileId: largestPhoto.file_id,
+            ocrText: msg.caption || undefined,
+          },
+        });
+
+        await telegramClient.sendMessage(
+          chatId,
+          `✅ *Payment Screenshot Received!*\n\n` +
+            `Now please send your *Sender Phone Number* used for the payment.\n\n` +
+            `Example:\n\`03001234567\``,
+          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
+        );
+        return;
+      }
 
       await redis.clearFsmState(userId);
       const sub = await manualPaymentService.submitDeposit({

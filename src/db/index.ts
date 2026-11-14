@@ -2,6 +2,7 @@ import pg from 'pg';
 import { newDb, IMemoryDb } from 'pg-mem';
 import { config } from '../config/env.js';
 import { createLogger } from '../services/logger.js';
+import { perfTracker } from '../services/perfTracker.js';
 
 const logger = createLogger('Database');
 
@@ -70,14 +71,16 @@ class DatabaseManager {
     try {
       const res = await this.pool.query(text, params);
       const duration = Date.now() - start;
-      if (duration > 1000) {
-        logger.warn('Slow query detected', { durationMs: duration, query: text.substring(0, 100) });
+      perfTracker.recordDb(duration);
+      if (duration > 250) {
+        logger.warn('Slow query detected', { durationMs: duration, query: text.substring(0, 120) });
       }
       return {
         rows: res.rows || [],
         rowCount: res.rowCount || (res.rows ? res.rows.length : 0),
       };
     } catch (err: any) {
+      perfTracker.recordDb(Date.now() - start);
       logger.error('Database query error', { error: err.message, query: text.substring(0, 150) });
       throw err;
     }
@@ -95,14 +98,18 @@ class DatabaseManager {
     const client = await this.pool.connect();
     return {
       query: async <T = any>(text: string, params?: any[]) => {
+        const qStart = Date.now();
         const res = await client.query(text, params);
+        perfTracker.recordDb(Date.now() - qStart);
         return {
           rows: res.rows || [],
           rowCount: res.rowCount || (res.rows ? res.rows.length : 0),
         };
       },
       queryRow: async <T = any>(text: string, params?: any[]) => {
+        const qStart = Date.now();
         const res = await client.query(text, params);
+        perfTracker.recordDb(Date.now() - qStart);
         const rows = res.rows || [];
         return (rows[0] as T) || null;
       },

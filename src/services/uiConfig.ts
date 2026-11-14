@@ -2,6 +2,7 @@ import { db } from '../db/index.js';
 import { redis } from './redis.js';
 import { ButtonStyle, TelegramBotCommand } from '../telegram/types.js';
 import { SupportedLanguage, SUPPORTED_LANGUAGES, translations } from './i18n.js';
+import { menuCache } from '../telegram/menuCache.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('UISettingService');
@@ -876,6 +877,7 @@ export class UISettingService {
       }
       this.cache = nextCache;
       this.loaded = true;
+      menuCache.invalidateAll();
     } catch (err: any) {
       // Safe fallback if migration 002 has not yet executed during isolated unit startup
       logger.warn('UI settings table load deferred; using built-in defaults', { error: err.message });
@@ -885,6 +887,7 @@ export class UISettingService {
 
   public invalidateCache(): void {
     this.loaded = false;
+    menuCache.invalidateAll();
   }
 
   /**

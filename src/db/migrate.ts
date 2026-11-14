@@ -4,6 +4,7 @@ import { db } from './index.js';
 import { createLogger } from '../services/logger.js';
 import { seedInitialData } from './seed.js';
 import { uiConfigService } from '../services/uiConfig.js';
+import { preloadCommonMenus } from '../telegram/keyboards.js';
 
 const logger = createLogger('Migrations');
 const MIGRATION_LOCK_ID = 987654321;
@@ -13,6 +14,7 @@ const MIGRATIONS: Array<{ version: number; name: string; filename: string }> = [
   { version: 2, name: '002_ui_customization', filename: '002_ui_customization.sql' },
   { version: 3, name: '003_binance_order_id', filename: '003_binance_order_id.sql' },
   { version: 4, name: '004_public_release_polish', filename: '004_public_release_polish.sql' },
+  { version: 5, name: '005_payment_ux_and_perf', filename: '005_payment_ux_and_perf.sql' },
 ];
 
 function readMigrationSql(filename: string): string {
@@ -120,9 +122,10 @@ export async function runMigrations(): Promise<void> {
       }
     }
 
-    // Seed baseline data and UI customization defaults idempotently
+    // Seed baseline data, UI customization defaults & prewarm menu cache
     await seedInitialData();
     await uiConfigService.seedDefaults();
+    preloadCommonMenus();
 
     logger.info('Database migrations and baseline configuration completed successfully');
   } finally {

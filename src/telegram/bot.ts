@@ -3,6 +3,7 @@ import { config } from '../config/env.js';
 import { customerHandler } from './handlers/customer.js';
 import { adminHandler } from './handlers/admin.js';
 import { TelegramUpdate } from './types.js';
+import { perfTracker } from '../services/perfTracker.js';
 import { createLogger } from '../services/logger.js';
 
 const logger = createLogger('TelegramBotRouter');
@@ -90,6 +91,9 @@ export const REGISTERED_ADMIN_CALLBACKS = {
     'adm:perf',
     'adm:sync',
     'adm:dep',
+    'adm:dep_set',
+    'adm:dep_set_t:custom',
+    'adm:dep_set_t:suggest',
     'adm:hlth',
     'adm:ui',
     'adm:ui_exp',
@@ -141,7 +145,12 @@ export const REGISTERED_ADMIN_CALLBACKS = {
     'adm:ban_e:',
     'adm:ban_clr:',
     'adm_app:',
+    'adm_app_amt:',
+    'adm_app_cust:',
     'adm_rej:',
+    'adm_dep_pic:',
+    'adm:dep_v:',
+    'adm:dep_set_e:',
     'adm:prod:',
     'adm_pr:',
     'adm_set_fm:',
@@ -248,16 +257,26 @@ export class TelegramBotRouter {
       let status = 'IGNORED';
       const handlerStartedAt = Date.now();
 
-      // 3. Route Callback Query
+      // 3. Route Callback Query (with per-callback latency, DB & supplier instrumentation)
       if (update.callback_query) {
         const cb = update.callback_query;
+        const cbName = cb.data || 'callback:empty';
         route = cb.data ? cb.data.split(':').slice(0, 2).join(':') : 'callback:empty';
         try {
-          if (cb.data?.startsWith('adm')) {
-            await adminHandler.handleCallback(cb);
-          } else {
-            await customerHandler.handleCallback(cb);
-          }
+          const { metrics } = await perfTracker.run(cbName, async () => {
+            if (cb.data?.startsWith('adm')) {
+              await adminHandler.handleCallback(cb);
+            } else {
+              await customerHandler.handleCallback(cb);
+            }
+          });
+          logger.debug('Callback perf metrics', {
+            callbackName: metrics.callbackName,
+            responseTimeMs: metrics.responseTimeMs,
+            dbTimeMs: metrics.dbTimeMs,
+            dbQueryCount: metrics.dbQueryCount,
+            supplierTimeMs: metrics.supplierTimeMs,
+          });
         } catch (err: any) {
           logger.error('Error handling callback query', { error: err.message, route });
         }

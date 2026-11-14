@@ -1,4 +1,5 @@
 import { db } from '../db/index.js';
+import { redis } from './redis.js';
 import { referralService } from './referral.js';
 import { createLogger } from './logger.js';
 
@@ -103,36 +104,58 @@ export class GiveawayService {
     };
   }
 
+  private readonly activeRawCacheKey = 'gw:active_raw';
+  private readonly cfgCacheKey = 'sys:giveaway_cfg';
+
+  private async invalidateCaches(): Promise<void> {
+    await Promise.all([
+      redis.del(this.activeRawCacheKey).catch(() => {}),
+      redis.del(this.cfgCacheKey).catch(() => {}),
+    ]);
+  }
+
   /**
-   * Get active, public, currently-running giveaways for customer display,
+   * Get active, public, currently-running giveaways for customer display (Redis-cached 45s),
    * annotated with user progress using a single batched claims query (no N+1).
    */
   public async getActiveGiveaways(userId?: string): Promise<GiveawayItem[]> {
     const now = Date.now();
-    const res = await db.query<any>(`
-      SELECT g.id, g.title, g.description, g.reward_product_id as "rewardProductId",
-             g.reward_label as "rewardLabel",
-             COALESCE(po.display_name_override, sp.original_name) as "rewardProductName",
-             g.reward_quantity as "rewardQuantity",
-             g.required_total_referrals as "requiredTotalReferrals",
-             g.required_qualified_referrals as "requiredQualifiedReferrals",
-             g.start_at as "startAt",
-             g.end_at as "endAt",
-             g.is_active as "isActive",
-             g.is_public as "isPublic",
-             g.claim_limit as "claimLimit",
-             g.claims_count as "claimsCount",
-             g.created_at as "createdAt",
-             g.updated_at as "updatedAt"
-      FROM giveaways g
-      LEFT JOIN supplier_products sp ON g.reward_product_id = sp.id
-      LEFT JOIN product_overrides po ON g.reward_product_id = po.product_id
-      WHERE g.is_active = TRUE
-        AND (g.is_public IS NULL OR g.is_public = TRUE)
-      ORDER BY g.created_at DESC
-    `);
+    let rawRows: any[] | null = null;
+    try {
+      const cached = await redis.get(this.activeRawCacheKey);
+      if (cached) rawRows = JSON.parse(cached);
+    } catch {
+      // Cache miss
+    }
 
-    const liveRows = res.rows.filter(r => {
+    if (!rawRows) {
+      const res = await db.query<any>(`
+        SELECT g.id, g.title, g.description, g.reward_product_id as "rewardProductId",
+               g.reward_label as "rewardLabel",
+               COALESCE(po.display_name_override, sp.original_name) as "rewardProductName",
+               g.reward_quantity as "rewardQuantity",
+               g.required_total_referrals as "requiredTotalReferrals",
+               g.required_qualified_referrals as "requiredQualifiedReferrals",
+               g.start_at as "startAt",
+               g.end_at as "endAt",
+               g.is_active as "isActive",
+               g.is_public as "isPublic",
+               g.claim_limit as "claimLimit",
+               g.claims_count as "claimsCount",
+               g.created_at as "createdAt",
+               g.updated_at as "updatedAt"
+        FROM giveaways g
+        LEFT JOIN supplier_products sp ON g.reward_product_id = sp.id
+        LEFT JOIN product_overrides po ON g.reward_product_id = po.product_id
+        WHERE g.is_active = TRUE
+          AND (g.is_public IS NULL OR g.is_public = TRUE)
+        ORDER BY g.created_at DESC
+      `);
+      rawRows = res.rows;
+      await redis.set(this.activeRawCacheKey, JSON.stringify(rawRows), 45).catch(() => {});
+    }
+
+    const liveRows = rawRows.filter(r => {
       if (r.startAt && new Date(r.startAt).getTime() > now) return false;
       if (r.endAt && new Date(r.endAt).getTime() <= now) return false;
       return true;
@@ -288,6 +311,7 @@ export class GiveawayService {
       `, [giveawayId]);
     });
 
+    await this.invalidateCaches();
     logger.info('Giveaway claimed by user', { giveawayId, userId, claimId });
 
     return {
@@ -351,6 +375,7 @@ export class GiveawayService {
       JSON.stringify({ title, rewardProductId: params.rewardProductId, reqTotal, reqQual, claimLimit, isActive, isPublic }),
     ]);
 
+    await this.invalidateCaches();
     return id;
   }
 
@@ -418,6 +443,7 @@ export class GiveawayService {
       [`log_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, adminId, giveawayId, JSON.stringify(patch)]
     );
 
+    await this.invalidateCaches();
     return (await this.getGiveawayById(giveawayId))!;
   }
 
@@ -445,17 +471,27 @@ export class GiveawayService {
       ]
     );
 
+    await this.invalidateCaches();
     return true;
   }
 
   public async getSettings(): Promise<{ enabled: boolean; defaultClaimLimit: number; notifyAdminOnClaim: boolean }> {
+    try {
+      const cached = await redis.get(this.cfgCacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {
+      // Cache miss
+    }
+
     const row = await db.queryRow<any>("SELECT value FROM system_settings WHERE key = 'giveaway_config'");
     const val = typeof row?.value === 'string' ? JSON.parse(row.value) : row?.value || {};
-    return {
+    const cfg = {
       enabled: val.enabled !== false,
       defaultClaimLimit: Number(val.defaultClaimLimit || 100),
       notifyAdminOnClaim: val.notifyAdminOnClaim !== false,
     };
+    await redis.set(this.cfgCacheKey, JSON.stringify(cfg), 60).catch(() => {});
+    return cfg;
   }
 
   public async updateSettings(
@@ -479,6 +515,7 @@ export class GiveawayService {
        VALUES ($1, $2, 'UPDATE_GIVEAWAY_SETTINGS', 'system_settings', 'giveaway_config', $3)`,
       [`log_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, adminId, JSON.stringify(next)]
     );
+    await this.invalidateCaches();
     return next;
   }
 }

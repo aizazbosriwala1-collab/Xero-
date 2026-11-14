@@ -2,6 +2,8 @@ import Decimal from 'decimal.js';
 import { config } from '../config/env.js';
 import { db } from '../db/index.js';
 import { redis } from './redis.js';
+import { perfTracker } from './perfTracker.js';
+import { pricingService } from './pricing.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('SupplierService');
@@ -215,13 +217,22 @@ export class SupplierService {
   }
 
   public async listSuppliers(): Promise<SupplierControlRecord[]> {
+    const cacheKey = 'supplier_ctrl:list';
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached) as SupplierControlRecord[];
+    } catch {
+      // Cache miss
+    }
+
     const res = await db.query<any>(
       'SELECT * FROM suppliers ORDER BY created_at ASC'
     );
-    if (res.rows.length === 0) {
-      return [await this.getSupplierControl('aitoolshop')];
-    }
-    return res.rows.map(r => this.mapSupplierControlRow(r));
+    const list = res.rows.length === 0
+      ? [await this.getSupplierControl('aitoolshop')]
+      : res.rows.map(r => this.mapSupplierControlRow(r));
+    await redis.set(cacheKey, JSON.stringify(list), 45).catch(() => {});
+    return list;
   }
 
   public async getSupplierControl(supplierId = 'aitoolshop'): Promise<SupplierControlRecord> {
@@ -249,7 +260,7 @@ export class SupplierService {
           lastSyncAt: null,
         };
 
-    await redis.set(cacheKey, JSON.stringify(ctrl), 30).catch(() => {});
+    await redis.set(cacheKey, JSON.stringify(ctrl), 45).catch(() => {});
     return ctrl;
   }
 
@@ -293,16 +304,24 @@ export class SupplierService {
       ]
     );
 
-    await redis.del(`supplier_ctrl:${supplierId}`).catch(() => {});
+    await Promise.all([
+      redis.del(`supplier_ctrl:${supplierId}`).catch(() => {}),
+      redis.del('supplier_ctrl:list').catch(() => {}),
+    ]);
     logger.info('Supplier control flag updated', { supplierId, field: col, value: Boolean(value), adminId });
     return await this.getSupplierControl(supplierId);
   }
 
   private async performFetch(url: string, init?: RequestInit): Promise<Response> {
-    if (this.fetchOverride) {
-      return await this.fetchOverride(url, init);
+    const startedAt = Date.now();
+    try {
+      if (this.fetchOverride) {
+        return await this.fetchOverride(url, init);
+      }
+      return await fetch(url, init);
+    } finally {
+      perfTracker.recordSupplier(Date.now() - startedAt);
     }
-    return await fetch(url, init);
   }
 
   private getHeaders(): Record<string, string> {
@@ -1153,7 +1172,8 @@ export class SupplierService {
     ).catch(() => {});
     await Promise.all([
       redis.del('supplier_ctrl:aitoolshop').catch(() => {}),
-      redis.del('cat_counts').catch(() => {}),
+      redis.del('supplier_ctrl:list').catch(() => {}),
+      pricingService.invalidateCatalogCaches(),
     ]);
 
     logger.info('Catalogue sync finished', { importedCount, updatedCount, totalCount });
