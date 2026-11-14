@@ -42,6 +42,7 @@ export const REGISTERED_ADMIN_CALLBACKS = {
     'adm:price',
     'adm:cat',
     'adm:ord',
+    'adm:ord_unc',
     'adm:wal',
     'adm:gw',
     'adm:sync',
@@ -61,6 +62,10 @@ export const REGISTERED_ADMIN_CALLBACKS = {
     'adm:sup_diag_clr',
   ]),
   prefixes: [
+    'adm:ord_det:',
+    'adm:ord_lkp:',
+    'adm:ord_rec:',
+    'adm:ord_hst:',
     'adm:cat_tog:',
     'adm:gw_tog:',
     'adm_app:',

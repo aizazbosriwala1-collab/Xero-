@@ -513,14 +513,24 @@ export class OrderService {
    * - Not found, still pending, or lookup error keeps order under review without
    *   reordering and without premature refund.
    */
-  public async retryOrder(orderId: string): Promise<{
+  public async retryOrder(
+    orderId: string,
+    options?: { allowRefund?: boolean }
+  ): Promise<{
     success: boolean;
+    newlyCompleted: boolean;
     orderId: string;
     idempotencyKey: string;
     status: OrderDetails['status'];
     message: string;
     deliveredItems: string[];
+    lookupMethod?: string;
+    lookupStatus?: string;
+    httpStatus?: number;
+    supplierOrderRef?: string | null;
   }> {
+    const allowRefund = options?.allowRefund !== false;
+
     return await this.serializeCheckout(`reconcile:${orderId}`, async () => {
       const precheck = await db.queryRow<any>('SELECT * FROM local_orders WHERE id = $1', [orderId]);
       if (!precheck) {
@@ -538,11 +548,16 @@ export class OrderService {
         const delivered = await this.decryptOrderItems(orderId);
         return {
           success: true,
+          newlyCompleted: false,
           orderId,
           idempotencyKey,
           status: 'COMPLETED',
           message: 'Order already completed.',
           deliveredItems: delivered,
+          lookupMethod: 'NONE',
+          lookupStatus: 'already_completed',
+          httpStatus: 0,
+          supplierOrderRef,
         };
       }
 
@@ -550,11 +565,16 @@ export class OrderService {
       if (precheck.status === 'FAILED' || precheck.status === 'REFUNDED') {
         return {
           success: false,
+          newlyCompleted: false,
           orderId,
           idempotencyKey,
           status: precheck.status,
           message: 'Cannot retry an order that already failed or was refunded.',
           deliveredItems: [],
+          lookupMethod: 'NONE',
+          lookupStatus: 'terminal_blocked',
+          httpStatus: 0,
+          supplierOrderRef,
         };
       }
 
@@ -566,11 +586,16 @@ export class OrderService {
         });
         return {
           success: false,
+          newlyCompleted: false,
           orderId,
           idempotencyKey,
           status: 'UNCERTAIN',
           message: 'Supplier order-status lookup endpoint is unavailable; blind POST /order retry blocked to prevent duplicate fulfillment.',
           deliveredItems: [],
+          lookupMethod: 'NONE',
+          lookupStatus: 'unavailable',
+          httpStatus: 0,
+          supplierOrderRef,
         };
       }
 
@@ -613,22 +638,32 @@ export class OrderService {
           });
           return {
             success: true,
+            newlyCompleted: false,
             orderId,
             idempotencyKey,
             status: 'COMPLETED' as const,
             message: 'Order already completed.',
             deliveredItems: delivered,
+            lookupMethod: lookup.lookupMethod,
+            lookupStatus: lookup.status,
+            httpStatus: lookup.httpStatus,
+            supplierOrderRef: lookup.order_ref || supplierOrderRef,
           };
         }
 
         if (localOrder.status === 'FAILED' || localOrder.status === 'REFUNDED') {
           return {
             success: false,
+            newlyCompleted: false,
             orderId,
             idempotencyKey,
             status: localOrder.status as OrderDetails['status'],
             message: 'Cannot retry an order that already failed or was refunded.',
             deliveredItems: [],
+            lookupMethod: lookup.lookupMethod,
+            lookupStatus: lookup.status,
+            httpStatus: lookup.httpStatus,
+            supplierOrderRef: lookup.order_ref || supplierOrderRef,
           };
         }
 
@@ -660,11 +695,16 @@ export class OrderService {
             );
             return {
               success: false,
+              newlyCompleted: false,
               orderId,
               idempotencyKey,
               status: 'UNCERTAIN' as const,
               message: msg,
               deliveredItems: [],
+              lookupMethod: lookup.lookupMethod,
+              lookupStatus: lookup.status,
+              httpStatus: lookup.httpStatus,
+              supplierOrderRef: resolvedRef,
             };
           }
 
@@ -715,19 +755,57 @@ export class OrderService {
 
           return {
             success: true,
+            newlyCompleted: true,
             orderId,
             idempotencyKey,
             status: 'COMPLETED' as const,
             message: 'Order verified via read-only supplier lookup and completed without duplicate wallet debit.',
             deliveredItems: finalDelivered,
+            lookupMethod: lookup.lookupMethod,
+            lookupStatus: lookup.status,
+            httpStatus: lookup.httpStatus,
+            supplierOrderRef: resolvedRef,
           };
         }
 
-        // 2) Confirmed deterministic failure via read-only lookup -> refund ONCE
+        // 2) Confirmed deterministic failure via read-only lookup
         if (lookup.status === 'failed') {
           const failureReason =
             lookup.message ||
             `Supplier confirmed deterministic failure (${lookup.error_code || 'FAILED'}) via ${lookup.lookupMethod}`;
+
+          if (!allowRefund) {
+            const heldReason = `Supplier reported failed (${failureReason}); kept UNCERTAIN without refund or balance change.`;
+            await client.query(
+              "UPDATE local_orders SET status = 'UNCERTAIN', error_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+              [heldReason, orderId]
+            );
+            if (resolvedRef) {
+              await client.query(
+                `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
+                 VALUES ($1, $2, $3, $4, 'FAILED_AT_SUPPLIER', $5)
+                 ON CONFLICT (local_order_id) DO UPDATE
+                 SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
+                     supplier_status = 'FAILED_AT_SUPPLIER',
+                     response_payload = EXCLUDED.response_payload,
+                     updated_at = CURRENT_TIMESTAMP`,
+                [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload]
+              );
+            }
+            return {
+              success: false,
+              newlyCompleted: false,
+              orderId,
+              idempotencyKey,
+              status: 'UNCERTAIN' as const,
+              message: heldReason,
+              deliveredItems: [],
+              lookupMethod: lookup.lookupMethod,
+              lookupStatus: lookup.status,
+              httpStatus: lookup.httpStatus,
+              supplierOrderRef: resolvedRef,
+            };
+          }
 
           await client.query(
             "UPDATE local_orders SET status = 'FAILED', error_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
@@ -764,11 +842,16 @@ export class OrderService {
 
           return {
             success: false,
+            newlyCompleted: false,
             orderId,
             idempotencyKey,
             status: 'FAILED' as const,
             message: `Supplier confirmed failure (${failureReason}). Wallet refunded once.`,
             deliveredItems: [],
+            lookupMethod: lookup.lookupMethod,
+            lookupStatus: lookup.status,
+            httpStatus: lookup.httpStatus,
+            supplierOrderRef: resolvedRef,
           };
         }
 
@@ -790,11 +873,16 @@ export class OrderService {
           );
           return {
             success: true,
+            newlyCompleted: false,
             orderId,
             idempotencyKey,
             status: 'PENDING_INVITE' as const,
             message: 'Order is awaiting supplier invite delivery.',
             deliveredItems: [],
+            lookupMethod: lookup.lookupMethod,
+            lookupStatus: lookup.status,
+            httpStatus: lookup.httpStatus,
+            supplierOrderRef: resolvedRef,
           };
         }
 
@@ -822,11 +910,16 @@ export class OrderService {
         if (localOrder.status === 'PENDING_INVITE') {
           return {
             success: true,
+            newlyCompleted: false,
             orderId,
             idempotencyKey,
             status: 'PENDING_INVITE' as const,
             message: 'Order is awaiting supplier invite delivery.',
             deliveredItems: [],
+            lookupMethod: lookup.lookupMethod,
+            lookupStatus: lookup.status,
+            httpStatus: lookup.httpStatus,
+            supplierOrderRef: resolvedRef,
           };
         }
 
@@ -844,11 +937,16 @@ export class OrderService {
 
         return {
           success: false,
+          newlyCompleted: false,
           orderId,
           idempotencyKey,
           status: 'UNCERTAIN' as const,
           message: reviewNote,
           deliveredItems: [],
+          lookupMethod: lookup.lookupMethod,
+          lookupStatus: lookup.status,
+          httpStatus: lookup.httpStatus,
+          supplierOrderRef: resolvedRef,
         };
       });
 
@@ -864,16 +962,250 @@ export class OrderService {
    * Reconcile an order marked UNCERTAIN using read-only GET /order/:ref & GET /orders
    * with its stored supplier_order_ref / idempotency_key.
    */
-  public async reconcileUncertainOrder(orderId: string): Promise<{
+  public async reconcileUncertainOrder(
+    orderId: string,
+    options?: { allowRefund?: boolean }
+  ): Promise<{
     orderId: string;
     idempotencyKey: string;
     status: OrderDetails['status'];
+    newlyCompleted: boolean;
+    message: string;
+    deliveredItems: string[];
+    lookupMethod?: string;
+    lookupStatus?: string;
+    httpStatus?: number;
+    supplierOrderRef?: string | null;
   }> {
-    const res = await this.retryOrder(orderId);
+    const res = await this.retryOrder(orderId, options);
     return {
       orderId: res.orderId,
       idempotencyKey: res.idempotencyKey,
       status: res.status,
+      newlyCompleted: res.newlyCompleted,
+      message: res.message,
+      deliveredItems: res.deliveredItems,
+      lookupMethod: res.lookupMethod,
+      lookupStatus: res.lookupStatus,
+      httpStatus: res.httpStatus,
+      supplierOrderRef: res.supplierOrderRef,
+    };
+  }
+
+  /**
+   * Admin order list prioritizing UNCERTAIN orders so operators can open and reconcile them cleanly.
+   */
+  public async listAdminOrders(limit = 8, uncertainOnly = false): Promise<Array<{
+    id: string;
+    userId: string;
+    totalPrice: string;
+    status: OrderDetails['status'];
+    supplierOrderRef: string | null;
+    supplierStatus: string | null;
+    createdAt: string;
+  }>> {
+    const whereClause = uncertainOnly ? "WHERE lo.status = 'UNCERTAIN'" : '';
+    const res = await db.query<any>(
+      `SELECT lo.id,
+              lo.user_id as "userId",
+              lo.total_price as "totalPrice",
+              lo.status,
+              so.supplier_order_ref as "supplierOrderRef",
+              so.supplier_status as "supplierStatus",
+              lo.created_at as "createdAt"
+       FROM local_orders lo
+       LEFT JOIN supplier_orders so ON so.local_order_id = lo.id
+       ${whereClause}
+       ORDER BY CASE WHEN lo.status = 'UNCERTAIN' THEN 0 ELSE 1 END, lo.created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    return res.rows.map(r => ({
+      id: r.id,
+      userId: r.userId,
+      totalPrice: new Decimal(r.totalPrice || 0).toFixed(2),
+      status: r.status,
+      supplierOrderRef: r.supplierOrderRef || null,
+      supplierStatus: r.supplierStatus || null,
+      createdAt: r.createdAt,
+    }));
+  }
+
+  /**
+   * Load sanitized admin detail view for any local order (no raw delivered secrets exposed).
+   */
+  public async getAdminOrderDetail(orderId: string): Promise<{
+    id: string;
+    userId: string;
+    customerUsername: string | null;
+    customerFirstName: string | null;
+    productId: string;
+    productName: string;
+    quantity: number;
+    totalPrice: string;
+    status: OrderDetails['status'];
+    errorMessage: string | null;
+    idempotencyKey: string;
+    supplierOrderRef: string | null;
+    supplierStatus: string | null;
+    deliveredCount: number;
+    createdAt: string;
+    updatedAt: string;
+  } | null> {
+    const row = await db.queryRow<any>(
+      `SELECT lo.id,
+              lo.user_id as "userId",
+              u.username as "customerUsername",
+              u.first_name as "customerFirstName",
+              lo.product_id as "productId",
+              sp.original_name as "productName",
+              lo.quantity,
+              lo.total_price as "totalPrice",
+              lo.status,
+              lo.error_message as "errorMessage",
+              COALESCE(so.idempotency_key, lo.idempotency_key) as "idempotencyKey",
+              so.supplier_order_ref as "supplierOrderRef",
+              so.supplier_status as "supplierStatus",
+              lo.created_at as "createdAt",
+              lo.updated_at as "updatedAt"
+       FROM local_orders lo
+       LEFT JOIN supplier_orders so ON so.local_order_id = lo.id
+       LEFT JOIN supplier_products sp ON sp.id = lo.product_id
+       LEFT JOIN users u ON u.id = lo.user_id
+       WHERE lo.id = $1`,
+      [orderId]
+    );
+
+    if (!row) return null;
+
+    const delCountRes = await db.queryRow<{ c: string }>(
+      'SELECT COUNT(*) as c FROM delivered_items WHERE local_order_id = $1',
+      [orderId]
+    );
+
+    return {
+      id: row.id,
+      userId: row.userId,
+      customerUsername: row.customerUsername || null,
+      customerFirstName: row.customerFirstName || null,
+      productId: row.productId,
+      productName: row.productName || row.productId,
+      quantity: Number(row.quantity || 1),
+      totalPrice: new Decimal(row.totalPrice || 0).toFixed(2),
+      status: row.status,
+      errorMessage: row.errorMessage || null,
+      idempotencyKey: row.idempotencyKey,
+      supplierOrderRef: row.supplierOrderRef || null,
+      supplierStatus: row.supplierStatus || null,
+      deliveredCount: parseInt(delCountRes?.c || '0', 10),
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  /**
+   * Read-only status & audit history for an order across local_orders,
+   * supplier_orders, delivered_items (count only), ledger_entries, and admin_audit_logs.
+   */
+  public async getAdminOrderStatusHistory(orderId: string): Promise<{
+    order: {
+      id: string;
+      userId: string;
+      status: string;
+      errorMessage: string | null;
+      createdAt: string;
+      updatedAt: string;
+    };
+    supplierOrder: {
+      supplierOrderRef: string | null;
+      supplierStatus: string;
+      createdAt: string;
+      updatedAt: string;
+    } | null;
+    deliveredCount: number;
+    firstDeliveredAt: string | null;
+    ledgerEntries: Array<{
+      entryType: string;
+      amount: string;
+      operationRef: string;
+      createdAt: string;
+    }>;
+    auditLogs: Array<{
+      action: string;
+      adminId: string;
+      details: any;
+      createdAt: string;
+    }>;
+  } | null> {
+    const lo = await db.queryRow<any>(
+      `SELECT id, user_id as "userId", status, error_message as "errorMessage",
+              created_at as "createdAt", updated_at as "updatedAt"
+       FROM local_orders WHERE id = $1`,
+      [orderId]
+    );
+    if (!lo) return null;
+
+    const so = await db.queryRow<any>(
+      `SELECT supplier_order_ref as "supplierOrderRef", supplier_status as "supplierStatus",
+              created_at as "createdAt", updated_at as "updatedAt"
+       FROM supplier_orders WHERE local_order_id = $1`,
+      [orderId]
+    );
+
+    const del = await db.queryRow<any>(
+      `SELECT COUNT(*) as c, MIN(delivered_at) as "firstDeliveredAt"
+       FROM delivered_items WHERE local_order_id = $1`,
+      [orderId]
+    );
+
+    const ledger = await db.query<any>(
+      `SELECT entry_type as "entryType", amount, operation_ref as "operationRef", created_at as "createdAt"
+       FROM ledger_entries
+       WHERE operation_ref IN ($1, $2)
+       ORDER BY created_at ASC`,
+      [`PURCHASE_${orderId}`, `REFUND_${orderId}`]
+    );
+
+    const audits = await db.query<any>(
+      `SELECT action, admin_id as "adminId", details, created_at as "createdAt"
+       FROM admin_audit_logs
+       WHERE target_entity = 'local_orders' AND target_id = $1
+       ORDER BY created_at DESC
+       LIMIT 10`,
+      [orderId]
+    );
+
+    return {
+      order: {
+        id: lo.id,
+        userId: lo.userId,
+        status: lo.status,
+        errorMessage: lo.errorMessage || null,
+        createdAt: lo.createdAt,
+        updatedAt: lo.updatedAt,
+      },
+      supplierOrder: so
+        ? {
+            supplierOrderRef: so.supplierOrderRef || null,
+            supplierStatus: so.supplierStatus,
+            createdAt: so.createdAt,
+            updatedAt: so.updatedAt,
+          }
+        : null,
+      deliveredCount: parseInt(del?.c || '0', 10),
+      firstDeliveredAt: del?.firstDeliveredAt || null,
+      ledgerEntries: ledger.rows.map(r => ({
+        entryType: r.entryType,
+        amount: new Decimal(r.amount || 0).toFixed(4),
+        operationRef: r.operationRef,
+        createdAt: r.createdAt,
+      })),
+      auditLogs: audits.rows.map(a => ({
+        action: a.action,
+        adminId: a.adminId,
+        details: typeof a.details === 'string' ? (() => { try { return JSON.parse(a.details); } catch { return {}; } })() : a.details,
+        createdAt: a.createdAt,
+      })),
     };
   }
 

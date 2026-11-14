@@ -7,6 +7,7 @@ import {
   maskSupplierRef,
 } from '../../services/supplier.js';
 import { pricingService } from '../../services/pricing.js';
+import { orderService } from '../../services/order.js';
 import { manualPaymentService } from '../../services/manualPayment.js';
 import {
   binanceService,
@@ -15,13 +16,14 @@ import {
   maskIdentifier,
 } from '../../services/binance.js';
 import { uiConfigService, UISection, UISettingRecord } from '../../services/uiConfig.js';
-import { SupportedLanguage } from '../../services/i18n.js';
+import { SupportedLanguage, getUserLanguage, t } from '../../services/i18n.js';
 import { ButtonBuilder } from '../buttonBuilder.js';
 import {
   getAdminMainMenuKeyboard,
   getAdminUiCenterKeyboard,
   getAdminUiSectionKeyboard,
   getAdminUiItemEditorKeyboard,
+  getBackHomeKeyboard,
 } from '../keyboards.js';
 import { telegramClient } from '../client.js';
 import { TelegramMessage, TelegramCallbackQuery, UserFsmState, ButtonStyle } from '../types.js';
@@ -179,25 +181,403 @@ export class AdminHandler {
       return;
     }
 
-    // Recent Orders Overview
-    if (data === 'adm:ord') {
-      const res = await db.query<any>(
-        `SELECT id, user_id as "userId", total_price as "totalPrice", status, created_at as "createdAt"
-         FROM local_orders ORDER BY created_at DESC LIMIT 8`
-      );
-      let text = `📦 *RECENT CUSTOMER ORDERS*\n\n`;
-      if (res.rows.length === 0) {
-        text += `_No customer orders placed yet._`;
+    // Recent Orders & Uncertain Orders Overview
+    if (data === 'adm:ord' || data === 'adm:ord_unc') {
+      const uncertainOnly = data === 'adm:ord_unc';
+      const orders = await orderService.listAdminOrders(8, uncertainOnly);
+
+      let text = uncertainOnly
+        ? `⚠️ *UNCERTAIN CUSTOMER ORDERS*\n\nTap any order below to open details and reconcile safely:\n\n`
+        : `📦 *RECENT CUSTOMER ORDERS*\n\nTap any order below to inspect details (⚠️ *UNCERTAIN* orders listed first):\n\n`;
+
+      const rows: any[][] = [];
+      if (orders.length === 0) {
+        text += uncertainOnly
+          ? `_No UNCERTAIN orders pending review._`
+          : `_No customer orders placed yet._`;
       } else {
-        for (const o of res.rows) {
-          text += `• \`${o.id}\` | User: \`${o.userId}\` | \`${o.totalPrice} USDT\` | *${o.status}*\n`;
+        for (const o of orders) {
+          const isUncertain = o.status === 'UNCERTAIN';
+          const badge = isUncertain ? '⚠️' : o.status === 'COMPLETED' ? '✅' : '📦';
+          const refLabel = o.supplierOrderRef ? maskSupplierRef(o.supplierOrderRef) : 'NO REF';
+          text += `${badge} \`${o.id}\` | User: \`${o.userId}\` | \`${o.totalPrice} USDT\` | *${o.status}* | Ref: \`${refLabel}\`\n`;
+          rows.push(
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: `${o.id} (${o.status})`,
+                fallbackEmoji: badge,
+                style: isUncertain ? 'danger' : 'default',
+                callbackData: `adm:ord_det:${o.id}`,
+                forceVisible: true,
+              }),
+            ])
+          );
         }
       }
+
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: uncertainOnly ? 'ALL RECENT ORDERS' : 'UNCERTAIN ORDERS ONLY',
+            fallbackEmoji: uncertainOnly ? '📦' : '⚠️',
+            style: 'primary',
+            callbackData: uncertainOnly ? 'adm:ord' : 'adm:ord_unc',
+            forceVisible: true,
+          }),
+        ])
+      );
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ])
+      );
+
+      await telegramClient.editMessageText(chatId, messageId, text, {
+        reply_markup: { inline_keyboard: rows },
+      });
+      return;
+    }
+
+    // Admin Order Detail Screen
+    if (data.startsWith('adm:ord_det:')) {
+      const orderId = data.slice('adm:ord_det:'.length);
+      const detail = await orderService.getAdminOrderDetail(orderId);
+      if (!detail) {
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `⚠️ *ORDER NOT FOUND*\n\nOrder \`${this.escapeDiagMarkdown(orderId)}\` could not be found.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ord', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      await telegramClient.editMessageText(chatId, messageId, this.formatAdminOrderDetailText(detail), {
+        reply_markup: this.getAdminOrderDetailKeyboard(detail.id),
+      });
+      return;
+    }
+
+    // Admin Order Action: Read-Only Supplier Lookup (GET /order/{ref})
+    if (data.startsWith('adm:ord_lkp:')) {
+      const orderId = data.slice('adm:ord_lkp:'.length);
+      const detail = await orderService.getAdminOrderDetail(orderId);
+      if (!detail) {
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `⚠️ *ORDER NOT FOUND*\n\nOrder \`${this.escapeDiagMarkdown(orderId)}\` could not be found.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ord', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      const lookup = await supplierService.lookupOrderReadOnly({
+        supplierOrderRef: detail.supplierOrderRef,
+        idempotencyKey: detail.idempotencyKey,
+      });
+
+      await this.recordOrderAuditLog(userId, 'ADMIN_ORDER_SUPPLIER_LOOKUP', orderId, {
+        mode: 'READ_ONLY',
+        newOrderPlaced: false,
+        walletDebitCreated: false,
+        refundCreated: false,
+        lookupMethod: lookup.lookupMethod,
+        httpStatus: lookup.httpStatus,
+        found: lookup.found,
+        lookupStatus: lookup.status,
+        supplierOrderRef: lookup.order_ref || detail.supplierOrderRef || null,
+        credentialsPresent: (lookup.delivered_items?.length || 0) > 0,
+        credentialsCount: lookup.delivered_items?.length || 0,
+      });
+
+      const resolvedRef = lookup.order_ref || detail.supplierOrderRef || 'NONE';
+      const credCount = lookup.delivered_items?.length || 0;
+      const text =
+        `🔎 *SUPPLIER ORDER LOOKUP (READ-ONLY)*\n\n` +
+        `• Local Order ID: \`${detail.id}\`\n` +
+        `• Supplier Order Ref: \`${this.escapeDiagMarkdown(String(resolvedRef))}\`\n` +
+        `• Current Local Status: *${detail.status}*\n\n` +
+        `📡 *Supplier API Response:*\n` +
+        `• Lookup Method: \`${lookup.lookupMethod}\`\n` +
+        `• HTTP Status: \`${lookup.httpStatus}\`\n` +
+        `• Found: \`${lookup.found ? 'YES' : 'NO'}\`\n` +
+        `• Normalized Status: *${lookup.status.toUpperCase()}*\n` +
+        `• Credentials Available: *${credCount > 0 ? `YES (${credCount})` : 'NO'}*\n` +
+        `• Diagnostic Message: ${this.escapeDiagMarkdown(lookup.message || 'OK')}\n\n` +
+        `_Strictly read-only (GET /order/{ref}). No local state, balance, or order was modified._`;
+
       await telegramClient.editMessageText(chatId, messageId, text, {
         reply_markup: {
           inline_keyboard: [
             ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main' }),
+              ButtonBuilder.buildButton({
+                text: 'Reconcile Order',
+                fallbackEmoji: '🔄',
+                style: 'success',
+                callbackData: `adm:ord_rec:${detail.id}`,
+                forceVisible: true,
+              }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'View Status History',
+                fallbackEmoji: '📜',
+                style: 'default',
+                callbackData: `adm:ord_hst:${detail.id}`,
+                forceVisible: true,
+              }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'Back',
+                fallbackEmoji: '⬅️',
+                style: 'default',
+                callbackData: `adm:ord_det:${detail.id}`,
+                forceVisible: true,
+              }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    // Admin Order Action: Safe Reconcile Order (never places new order, never debits, never refunds)
+    if (data.startsWith('adm:ord_rec:')) {
+      const orderId = data.slice('adm:ord_rec:'.length);
+      const beforeDetail = await orderService.getAdminOrderDetail(orderId);
+      if (!beforeDetail) {
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `⚠️ *ORDER NOT FOUND*\n\nOrder \`${this.escapeDiagMarkdown(orderId)}\` could not be found.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ord', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      const recon = await orderService.reconcileUncertainOrder(orderId, { allowRefund: false });
+      const afterDetail = await orderService.getAdminOrderDetail(orderId);
+
+      let customerDelivered = false;
+      let deliveryError: string | undefined;
+
+      if (recon.status === 'COMPLETED' && recon.newlyCompleted) {
+        try {
+          const custLang = await getUserLanguage(beforeDetail.userId);
+          let custMsg = `${t('order_success', custLang, { orderId: recon.orderId })}\n\n`;
+          if (recon.deliveredItems.length > 0) {
+            custMsg += `\`\`\`\n${recon.deliveredItems.join('\n')}\n\`\`\``;
+          } else {
+            custMsg += `_Status: ${recon.status}. Your access invite has been fulfilled._`;
+          }
+          await telegramClient.sendMessage(Number(beforeDetail.userId), custMsg, {
+            reply_markup: getBackHomeKeyboard('m:ord', custLang),
+          });
+          customerDelivered = true;
+        } catch (err: any) {
+          deliveryError = err?.message || 'Telegram DM delivery failed';
+          logger.error('Admin reconciliation succeeded but XERO KHAN customer DM delivery failed', {
+            orderId: recon.orderId,
+            error: deliveryError,
+          });
+        }
+      }
+
+      await this.recordOrderAuditLog(userId, 'ADMIN_ORDER_RECONCILE', orderId, {
+        previousStatus: beforeDetail.status,
+        resultingStatus: recon.status,
+        newlyCompleted: recon.newlyCompleted,
+        lookupMethod: recon.lookupMethod || 'NONE',
+        lookupStatus: recon.lookupStatus || 'UNKNOWN',
+        httpStatus: recon.httpStatus ?? 0,
+        supplierOrderRef: afterDetail?.supplierOrderRef || recon.supplierOrderRef || null,
+        storedSupplierStatus: afterDetail?.supplierStatus || null,
+        deliveredItemsCount: afterDetail?.deliveredCount ?? recon.deliveredItems.length,
+        credentialsEncrypted: (afterDetail?.deliveredCount ?? 0) > 0,
+        customerDelivered,
+        deliveryError: deliveryError || null,
+        diagnosticReason: recon.message,
+        newOrderPlaced: false,
+        walletDebitCreated: false,
+        refundCreated: false,
+      });
+
+      const resolvedRef = afterDetail?.supplierOrderRef || recon.supplierOrderRef || 'NONE';
+      const storedSupStatus = afterDetail?.supplierStatus || 'NONE';
+      const deliveredCount = afterDetail?.deliveredCount ?? recon.deliveredItems.length;
+
+      let report: string;
+      if (recon.status === 'COMPLETED') {
+        const deliveryLine = recon.newlyCompleted
+          ? customerDelivered
+            ? `• Customer Delivery: *DELIVERED via XERO KHAN* (User \`${beforeDetail.userId}\`)\n`
+            : `• Customer Delivery: ⚠️ *DM FAILED* (${this.escapeDiagMarkdown(deliveryError || 'Unknown')})\n`
+          : `• Customer Delivery: *ALREADY COMPLETED PRIOR*\n`;
+
+        report =
+          `✅ *ORDER RECONCILED & COMPLETED*\n\n` +
+          `• Local Order ID: \`${recon.orderId}\`\n` +
+          `• Supplier Order Ref: \`${this.escapeDiagMarkdown(String(resolvedRef))}\`\n` +
+          `• Local Status: *COMPLETED*\n` +
+          `• Stored Supplier Status: *${this.escapeDiagMarkdown(storedSupStatus)}*\n` +
+          `• Delivered Items Created: *${deliveredCount}* (Encrypted AES-256-GCM)\n` +
+          deliveryLine +
+          `\n🛡️ *Safety Guarantees:*\n` +
+          `• Lookup Used: \`${recon.lookupMethod || 'GET /order/{ref}'}\` (HTTP \`${recon.httpStatus ?? 0}\`)\n` +
+          `• New Supplier Order Placed: *NO*\n` +
+          `• New Wallet Debit / Refund: *NO*`;
+      } else {
+        report =
+          `⚠️ *RECONCILIATION UNRESOLVED — STILL ${recon.status}*\n\n` +
+          `• Local Order ID: \`${recon.orderId}\`\n` +
+          `• Supplier Order Ref: \`${this.escapeDiagMarkdown(String(resolvedRef))}\`\n` +
+          `• Local Status: *${recon.status}*\n` +
+          `• Stored Supplier Status: *${this.escapeDiagMarkdown(storedSupStatus)}*\n` +
+          `• Lookup Method: \`${recon.lookupMethod || 'NONE'}\` (HTTP \`${recon.httpStatus ?? 0}\`)\n` +
+          `• Diagnostic Reason: ${this.escapeDiagMarkdown(recon.message)}\n\n` +
+          `🛡️ *Safety Guarantees:*\n` +
+          `• New Supplier Order Placed: *NO*\n` +
+          `• New Wallet Debit: *NO*\n` +
+          `• Refund Issued: *NO*`;
+      }
+
+      await telegramClient.editMessageText(chatId, messageId, report, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'View Status History',
+                fallbackEmoji: '📜',
+                style: 'default',
+                callbackData: `adm:ord_hst:${orderId}`,
+                forceVisible: true,
+              }),
+            ]),
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'Back',
+                fallbackEmoji: '⬅️',
+                style: 'default',
+                callbackData: `adm:ord_det:${orderId}`,
+                forceVisible: true,
+              }),
+            ]),
+          ],
+        },
+      });
+      return;
+    }
+
+    // Admin Order Action: View Status History
+    if (data.startsWith('adm:ord_hst:')) {
+      const orderId = data.slice('adm:ord_hst:'.length);
+      const hist = await orderService.getAdminOrderStatusHistory(orderId);
+      if (!hist) {
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `⚠️ *ORDER NOT FOUND*\n\nOrder \`${this.escapeDiagMarkdown(orderId)}\` could not be found.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ord', forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      await this.recordOrderAuditLog(userId, 'ADMIN_ORDER_HISTORY_VIEWED', orderId, {
+        currentStatus: hist.order.status,
+        supplierStatus: hist.supplierOrder?.supplierStatus || null,
+      });
+
+      const createdIso = new Date(hist.order.createdAt).toISOString();
+      const updatedIso = new Date(hist.order.updatedAt).toISOString();
+
+      let text =
+        `📜 *ORDER STATUS HISTORY*\n\n` +
+        `• Local Order ID: \`${hist.order.id}\`\n` +
+        `• Local Status: *${hist.order.status}*\n` +
+        `• Created: \`${createdIso}\`\n` +
+        `• Last Updated: \`${updatedIso}\`\n` +
+        (hist.order.errorMessage
+          ? `• Diagnostic Note: ${this.escapeDiagMarkdown(hist.order.errorMessage)}\n`
+          : '');
+
+      if (hist.supplierOrder) {
+        text +=
+          `\n📡 *Supplier Record:*\n` +
+          `• Supplier Order Ref: \`${this.escapeDiagMarkdown(hist.supplierOrder.supplierOrderRef || 'NONE')}\`\n` +
+          `• Supplier Status: *${this.escapeDiagMarkdown(hist.supplierOrder.supplierStatus)}*\n` +
+          `• Updated: \`${new Date(hist.supplierOrder.updatedAt).toISOString()}\`\n`;
+      } else {
+        text += `\n📡 *Supplier Record:* _None stored yet._\n`;
+      }
+
+      text +=
+        `\n🔐 *Delivered Items:* \`${hist.deliveredCount}\` encrypted item(s)` +
+        (hist.firstDeliveredAt ? ` (at \`${new Date(hist.firstDeliveredAt).toISOString()}\`)` : '') +
+        `\n`;
+
+      text += `\n📒 *Wallet Ledger Entries (${hist.ledgerEntries.length}):*\n`;
+      if (hist.ledgerEntries.length === 0) {
+        text += `• _None recorded_\n`;
+      } else {
+        for (const le of hist.ledgerEntries) {
+          text += `• *${le.entryType}*: \`${le.amount} USDT\` (\`${le.operationRef}\`)\n`;
+        }
+      }
+
+      text += `\n🛡️ *Admin Audit Trail:*\n`;
+      if (hist.auditLogs.length === 0) {
+        text += `• _No prior admin actions_`;
+      } else {
+        for (const al of hist.auditLogs.slice(0, 5)) {
+          text += `• \`${al.action}\` by \`${al.adminId}\` at \`${new Date(al.createdAt).toISOString()}\`\n`;
+        }
+      }
+
+      await telegramClient.editMessageText(chatId, messageId, text, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'Back',
+                fallbackEmoji: '⬅️',
+                style: 'default',
+                callbackData: `adm:ord_det:${orderId}`,
+                forceVisible: true,
+              }),
             ]),
           ],
         },
@@ -1507,6 +1887,106 @@ export class AdminHandler {
       await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
     } else {
       await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private formatAdminOrderDetailText(detail: NonNullable<Awaited<ReturnType<typeof orderService.getAdminOrderDetail>>>): string {
+    const customerHandle = detail.customerUsername
+      ? `@${this.escapeDiagMarkdown(detail.customerUsername)}`
+      : detail.customerFirstName
+      ? this.escapeDiagMarkdown(detail.customerFirstName)
+      : 'Customer';
+    const createdIso = new Date(detail.createdAt).toISOString();
+
+    return (
+      `📋 *ADMIN ORDER DETAIL*\n\n` +
+      `• Local Order ID: \`${detail.id}\`\n` +
+      `• Supplier Order Ref: \`${this.escapeDiagMarkdown(detail.supplierOrderRef || 'NONE')}\`\n` +
+      `• Status: *${detail.status}* (Supplier: *${this.escapeDiagMarkdown(detail.supplierStatus || 'NONE')}*)\n` +
+      `• Created Time: \`${createdIso}\`\n` +
+      `• Customer: \`${detail.userId}\` (${customerHandle})\n\n` +
+      `• Product: *${this.escapeDiagMarkdown(detail.productName)}* x${detail.quantity}\n` +
+      `• Amount Paid: \`${detail.totalPrice} USDT\`\n` +
+      `• Delivered Items Stored: *${detail.deliveredCount}*\n` +
+      (detail.errorMessage ? `• Diagnostic Note: ${this.escapeDiagMarkdown(detail.errorMessage)}\n` : '') +
+      `\n_Reconciliation performs read-only GET /order/{ref} only — zero reorders, debits, or refunds._`
+    );
+  }
+
+  private getAdminOrderDetailKeyboard(orderId: string) {
+    return {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'Lookup Supplier Order (Read-Only)',
+            fallbackEmoji: '🔎',
+            style: 'primary',
+            callbackData: `adm:ord_lkp:${orderId}`,
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'Reconcile Order',
+            fallbackEmoji: '🔄',
+            style: 'success',
+            callbackData: `adm:ord_rec:${orderId}`,
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'View Status History',
+            fallbackEmoji: '📜',
+            style: 'default',
+            callbackData: `adm:ord_hst:${orderId}`,
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'Back',
+            fallbackEmoji: '⬅️',
+            style: 'default',
+            callbackData: 'adm:ord',
+            forceVisible: true,
+          }),
+        ]),
+      ],
+    };
+  }
+
+  private async recordOrderAuditLog(
+    adminUserId: string,
+    action: string,
+    orderId: string,
+    details: Record<string, unknown>
+  ): Promise<void> {
+    const maskedAdmin = maskIdentifier(adminUserId);
+    const payload = {
+      adminUserId: maskedAdmin,
+      orderId,
+      ...details,
+    };
+    logger.info(action, payload);
+    try {
+      await db.query(
+        `INSERT INTO admin_audit_logs (id, admin_id, action, target_entity, target_id, details)
+         VALUES ($1, $2, $3, 'local_orders', $4, $5)`,
+        [
+          `aud_ord_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          maskedAdmin,
+          action,
+          orderId,
+          JSON.stringify(payload),
+        ]
+      );
+    } catch (auditErr: any) {
+      logger.warn('Failed to persist admin order audit log (non-fatal)', {
+        action,
+        orderId,
+        error: auditErr?.message,
+      });
     }
   }
 }

@@ -5775,6 +5775,245 @@ export async function runComprehensiveTests() {
     }
   });
 
+  await it('Contract 8: Admin Order Detail, Read-Only Lookup, Safe Reconcile (no reorder/debit/refund), XERO KHAN delivery, Status History & Audit Logging', 'mock_integration', async () => {
+    const adminId = 123456789;
+    const customerId = 82005;
+    if (!config.telegram.adminIds.includes(String(adminId))) {
+      config.telegram.adminIds.push(String(adminId));
+    }
+
+    await ensureAuditUser(String(customerId), '10.0000');
+    const prodId = await insertTestProduct({ id: 'contract_adm_rec', name: 'Admin Reconcile Pro', your_cost: 1.50, stock: 10 });
+    await pricingService.setFixedRetailPrice(prodId, '2.50', String(adminId));
+
+    const orderId = 'ord_1799999999000_r1a2b';
+    const supplierRef = 'ORDERHSECSG251Z';
+    const idempKey = 'idemp_contract8_orderhsecsg251z';
+
+    // Clean slate for deterministic re-runs
+    await db.query('DELETE FROM admin_audit_logs WHERE target_id = $1', [orderId]);
+    await db.query('DELETE FROM delivered_items WHERE local_order_id = $1', [orderId]);
+    await db.query('DELETE FROM supplier_orders WHERE local_order_id = $1', [orderId]);
+    await db.query('DELETE FROM local_orders WHERE id = $1', [orderId]);
+
+    // Debit wallet once via immutable ledger (simulating initial purchase that ended UNCERTAIN)
+    await walletService.executeMutation({
+      userId: String(customerId),
+      amount: new Decimal('2.5000'),
+      operationRef: `PURCHASE_${orderId}`,
+      idempotencyKey: `PURCHASE_${orderId}`,
+      entryType: 'PURCHASE_DEBIT',
+      reason: 'Initial order checkout before uncertain supplier timeout',
+      source: 'ORDER_CHECKOUT',
+      actor: String(customerId),
+      metadata: { orderId },
+    });
+
+    await db.query(
+      `INSERT INTO local_orders (id, user_id, product_id, quantity, unit_price, total_price, supplier_cost, status, idempotency_key, error_message)
+       VALUES ($1, $2, $3, 1, 2.50, 2.50, 1.50, 'UNCERTAIN', $4, 'Initial supplier POST timeout')`,
+      [orderId, String(customerId), prodId, idempKey]
+    );
+    await db.query(
+      `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
+       VALUES ($1, $2, $3, $4, 'UNCERTAIN', '{}')`,
+      ['so_contract8_1', orderId, supplierRef, idempKey]
+    );
+
+    const balanceBefore = (await walletService.getBalance(String(customerId))).balance.toFixed(4);
+    const ledgerBeforeRes = await db.queryRow<{ c: string }>(
+      'SELECT COUNT(*) as c FROM ledger_entries WHERE operation_ref IN ($1, $2)',
+      [`PURCHASE_${orderId}`, `REFUND_${orderId}`]
+    );
+    const ledgerCountBefore = parseInt(ledgerBeforeRes?.c || '0', 10);
+
+    const requests: Array<{ method: string; url: string }> = [];
+    const tgCalls: Array<{ method: string; body: any }> = [];
+    let supplierMode: 'pending' | 'failed' | 'completed' = 'pending';
+
+    supplierService.setTestApiKey('mock_contract8_key');
+    supplierService.setFetchOverride(async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ method, url });
+      if (url.includes(`/order/${supplierRef}`)) {
+        if (supplierMode === 'pending') {
+          return new Response(JSON.stringify({ success: true, order_ref: supplierRef, status: 'pending' }), { status: 200 });
+        }
+        if (supplierMode === 'failed') {
+          return new Response(
+            JSON.stringify({ success: false, order_ref: supplierRef, status: 'failed', message: 'Upstream manual hold' }),
+            { status: 200 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            success: true,
+            order_ref: supplierRef,
+            status: 'completed',
+            items: [],
+            credentials: ['reconciled.user@mail.com:SafePass9988'],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/orders')) {
+        return new Response(JSON.stringify({ orders: [] }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    telegramClient.setTransportOverride(async (method, body) => {
+      tgCalls.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9991 } };
+    });
+
+    const fireAdminCb = async (callbackData: string, fromId = adminId) => {
+      tgCalls.length = 0;
+      return await telegramBotRouter.handleUpdate({
+        update_id: Math.floor(Math.random() * 1000000) + 50000,
+        callback_query: {
+          id: `cb_${Date.now()}_${Math.random()}`,
+          from: { id: fromId, is_bot: false, first_name: 'Actor' },
+          data: callbackData,
+          message: {
+            message_id: 404,
+            chat: { id: fromId, type: 'private' as const },
+            date: Math.floor(Date.now() / 1000),
+            text: 'Admin view',
+          },
+        },
+      });
+    };
+
+    try {
+      // 1. Registered routes & non-admin authorization gate
+      assert.strictEqual(isRegisteredCallbackRoute('adm:ord'), true);
+      assert.strictEqual(isRegisteredCallbackRoute('adm:ord_unc'), true);
+      assert.strictEqual(isRegisteredCallbackRoute(`adm:ord_det:${orderId}`), true);
+      assert.strictEqual(isRegisteredCallbackRoute(`adm:ord_lkp:${orderId}`), true);
+      assert.strictEqual(isRegisteredCallbackRoute(`adm:ord_rec:${orderId}`), true);
+      assert.strictEqual(isRegisteredCallbackRoute(`adm:ord_hst:${orderId}`), true);
+
+      await fireAdminCb(`adm:ord_rec:${orderId}`, customerId);
+      assert.strictEqual(
+        tgCalls.some(c => c.method === 'answerCallbackQuery' && String(c.body.text).includes('Access Denied')),
+        true,
+        'Non-admin must be denied access to admin order reconciliation'
+      );
+
+      // 2. Opening adm:ord lists the UNCERTAIN order button & tapping opens Order Detail
+      await fireAdminCb('adm:ord');
+      const ordListEdit = tgCalls.find(c => c.method === 'editMessageText');
+      assert.ok(ordListEdit);
+      const uncBtn = ordListEdit!.body.reply_markup.inline_keyboard
+        .flat()
+        .find((b: any) => b.callback_data === `adm:ord_det:${orderId}`);
+      assert.ok(uncBtn, 'UNCERTAIN order must be clickable from Admin Orders list');
+
+      await fireAdminCb(`adm:ord_det:${orderId}`);
+      const detailEdit = tgCalls.find(c => c.method === 'editMessageText');
+      assert.ok(detailEdit);
+      const detailText = String(detailEdit!.body.text);
+      assert.ok(detailText.includes(orderId), 'Detail screen must show Local Order ID');
+      assert.ok(detailText.includes(supplierRef), 'Detail screen must show Supplier Order Ref');
+      assert.ok(detailText.includes('UNCERTAIN'), 'Detail screen must show Status');
+      assert.ok(detailText.includes('Created Time:'), 'Detail screen must show Created Time');
+      assert.ok(detailText.includes(String(customerId)), 'Detail screen must show Customer');
+
+      const detailBtns = detailEdit!.body.reply_markup.inline_keyboard.flat();
+      assert.ok(detailBtns.some((b: any) => b.text === '🔎 Lookup Supplier Order (Read-Only)' && b.callback_data === `adm:ord_lkp:${orderId}`));
+      assert.ok(detailBtns.some((b: any) => b.text === '🔄 Reconcile Order' && b.callback_data === `adm:ord_rec:${orderId}`));
+      assert.ok(detailBtns.some((b: any) => b.text === '📜 View Status History' && b.callback_data === `adm:ord_hst:${orderId}`));
+      assert.ok(detailBtns.some((b: any) => b.text === '⬅️ Back' && b.callback_data === 'adm:ord'));
+
+      // 3. Read-Only Lookup leaves DB UNCERTAIN with zero POST /order & zero balance changes + writes audit log
+      requests.length = 0;
+      await fireAdminCb(`adm:ord_lkp:${orderId}`);
+      assert.strictEqual(requests.every(r => r.method === 'GET' && !r.url.endsWith('/order')), true, 'Lookup must be GET-only');
+      const lkpEdit = tgCalls.find(c => c.method === 'editMessageText');
+      assert.ok(String(lkpEdit?.body?.text).includes('LOOKUP (READ-ONLY)'));
+      const orderAfterLookup = await db.queryRow<any>('SELECT status FROM local_orders WHERE id = $1', [orderId]);
+      assert.strictEqual(orderAfterLookup?.status, 'UNCERTAIN');
+
+      // 4. Reconcile while still unresolved (pending) & when supplier reports failed (must stay UNCERTAIN, ZERO refund/debit/POST)
+      supplierMode = 'pending';
+      requests.length = 0;
+      await fireAdminCb(`adm:ord_rec:${orderId}`);
+      assert.strictEqual(requests.some(r => r.method === 'POST'), false, 'Reconcile must NEVER call POST /order');
+      assert.strictEqual(requests.some(r => r.url.includes(`/order/${supplierRef}`)), true, 'Reconcile must call GET /order/{ref}');
+      const pendingEdit = tgCalls.find(c => c.method === 'editMessageText');
+      assert.ok(String(pendingEdit?.body?.text).includes('STILL UNCERTAIN'));
+      assert.ok(String(pendingEdit?.body?.text).includes('Diagnostic Reason:'));
+
+      supplierMode = 'failed';
+      requests.length = 0;
+      await fireAdminCb(`adm:ord_rec:${orderId}`);
+      assert.strictEqual(requests.some(r => r.method === 'POST'), false, 'Failed supplier reconcile must NEVER call POST /order');
+      const failedEdit = tgCalls.find(c => c.method === 'editMessageText');
+      assert.ok(String(failedEdit?.body?.text).includes('STILL UNCERTAIN'));
+      const orderStillUncertain = await db.queryRow<any>('SELECT status FROM local_orders WHERE id = $1', [orderId]);
+      assert.strictEqual(orderStillUncertain?.status, 'UNCERTAIN');
+
+      // Verify zero refund or extra debit occurred while unresolved
+      assert.strictEqual((await walletService.getBalance(String(customerId))).balance.toFixed(4), balanceBefore);
+
+      // 5. Reconcile when credentials exist -> encrypted delivered_items, COMPLETED, supplier status stored, XERO KHAN DM delivered
+      supplierMode = 'completed';
+      requests.length = 0;
+      await fireAdminCb(`adm:ord_rec:${orderId}`);
+
+      assert.strictEqual(requests.some(r => r.method === 'POST'), false, 'Reconcile must NEVER call POST /order');
+      assert.strictEqual(requests.some(r => r.method === 'GET' && r.url.includes(`/order/${supplierRef}`)), true);
+
+      const finalOrder = await db.queryRow<any>('SELECT status, error_message FROM local_orders WHERE id = $1', [orderId]);
+      assert.strictEqual(finalOrder?.status, 'COMPLETED');
+
+      const finalSupplierOrder = await db.queryRow<any>('SELECT supplier_status, response_payload FROM supplier_orders WHERE local_order_id = $1', [orderId]);
+      assert.strictEqual(finalSupplierOrder?.supplier_status, 'COMPLETED');
+      assert.strictEqual(String(finalSupplierOrder?.response_payload).includes('SafePass9988'), false);
+
+      const delItems = await db.query<any>('SELECT content FROM delivered_items WHERE local_order_id = $1', [orderId]);
+      assert.strictEqual(delItems.rows.length, 1);
+      assert.ok(delItems.rows[0].content.startsWith('v1:'), 'Delivered credentials must be encrypted at rest');
+      assert.strictEqual(encryptionService.decrypt(delItems.rows[0].content), 'reconciled.user@mail.com:SafePass9988');
+
+      // Customer Telegram DM delivery verified via XERO KHAN
+      const custDm = tgCalls.find(c => c.method === 'sendMessage' && Number(c.body.chat_id) === customerId);
+      assert.ok(custDm, 'Customer must receive credentials via XERO KHAN DM upon reconciliation completion');
+      assert.ok(String(custDm!.body.text).includes('reconciled.user@mail.com:SafePass9988'));
+
+      // Verify zero wallet balance mutation and zero new ledger entries (no extra debit, no refund)
+      assert.strictEqual((await walletService.getBalance(String(customerId))).balance.toFixed(4), balanceBefore);
+      const ledgerAfterRes = await db.queryRow<{ c: string }>(
+        'SELECT COUNT(*) as c FROM ledger_entries WHERE operation_ref IN ($1, $2)',
+        [`PURCHASE_${orderId}`, `REFUND_${orderId}`]
+      );
+      assert.strictEqual(parseInt(ledgerAfterRes?.c || '0', 10), ledgerCountBefore);
+
+      // 6. Status History & Audit Logging verification
+      await fireAdminCb(`adm:ord_hst:${orderId}`);
+      const hstEdit = tgCalls.find(c => c.method === 'editMessageText');
+      assert.ok(String(hstEdit?.body?.text).includes('ORDER STATUS HISTORY'));
+      assert.ok(String(hstEdit?.body?.text).includes('COMPLETED'));
+      assert.strictEqual(String(hstEdit?.body?.text).includes('SafePass9988'), false, 'Status history must never leak plaintext credentials');
+
+      const audits = await db.query<any>(
+        'SELECT action, details FROM admin_audit_logs WHERE target_entity = $1 AND target_id = $2 ORDER BY created_at ASC',
+        ['local_orders', orderId]
+      );
+      const auditActions = audits.rows.map(r => r.action);
+      assert.ok(auditActions.includes('ADMIN_ORDER_SUPPLIER_LOOKUP'));
+      assert.ok(auditActions.includes('ADMIN_ORDER_RECONCILE'));
+      assert.ok(auditActions.includes('ADMIN_ORDER_HISTORY_VIEWED'));
+      for (const a of audits.rows) {
+        assert.strictEqual(String(a.details).includes('SafePass9988'), false, 'Audit logs must never leak plaintext credentials');
+      }
+    } finally {
+      supplierService.resetTestState();
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
   // SUMMARY & STATS DYNAMIC COMPUTATION
   const total = testResults.length;
   const passed = testResults.filter(r => r.status === 'PASS').length;
