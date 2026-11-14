@@ -199,35 +199,107 @@ export class SupplierService {
     return headers;
   }
 
+  private static readonly DELIVERED_STATUS_ALIASES = new Set([
+    'completed',
+    'complete',
+    'delivered',
+    'fulfilled',
+    'done',
+    'success',
+    'ok',
+    'processed',
+    'ready',
+    'replayed',
+  ]);
+
+  private static readonly PENDING_INVITE_ALIASES = new Set([
+    'pending_invite',
+    'awaiting_invite',
+  ]);
+
+  private static readonly PENDING_STATUS_ALIASES = new Set([
+    'pending',
+    'processing',
+    'queued',
+    'in_progress',
+  ]);
+
+  private static readonly FAILED_STATUS_ALIASES = new Set([
+    'failed',
+    'rejected',
+    'cancelled',
+    'canceled',
+    'expired',
+    'refunded',
+  ]);
+
+  private hasNonBenignErrorCode(errorCode: unknown): boolean {
+    if (errorCode === undefined || errorCode === null) return false;
+    const norm = String(errorCode).trim().toLowerCase();
+    return norm.length > 0 && norm !== 'none' && norm !== 'null' && norm !== 'ok' && norm !== '0';
+  }
+
+  private unwrapOrderEnvelope(data: any): any {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    const nested =
+      (data.order && typeof data.order === 'object' && !Array.isArray(data.order) && data.order) ||
+      (data.data && typeof data.data === 'object' && !Array.isArray(data.data) && data.data) ||
+      (data.result && typeof data.result === 'object' && !Array.isArray(data.result) && data.result);
+    if (!nested) return data;
+    return { ...data, ...nested };
+  }
+
+  private extractOrderRef(record: any, fallback?: any): string | undefined {
+    const candidate =
+      record?.order_ref ??
+      record?.ref ??
+      record?.reference ??
+      record?.order_id ??
+      record?.orderId ??
+      record?.order_no ??
+      record?.orderNo ??
+      record?.id ??
+      fallback?.order_ref ??
+      fallback?.ref ??
+      fallback?.reference ??
+      fallback?.order_id ??
+      fallback?.orderId ??
+      fallback?.id;
+    if (candidate === undefined || candidate === null) return undefined;
+    const trimmed = String(candidate).trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
   private normalizeLookupStatus(rawStatus: unknown, record: any): SupplierOrderLookupStatus {
-    const norm = typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : '';
+    const unwrapped = this.unwrapOrderEnvelope(record);
+    const norm = typeof rawStatus === 'string'
+      ? rawStatus.trim().toLowerCase()
+      : typeof unwrapped?.status === 'string'
+      ? unwrapped.status.trim().toLowerCase()
+      : '';
 
     if (
+      unwrapped?.success === false ||
       record?.success === false ||
-      norm === 'failed' ||
-      norm === 'rejected' ||
-      norm === 'cancelled' ||
-      norm === 'canceled' ||
-      norm === 'expired' ||
-      norm === 'refunded' ||
-      (norm === 'error' && Boolean(record?.error_code))
+      SupplierService.FAILED_STATUS_ALIASES.has(norm) ||
+      (norm === 'error' && this.hasNonBenignErrorCode(unwrapped?.error_code ?? record?.error_code))
     ) {
       return 'failed';
     }
 
-    if (norm === 'pending_invite' || norm === 'awaiting_invite') {
+    if (SupplierService.PENDING_INVITE_ALIASES.has(norm)) {
       return 'pending_invite';
     }
 
-    if (norm === 'pending' || norm === 'processing' || norm === 'queued' || norm === 'in_progress') {
+    if (SupplierService.PENDING_STATUS_ALIASES.has(norm)) {
       return 'pending';
     }
 
-    if (norm === 'completed' || norm === 'delivered' || norm === 'fulfilled' || norm === 'replayed') {
+    if (SupplierService.DELIVERED_STATUS_ALIASES.has(norm)) {
       return 'completed';
     }
 
-    if (this.extractDeliveredItems(record).length > 0) {
+    if (this.extractDeliveredItems(unwrapped).length > 0) {
       return 'completed';
     }
 
@@ -235,19 +307,25 @@ export class SupplierService {
   }
 
   private parseOrderRecord(raw: any): SupplierOrderLookupRecord {
-    const deliveredItems = this.extractDeliveredItems(raw);
-    const orderRef = raw?.order_ref || raw?.ref || raw?.reference || raw?.id || undefined;
-    const idempotencyKey = raw?.idempotency_key || raw?.idempotencyKey || undefined;
+    const unwrapped = this.unwrapOrderEnvelope(raw);
+    const deliveredItems = this.extractDeliveredItems(unwrapped);
+    const orderRef = this.extractOrderRef(unwrapped, raw);
+    const idempotencyKey = unwrapped?.idempotency_key || unwrapped?.idempotencyKey || raw?.idempotency_key || undefined;
     return {
-      order_ref: orderRef !== undefined ? String(orderRef) : undefined,
-      id: raw?.id !== undefined ? String(raw.id) : undefined,
+      order_ref: orderRef,
+      id: unwrapped?.id !== undefined ? String(unwrapped.id) : undefined,
       idempotency_key: idempotencyKey !== undefined ? String(idempotencyKey) : undefined,
-      status: typeof raw?.status === 'string' ? raw.status : '',
-      product_id: raw?.product_id,
-      quantity: typeof raw?.quantity === 'number' ? raw.quantity : undefined,
-      total_cost: raw?.total_cost !== undefined ? String(raw.total_cost) : raw?.amount !== undefined ? String(raw.amount) : undefined,
+      status: typeof unwrapped?.status === 'string' ? unwrapped.status : '',
+      product_id: unwrapped?.product_id,
+      quantity: typeof unwrapped?.quantity === 'number' ? unwrapped.quantity : undefined,
+      total_cost:
+        unwrapped?.total_cost !== undefined
+          ? String(unwrapped.total_cost)
+          : unwrapped?.amount !== undefined
+          ? String(unwrapped.amount)
+          : undefined,
       delivered_items: deliveredItems,
-      created_at: raw?.created_at || raw?.createdAt,
+      created_at: unwrapped?.created_at || unwrapped?.createdAt,
       raw,
     };
   }
@@ -526,13 +604,8 @@ export class SupplierService {
         };
       }
 
-      // Unwrap `{ order: {...} }` or `{ data: {...} }` response envelopes safely
-      const record =
-        data.order && typeof data.order === 'object' && !Array.isArray(data.order)
-          ? data.order
-          : data.data && typeof data.data === 'object' && !Array.isArray(data.data)
-          ? data.data
-          : data;
+      // Unwrap `{ order: {...} }`, `{ data: {...} }`, or `{ result: {...} }` response envelopes safely
+      const record = this.unwrapOrderEnvelope(data);
 
       if (data.success === false && !record?.status && String(data.error_code || '').toUpperCase().includes('NOT_FOUND')) {
         return {
@@ -973,21 +1046,107 @@ export class SupplierService {
     return 'cat_ai-tools'; // Default fallback
   }
 
+  private normalizeDeliveryValue(val: unknown): string[] {
+    if (val === undefined || val === null) return [];
+    if (Array.isArray(val)) {
+      return val
+        .map((item: any) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item === 'object') {
+            if (Object.keys(item).length === 0) return '';
+            return JSON.stringify(item);
+          }
+          if (typeof item === 'number' || typeof item === 'boolean') return String(item);
+          return '';
+        })
+        .filter((s: string) => s.trim().length > 0);
+    }
+    if (typeof val === 'string') {
+      return val.trim().length > 0 ? [val] : [];
+    }
+    if (typeof val === 'object') {
+      return Object.keys(val as Record<string, unknown>).length > 0 ? [JSON.stringify(val)] : [];
+    }
+    if (typeof val === 'number' || typeof val === 'boolean') {
+      return [String(val)];
+    }
+    return [];
+  }
+
   /**
-   * Extract normalized delivered item strings from supplier payload.
+   * Extract normalized delivered item strings from supplier payload across
+   * documented and real-world AiToolShop / reseller envelopes and field aliases.
    */
   private extractDeliveredItems(data: any): string[] {
-    const rawList = Array.isArray(data?.items)
-      ? data.items
-      : Array.isArray(data?.delivered_items)
-      ? data.delivered_items
-      : data?.content !== undefined && data?.content !== null
-      ? [data.content]
-      : [];
+    if (!data || typeof data !== 'object') return [];
 
-    return rawList
-      .map((item: any) => (typeof item === 'string' ? item : JSON.stringify(item)))
-      .filter((s: string) => s.trim().length > 0);
+    const containers: any[] = [];
+    const seen = new Set<any>();
+    const pushContainer = (obj: any) => {
+      if (obj && typeof obj === 'object' && !Array.isArray(obj) && !seen.has(obj)) {
+        seen.add(obj);
+        containers.push(obj);
+      }
+    };
+
+    pushContainer(this.unwrapOrderEnvelope(data));
+    pushContainer(data);
+    pushContainer(data.order);
+    pushContainer(data.data);
+    pushContainer(data.result);
+    pushContainer(data.delivery);
+
+    const deliveryKeys = [
+      'delivered_items',
+      'deliveredItems',
+      'items',
+      'credentials',
+      'accounts',
+      'account',
+      'account_details',
+      'delivered',
+      'delivery_content',
+      'deliveryContent',
+      'license_keys',
+      'licenseKeys',
+      'license_key',
+      'licenseKey',
+      'licenses',
+      'license',
+      'keys',
+      'codes',
+      'pins',
+      'secrets',
+      'secret',
+      'credential',
+      'content',
+      'access',
+      'invite_link',
+      'inviteLink',
+    ];
+
+    for (const container of containers) {
+      for (const key of deliveryKeys) {
+        if (Object.prototype.hasOwnProperty.call(container, key)) {
+          const extracted = this.normalizeDeliveryValue(container[key]);
+          if (extracted.length > 0) {
+            return extracted;
+          }
+        }
+      }
+      // If `delivery` or `result` is a direct string or Array (not metadata wrapper object)
+      for (const directKey of ['delivery', 'result']) {
+        const directVal = container[directKey];
+        if (typeof directVal === 'string' || Array.isArray(directVal)) {
+          const extracted = this.normalizeDeliveryValue(directVal);
+          if (extracted.length > 0) {
+            return extracted;
+          }
+        }
+      }
+    }
+
+    return [];
   }
 
   /**
@@ -1056,27 +1215,69 @@ export class SupplierService {
         };
       }
 
-      const rawStatus = typeof data.status === 'string' ? data.status.trim().toLowerCase() : '';
-      const orderRef = data.order_ref || data.id || undefined;
+      const record = this.unwrapOrderEnvelope(data);
+      const rawStatus = typeof record?.status === 'string'
+        ? record.status.trim().toLowerCase()
+        : typeof data.status === 'string'
+        ? data.status.trim().toLowerCase()
+        : '';
+      const orderRef = this.extractOrderRef(record, data);
       const deliveredItems = this.extractDeliveredItems(data);
 
       if (res.status === 200 || res.status === 201) {
+        const explicitFailure =
+          data.success === false ||
+          record?.success === false ||
+          SupplierService.FAILED_STATUS_ALIASES.has(rawStatus) ||
+          (rawStatus === 'error' && this.hasNonBenignErrorCode(record?.error_code ?? data.error_code)) ||
+          this.hasNonBenignErrorCode(record?.error_code ?? data.error_code);
+
         // Guard against "fake 200" error envelopes or explicit failure flags inside HTTP 200
-        if (data.success === false || rawStatus === 'failed' || rawStatus === 'rejected' || Boolean(data.error_code)) {
+        if (explicitFailure) {
           return {
             success: false,
             status: 'failed',
             order_ref: orderRef,
-            error_code: data.error_code || 'SUPPLIER_REJECTED',
-            message: data.message || 'Supplier rejected order inside 200 envelope',
+            error_code: record?.error_code || data.error_code || 'SUPPLIER_REJECTED',
+            message: record?.message || data.message || 'Supplier rejected order inside 200 envelope',
             raw: data,
           };
         }
 
-        if (rawStatus === 'completed' || rawStatus === 'pending_invite' || rawStatus === 'pending' || rawStatus === 'replayed') {
+        if (rawStatus === 'replayed') {
           return {
             success: true,
-            status: rawStatus as SupplierOrderResponse['status'],
+            status: 'replayed',
+            order_ref: orderRef,
+            delivered_items: deliveredItems,
+            raw: data,
+          };
+        }
+
+        if (SupplierService.DELIVERED_STATUS_ALIASES.has(rawStatus)) {
+          return {
+            success: true,
+            status: 'completed',
+            order_ref: orderRef,
+            delivered_items: deliveredItems,
+            raw: data,
+          };
+        }
+
+        if (SupplierService.PENDING_INVITE_ALIASES.has(rawStatus)) {
+          return {
+            success: true,
+            status: 'pending_invite',
+            order_ref: orderRef,
+            delivered_items: deliveredItems,
+            raw: data,
+          };
+        }
+
+        if (SupplierService.PENDING_STATUS_ALIASES.has(rawStatus)) {
+          return {
+            success: true,
+            status: 'pending',
             order_ref: orderRef,
             delivered_items: deliveredItems,
             raw: data,
@@ -1099,6 +1300,7 @@ export class SupplierService {
           status: 'failed',
           error_code: 'UNCERTAIN_MALFORMED_RESPONSE',
           message: 'Supplier returned 200 without recognized status, order reference, or delivery payload.',
+          raw: data,
         };
       }
 

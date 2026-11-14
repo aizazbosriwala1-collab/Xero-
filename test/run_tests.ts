@@ -5686,6 +5686,95 @@ export async function runComprehensiveTests() {
     }
   });
 
+  await it('Contract 7: Real-world delivered credential envelopes (ORDERHSECSG251Z variants) classify COMPLETED instead of UNCERTAIN', 'mock_integration', async () => {
+    const origLive = config.safety.liveOrderingEnabled;
+    config.safety.liveOrderingEnabled = true;
+
+    const payloads: Array<{ name: string; body: any; expectedPlain: string }> = [
+      {
+        name: 'completed_credentials_array_with_empty_items',
+        body: {
+          success: true,
+          status: 'completed',
+          order_ref: 'ORDERHSECSG251Z_A',
+          items: [],
+          credentials: ['credA@mail.com:SecretPassA1'],
+        },
+        expectedPlain: 'credA@mail.com:SecretPassA1',
+      },
+      {
+        name: 'nested_order_envelope_delivered_status_account_string',
+        body: {
+          success: true,
+          order: {
+            ref: 'ORDERHSECSG251Z_B',
+            status: 'delivered',
+            account: 'credB@mail.com:SecretPassB2',
+          },
+        },
+        expectedPlain: 'credB@mail.com:SecretPassB2',
+      },
+      {
+        name: 'nested_data_envelope_fulfilled_status_delivered_key',
+        body: {
+          success: true,
+          order_ref: 'ORDERHSECSG251Z_C',
+          status: 'fulfilled',
+          data: {
+            delivered: ['credC@mail.com:SecretPassC3'],
+          },
+        },
+        expectedPlain: 'credC@mail.com:SecretPassC3',
+      },
+      {
+        name: 'top_level_string_delivered_items_and_success_status',
+        body: {
+          status: 'success',
+          order_id: 'ORDERHSECSG251Z_D',
+          delivered_items: 'credD@mail.com:SecretPassD4',
+        },
+        expectedPlain: 'credD@mail.com:SecretPassD4',
+      },
+    ];
+
+    let idx = 0;
+    supplierService.setTestApiKey('mock_contract_key');
+    supplierService.setFetchOverride(async () => {
+      const current = payloads[idx];
+      return new Response(JSON.stringify(current.body), { status: 200 });
+    });
+
+    try {
+      const uid = '82004';
+      await ensureAuditUser(uid, '20.0000');
+      const prodId = await insertTestProduct({ id: 'contract_cred_classify', name: 'Credential Variant SKU', your_cost: 1.00, stock: 20 });
+      await pricingService.setFixedRetailPrice(prodId, '2.00', '123456789');
+
+      for (let i = 0; i < payloads.length; i++) {
+        idx = i;
+        const variant = payloads[i];
+        const res = await orderService.checkout({ userId: uid, productId: prodId, quantity: 1 });
+        assert.strictEqual(res.status, 'COMPLETED', `Variant ${variant.name} should classify COMPLETED, got ${res.status}`);
+        assert.strictEqual(res.success, true);
+        assert.deepStrictEqual(res.deliveredItems, [variant.expectedPlain]);
+
+        const delRow = await db.queryRow<any>('SELECT content FROM delivered_items WHERE local_order_id = $1', [res.orderId]);
+        assert.ok(delRow?.content?.startsWith('v1:'), `Variant ${variant.name} must encrypt credentials at rest`);
+        assert.strictEqual(encryptionService.decrypt(delRow.content), variant.expectedPlain);
+
+        const soRow = await db.queryRow<any>('SELECT supplier_status, response_payload FROM supplier_orders WHERE local_order_id = $1', [res.orderId]);
+        assert.strictEqual(soRow?.supplier_status, 'COMPLETED');
+        assert.strictEqual(String(soRow?.response_payload).includes('SecretPass'), false, `Variant ${variant.name} must redact stored response_payload`);
+      }
+
+      const bal = await walletService.getBalance(uid);
+      assert.strictEqual(bal.balance.toFixed(4), '12.0000');
+    } finally {
+      config.safety.liveOrderingEnabled = origLive;
+      supplierService.resetTestState();
+    }
+  });
+
   // SUMMARY & STATS DYNAMIC COMPUTATION
   const total = testResults.length;
   const passed = testResults.filter(r => r.status === 'PASS').length;
