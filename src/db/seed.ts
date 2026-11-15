@@ -75,26 +75,35 @@ export async function seedInitialData(): Promise<void> {
     logger.info('Seeded Binance Pay method');
   }
 
-  // 2. Seed Default Product Categories
-  const existingCategories = await db.query('SELECT slug FROM product_categories');
-  const existingCategorySlugs = new Set(existingCategories.rows.map(r => r.slug));
-
+  // 2. Seed & Align Clean 6-Category Storefront (non-destructive: keeps overrides/FKs intact)
   const defaultCategories = [
-    { slug: 'ai-tools', name: '🤖 AI & Assistants', order: 1 },
-    { slug: 'streaming', name: '🎬 Streaming & Media', order: 2 },
-    { slug: 'developer', name: '💻 Dev & Cloud Tools', order: 3 },
-    { slug: 'design', name: '🎨 Design & Productivity', order: 4 },
-    { slug: 'vpn-security', name: '🛡️ VPN & Security', order: 5 },
+    { slug: 'ai-tools', name: '🤖 AI Tools', order: 1 },
+    { slug: 'design', name: '🎨 Design Tools', order: 2 },
+    { slug: 'courses', name: '📚 Courses', order: 3 },
+    { slug: 'streaming', name: '🎬 Streaming', order: 4 },
+    { slug: 'vpn-security', name: '🌐 VPN', order: 5 },
+    { slug: 'gaming', name: '🎮 Gaming', order: 6 },
   ];
 
   for (const cat of defaultCategories) {
-    if (!existingCategorySlugs.has(cat.slug)) {
-      await db.query(`
-        INSERT INTO product_categories (id, slug, name, display_order, is_visible)
-        VALUES ($1, $2, $3, $4, true)
-      `, [`cat_${cat.slug}`, cat.slug, cat.name, cat.order]);
-    }
+    await db.query(
+      `INSERT INTO product_categories (id, slug, name, display_order, is_visible)
+       VALUES ($1, $2, $3, $4, true)
+       ON CONFLICT (slug) DO UPDATE SET
+         name = EXCLUDED.name,
+         display_order = EXCLUDED.display_order,
+         is_visible = true,
+         updated_at = CURRENT_TIMESTAMP`,
+      [`cat_${cat.slug}`, cat.slug, cat.name, cat.order]
+    );
   }
+
+  // Keep legacy developer category hidden from the minimal 6-category grid without breaking product mappings
+  await db.query(
+    `UPDATE product_categories
+     SET is_visible = FALSE, display_order = 99, updated_at = CURRENT_TIMESTAMP
+     WHERE slug = 'developer' AND is_visible = TRUE`
+  );
 
   // 3. Seed Primary Supplier Control Record (never deletable from UI)
   await db.query(`

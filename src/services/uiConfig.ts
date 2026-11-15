@@ -76,94 +76,46 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
     },
   },
 
-  // Main Menu Inline Buttons
+  // Main Menu Inline Buttons (Minimal 5-Button Apple-Style Home)
   {
     settingKey: 'btn.menu.products',
     section: 'main_menu',
-    textValue: 'PRODUCTS',
-    fallbackEmoji: '🛍️',
+    textValue: 'Products',
+    fallbackEmoji: '🛍',
     buttonStyle: 'primary',
-    localizedText: { en: 'PRODUCTS', ur: 'پروڈکٹس', 'ur-ro': 'PRODUCTS' },
+    localizedText: { en: 'Products', ur: 'پروڈکٹس', 'ur-ro': 'Products' },
   },
   {
-    settingKey: 'btn.menu.featured',
+    settingKey: 'btn.menu.free_stuff',
     section: 'main_menu',
-    textValue: 'FEATURED',
-    fallbackEmoji: '🔥',
-    buttonStyle: 'primary',
-    localizedText: { en: 'FEATURED', ur: 'نمایاں', 'ur-ro': 'FEATURED' },
-  },
-  {
-    settingKey: 'btn.menu.search',
-    section: 'main_menu',
-    textValue: 'SEARCH',
-    fallbackEmoji: '🔎',
-    buttonStyle: 'primary',
-    localizedText: { en: 'SEARCH', ur: 'تلاش', 'ur-ro': 'SEARCH' },
+    textValue: 'Get Free Stuff',
+    fallbackEmoji: '🎁',
+    buttonStyle: 'success',
+    localizedText: { en: 'Get Free Stuff', ur: 'مفت انعامات', 'ur-ro': 'Get Free Stuff' },
   },
   {
     settingKey: 'btn.menu.wallet',
     section: 'main_menu',
-    textValue: 'WALLET',
+    textValue: 'Wallet',
     fallbackEmoji: '💳',
     buttonStyle: 'default',
-    localizedText: { en: 'WALLET', ur: 'والٹ', 'ur-ro': 'WALLET' },
-  },
-  {
-    settingKey: 'btn.menu.add_funds',
-    section: 'main_menu',
-    textValue: 'ADD FUNDS',
-    fallbackEmoji: '➕',
-    buttonStyle: 'success',
-    localizedText: { en: 'ADD FUNDS', ur: 'رقم جمع کریں', 'ur-ro': 'ADD FUNDS' },
+    localizedText: { en: 'Wallet', ur: 'والٹ', 'ur-ro': 'Wallet' },
   },
   {
     settingKey: 'btn.menu.orders',
     section: 'main_menu',
-    textValue: 'MY ORDERS',
+    textValue: 'Orders',
     fallbackEmoji: '📦',
     buttonStyle: 'default',
-    localizedText: { en: 'MY ORDERS', ur: 'میرے آرڈرز', 'ur-ro': 'MY ORDERS' },
-  },
-  {
-    settingKey: 'btn.menu.giveaways',
-    section: 'main_menu',
-    textValue: 'GIVEAWAYS',
-    fallbackEmoji: '🎁',
-    buttonStyle: 'default',
-    localizedText: { en: 'GIVEAWAYS', ur: 'انعامات', 'ur-ro': 'GIVEAWAYS' },
-  },
-  {
-    settingKey: 'btn.menu.referral',
-    section: 'main_menu',
-    textValue: 'REFER & EARN',
-    fallbackEmoji: '👥',
-    buttonStyle: 'default',
-    localizedText: { en: 'REFER & EARN', ur: 'ریفرل', 'ur-ro': 'REFER & EARN' },
+    localizedText: { en: 'Orders', ur: 'آرڈرز', 'ur-ro': 'Orders' },
   },
   {
     settingKey: 'btn.menu.support',
     section: 'main_menu',
-    textValue: 'SUPPORT',
+    textValue: 'Support',
     fallbackEmoji: '🎧',
     buttonStyle: 'default',
-    localizedText: { en: 'SUPPORT', ur: 'سپورٹ', 'ur-ro': 'SUPPORT' },
-  },
-  {
-    settingKey: 'btn.menu.profile',
-    section: 'main_menu',
-    textValue: 'PROFILE',
-    fallbackEmoji: '👤',
-    buttonStyle: 'default',
-    localizedText: { en: 'PROFILE', ur: 'پروفائل', 'ur-ro': 'PROFILE' },
-  },
-  {
-    settingKey: 'btn.menu.language',
-    section: 'main_menu',
-    textValue: 'LANGUAGE',
-    fallbackEmoji: '🌐',
-    buttonStyle: 'default',
-    localizedText: { en: 'LANGUAGE', ur: 'زبان', 'ur-ro': 'ZUBAN' },
+    localizedText: { en: 'Support', ur: 'سپورٹ', 'ur-ro': 'Support' },
   },
   {
     settingKey: 'btn.menu.admin',
@@ -174,38 +126,158 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
     localizedText: { en: 'ADMIN CONTROL CENTER', ur: 'ایڈمن کنٹرول سینٹر', 'ur-ro': 'ADMIN CONTROL CENTER' },
   },
 
+  // Secondary / Submenu & Legacy UI Settings (preserved for UI Editor & slash-command flows)
+  {
+    settingKey: 'btn.menu.featured',
+    section: 'main_menu',
+    textValue: 'Featured',
+    fallbackEmoji: '🔥',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Featured', ur: 'نمایاں', 'ur-ro': 'Featured' },
+  },
+  {
+    settingKey: 'btn.menu.search',
+    section: 'main_menu',
+    textValue: 'Search',
+    fallbackEmoji: '🔎',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Search', ur: 'تلاش', 'ur-ro': 'Search' },
+  },
+  {
+    settingKey: 'btn.menu.add_funds',
+    section: 'main_menu',
+    textValue: 'Add Funds',
+    fallbackEmoji: '➕',
+    buttonStyle: 'success',
+    localizedText: { en: 'Add Funds', ur: 'رقم جمع کریں', 'ur-ro': 'Add Funds' },
+  },
+  {
+    settingKey: 'btn.menu.giveaways',
+    section: 'main_menu',
+    textValue: 'Giveaways',
+    fallbackEmoji: '🎁',
+    buttonStyle: 'default',
+    localizedText: { en: 'Giveaways', ur: 'گیو اوے', 'ur-ro': 'Giveaways' },
+  },
+  {
+    settingKey: 'btn.menu.referral',
+    section: 'main_menu',
+    textValue: 'Invite Friends',
+    fallbackEmoji: '👥',
+    buttonStyle: 'default',
+    localizedText: { en: 'Invite Friends', ur: 'دوستوں کو مدعو کریں', 'ur-ro': 'Invite Friends' },
+  },
+  {
+    settingKey: 'btn.menu.profile',
+    section: 'main_menu',
+    textValue: 'Profile',
+    fallbackEmoji: '👤',
+    buttonStyle: 'default',
+    localizedText: { en: 'Profile', ur: 'پروفائل', 'ur-ro': 'Profile' },
+  },
+  {
+    settingKey: 'btn.menu.language',
+    section: 'main_menu',
+    textValue: 'Language',
+    fallbackEmoji: '🌐',
+    buttonStyle: 'default',
+    localizedText: { en: 'Language', ur: 'زبان', 'ur-ro': 'Zuban' },
+  },
+
+  // Get Free Stuff Hub Buttons
+  {
+    settingKey: 'btn.free.invite',
+    section: 'main_menu',
+    textValue: 'Invite Friends',
+    fallbackEmoji: '👥',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Invite Friends', ur: 'دوستوں کو مدعو کریں', 'ur-ro': 'Invite Friends' },
+  },
+  {
+    settingKey: 'btn.free.giveaways',
+    section: 'main_menu',
+    textValue: 'Giveaways',
+    fallbackEmoji: '🎁',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Giveaways', ur: 'گیو اوے', 'ur-ro': 'Giveaways' },
+  },
+  {
+    settingKey: 'btn.free.rewards',
+    section: 'main_menu',
+    textValue: 'Rewards',
+    fallbackEmoji: '🏆',
+    buttonStyle: 'success',
+    localizedText: { en: 'Rewards', ur: 'انعامات', 'ur-ro': 'Rewards' },
+  },
+
+  // Orders Hub Buttons
+  {
+    settingKey: 'btn.ord.active',
+    section: 'main_menu',
+    textValue: 'Active Orders',
+    fallbackEmoji: '📦',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Active Orders', ur: 'فعال آرڈرز', 'ur-ro': 'Active Orders' },
+  },
+  {
+    settingKey: 'btn.ord.history',
+    section: 'main_menu',
+    textValue: 'Order History',
+    fallbackEmoji: '📜',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Order History', ur: 'آرڈر ہسٹری', 'ur-ro': 'Order History' },
+  },
+
+  // Support Hub Buttons
+  {
+    settingKey: 'btn.supp.contact',
+    section: 'main_menu',
+    textValue: 'Contact Support',
+    fallbackEmoji: '💬',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Contact Support', ur: 'سپورٹ سے رابطہ', 'ur-ro': 'Contact Support' },
+  },
+  {
+    settingKey: 'btn.supp.faq',
+    section: 'main_menu',
+    textValue: 'FAQ',
+    fallbackEmoji: '❓',
+    buttonStyle: 'default',
+    localizedText: { en: 'FAQ', ur: 'عمومی سوالات', 'ur-ro': 'FAQ' },
+  },
+
   // Category Screen Buttons
   {
     settingKey: 'btn.cat.all',
     section: 'categories',
-    textValue: 'ALL PRODUCTS',
+    textValue: 'All Products',
     fallbackEmoji: '⚡',
     buttonStyle: 'primary',
-    localizedText: { en: 'ALL PRODUCTS', ur: 'تمام پروڈکٹس', 'ur-ro': 'ALL PRODUCTS' },
+    localizedText: { en: 'All Products', ur: 'تمام پروڈکٹس', 'ur-ro': 'All Products' },
   },
   {
     settingKey: 'btn.cat.featured',
     section: 'categories',
-    textValue: 'FEATURED',
+    textValue: 'Featured',
     fallbackEmoji: '🔥',
     buttonStyle: 'primary',
-    localizedText: { en: 'FEATURED', ur: 'نمایاں', 'ur-ro': 'FEATURED' },
+    localizedText: { en: 'Featured', ur: 'نمایاں', 'ur-ro': 'Featured' },
   },
   {
     settingKey: 'btn.cat.search',
     section: 'categories',
-    textValue: 'SEARCH',
+    textValue: 'Search',
     fallbackEmoji: '🔎',
     buttonStyle: 'primary',
-    localizedText: { en: 'SEARCH', ur: 'تلاش', 'ur-ro': 'SEARCH' },
+    localizedText: { en: 'Search', ur: 'تلاش', 'ur-ro': 'Search' },
   },
   {
     settingKey: 'btn.cat.support',
     section: 'categories',
-    textValue: 'SUPPORT',
+    textValue: 'Support',
     fallbackEmoji: '🎧',
     buttonStyle: 'default',
-    localizedText: { en: 'SUPPORT', ur: 'سپورٹ', 'ur-ro': 'SUPPORT' },
+    localizedText: { en: 'Support', ur: 'سپورٹ', 'ur-ro': 'Support' },
   },
 
   // Product Detail & Purchase Buttons
@@ -331,20 +403,28 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
 
   // Wallet & Deposit Buttons
   {
+    settingKey: 'btn.wall.balance',
+    section: 'wallet_dep',
+    textValue: 'Balance',
+    fallbackEmoji: '💰',
+    buttonStyle: 'primary',
+    localizedText: { en: 'Balance', ur: 'بیلنس', 'ur-ro': 'Balance' },
+  },
+  {
     settingKey: 'btn.wall.add_funds',
     section: 'wallet_dep',
-    textValue: 'ADD FUNDS',
+    textValue: 'Add Funds',
     fallbackEmoji: '➕',
     buttonStyle: 'success',
-    localizedText: { en: 'ADD FUNDS', ur: 'رقم جمع کریں', 'ur-ro': 'ADD FUNDS' },
+    localizedText: { en: 'Add Funds', ur: 'رقم جمع کریں', 'ur-ro': 'Add Funds' },
   },
   {
     settingKey: 'btn.wall.history',
     section: 'wallet_dep',
-    textValue: 'TRANSACTION HISTORY',
+    textValue: 'Transactions',
     fallbackEmoji: '📜',
     buttonStyle: 'primary',
-    localizedText: { en: 'TRANSACTION HISTORY', ur: 'لین دین کی تاریخ', 'ur-ro': 'TRANSACTION HISTORY' },
+    localizedText: { en: 'Transactions', ur: 'لین دین', 'ur-ro': 'Transactions' },
   },
   {
     settingKey: 'btn.dep.binance',
@@ -522,10 +602,10 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
   {
     settingKey: 'cmd.start',
     section: 'commands',
-    textValue: 'Open the XERO KHAN home screen',
+    textValue: 'Open Master Xero home screen',
     fallbackEmoji: '',
     buttonStyle: 'default',
-    localizedText: { en: 'Open the XERO KHAN home screen', ur: 'زیرو خان ہوم اسکرین کھولیں' },
+    localizedText: { en: 'Open Master Xero home screen', ur: 'ماسٹر زیرو ہوم اسکرین کھولیں' },
   },
   {
     settingKey: 'cmd.shop',
@@ -820,20 +900,52 @@ export class UISettingService {
       }
     }
 
-    // Safely migrate unmodified factory default label from Transaction ID -> Order ID
-    // without touching any admin-customized UI text.
-    const binSubmitSpec = DEFAULT_SPEC_MAP.get('btn.dep.bin_submit');
-    if (binSubmitSpec) {
+    // Safely migrate unmodified factory default UI labels/texts for Master Xero redesign
+    // without touching any admin-customized UI text (updated_by != 'SYSTEM_DEFAULT').
+    const factoryUpgradeKeys = [
+      'btn.dep.bin_submit',
+      'btn.menu.products',
+      'btn.menu.wallet',
+      'btn.menu.orders',
+      'btn.menu.support',
+      'btn.menu.featured',
+      'btn.menu.search',
+      'btn.menu.add_funds',
+      'btn.menu.giveaways',
+      'btn.menu.referral',
+      'btn.menu.profile',
+      'btn.menu.language',
+      'btn.cat.all',
+      'btn.cat.featured',
+      'btn.cat.search',
+      'btn.cat.support',
+      'btn.wall.add_funds',
+      'btn.wall.history',
+      'msg.welcome',
+      'msg.categories_header',
+      'msg.wallet_info',
+      'msg.choose_payment',
+      'msg.referral_title',
+      'msg.support_prompt',
+      'msg.profile_header',
+      'msg.language_select',
+      'cmd.start',
+    ];
+    for (const key of factoryUpgradeKeys) {
+      const spec = DEFAULT_SPEC_MAP.get(key);
+      if (!spec) continue;
       for (const lang of SUPPORTED_LANGUAGES) {
-        const nextText = binSubmitSpec.localizedText?.[lang] || binSubmitSpec.textValue;
+        const rec = this.specToRecord(spec, lang);
         await db.query(
           `UPDATE ui_settings
-           SET text_value = $1, updated_at = CURRENT_TIMESTAMP
-           WHERE setting_key = 'btn.dep.bin_submit'
-             AND language_code = $2
-             AND updated_by = 'SYSTEM_DEFAULT'
-             AND text_value IN ('SUBMIT TRANSACTION ID', 'SUBMIT TRANSACTION ID ')`,
-          [nextText, lang]
+           SET text_value = $1,
+               fallback_emoji = $2,
+               button_style = $3,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE setting_key = $4
+             AND language_code = $5
+             AND updated_by = 'SYSTEM_DEFAULT'`,
+          [rec.textValue, rec.fallbackEmoji, rec.buttonStyle, key, lang]
         );
       }
     }

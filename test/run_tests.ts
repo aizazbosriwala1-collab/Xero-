@@ -58,7 +58,9 @@ import {
   getProductDetailKeyboard,
   getPurchaseConfirmKeyboard,
   getMoreDetailsKeyboard,
+  getFreeStuffKeyboard,
   getWalletKeyboard,
+  getOrdersMenuKeyboard,
   getDepositMethodsKeyboard,
   getSupportMenuKeyboard,
   getBinanceInvoiceKeyboard,
@@ -2071,15 +2073,14 @@ export async function runComprehensiveTests() {
     assert.strictEqual(adminBtn?.style, 'danger');
   });
 
-  await it('V2 Keyboards: 3-column category grid renders cleanly with blue primary buttons', 'unit', async () => {
+  await it('V2 Keyboards: max 2-column category grid renders cleanly with blue primary buttons', 'unit', async () => {
     const cats = await db.query<any>('SELECT id, name FROM product_categories WHERE is_visible = TRUE ORDER BY display_order ASC');
     const kb = getCategoryKeyboard(cats.rows, 'en', 1);
-    assert.ok(kb.inline_keyboard[0].length <= 3 && kb.inline_keyboard[0].length >= 1);
+    assert.ok(kb.inline_keyboard[0].length <= 2 && kb.inline_keyboard[0].length >= 1);
     assert.strictEqual(kb.inline_keyboard[0][0].style, 'primary');
     const hasAll = kb.inline_keyboard.flat().some(b => b.callback_data === 'cat:all:1');
-    const hasFeatured = kb.inline_keyboard.flat().some(b => b.callback_data === 'm:feat');
     const hasSearch = kb.inline_keyboard.flat().some(b => b.callback_data === 'm:srch');
-    assert.ok(hasAll && hasFeatured && hasSearch);
+    assert.ok(hasAll && hasSearch);
   });
 
   currentCategory = 'XERO KHAN V2 Admin Customization & Reliability';
@@ -2089,10 +2090,10 @@ export async function runComprehensiveTests() {
     const adminId = '123456789';
     if (!config.telegram.adminIds.includes(adminId)) config.telegram.adminIds.push(adminId);
 
-    // 1. Admin edits btn.menu.featured via service + simulated custom_emoji entity FSM capture
+    // 1. Admin edits btn.menu.wallet via service + simulated custom_emoji entity FSM capture
     await redis.setFsmState(adminId, {
       step: 'ADMIN_UI_EDIT_EMOJI',
-      data: { settingKey: 'btn.menu.featured', lang: 'en' },
+      data: { settingKey: 'btn.menu.wallet', lang: 'en' },
     });
 
     await adminHandler.handleAdminTextInput(
@@ -2101,44 +2102,44 @@ export async function runComprehensiveTests() {
         chat: { id: 123456789, type: 'private' },
         from: { id: 123456789, is_bot: false, first_name: 'Admin' },
         date: Math.floor(Date.now() / 1000),
-        text: '🔥',
+        text: '💳',
         entities: [{ type: 'custom_emoji', offset: 0, length: 2, custom_emoji_id: '599999999999999999' }],
       },
-      { step: 'ADMIN_UI_EDIT_EMOJI', data: { settingKey: 'btn.menu.featured', lang: 'en' } }
+      { step: 'ADMIN_UI_EDIT_EMOJI', data: { settingKey: 'btn.menu.wallet', lang: 'en' } }
     );
 
     await uiConfigService.upsertSetting({
-      settingKey: 'btn.menu.featured',
+      settingKey: 'btn.menu.wallet',
       languageCode: 'en',
-      textValue: 'HOT DEALS',
+      textValue: 'MY BALANCE',
       buttonStyle: 'success',
       adminId,
     });
 
     const menuAfter = getCustomerMainInlineKeyboard(false, 'en');
-    const featBtn = menuAfter.inline_keyboard.flat().find(b => b.callback_data === 'm:feat');
-    assert.strictEqual(featBtn?.text, 'HOT DEALS');
-    assert.strictEqual(featBtn?.style, 'success');
-    assert.strictEqual(featBtn?.icon_custom_emoji_id, '599999999999999999');
+    const wallBtn = menuAfter.inline_keyboard.flat().find(b => b.callback_data === 'm:wall');
+    assert.strictEqual(wallBtn?.text, 'MY BALANCE');
+    assert.strictEqual(wallBtn?.style, 'success');
+    assert.strictEqual(wallBtn?.icon_custom_emoji_id, '599999999999999999');
 
-    // 2. Hide btn.menu.giveaways and verify it is omitted cleanly
+    // 2. Hide btn.menu.free_stuff and verify it is omitted cleanly
     await uiConfigService.upsertSetting({
-      settingKey: 'btn.menu.giveaways',
+      settingKey: 'btn.menu.free_stuff',
       languageCode: 'en',
       isVisible: false,
       adminId,
     });
     const menuHidden = getCustomerMainInlineKeyboard(false, 'en');
-    assert.strictEqual(menuHidden.inline_keyboard.flat().some(b => b.callback_data === 'm:give'), false);
+    assert.strictEqual(menuHidden.inline_keyboard.flat().some(b => b.callback_data === 'm:free'), false);
 
     // 3. Reset item restores factory default
-    await uiConfigService.resetSetting('btn.menu.featured', 'en', adminId);
-    await uiConfigService.resetSetting('btn.menu.giveaways', 'en', adminId);
+    await uiConfigService.resetSetting('btn.menu.wallet', 'en', adminId);
+    await uiConfigService.resetSetting('btn.menu.free_stuff', 'en', adminId);
     const menuReset = getCustomerMainInlineKeyboard(false, 'en');
-    const featRestored = menuReset.inline_keyboard.flat().find(b => b.callback_data === 'm:feat');
-    assert.strictEqual(featRestored?.text, '🔥 FEATURED');
-    assert.strictEqual(featRestored?.style, 'primary');
-    assert.strictEqual(featRestored?.icon_custom_emoji_id, undefined);
+    const wallRestored = menuReset.inline_keyboard.flat().find(b => b.callback_data === 'm:wall');
+    assert.strictEqual(wallRestored?.text, '💳 Wallet');
+    assert.strictEqual(wallRestored?.style, undefined);
+    assert.strictEqual(wallRestored?.icon_custom_emoji_id, undefined);
   });
 
   await it('V2 Admin Security: unauthorized user blocked from Admin UI callbacks and FSM text edits', 'mock_integration', async () => {
@@ -2160,7 +2161,7 @@ export async function runComprehensiveTests() {
     );
 
     const setting = uiConfigService.getCachedSetting('btn.menu.products', 'en');
-    assert.strictEqual(setting?.textValue, 'PRODUCTS');
+    assert.strictEqual(setting?.textValue, 'Products');
   });
 
   await it('V2 Export/Import: exports UI JSON without secrets and validates import payloads strictly', 'unit', async () => {
@@ -2216,7 +2217,7 @@ export async function runComprehensiveTests() {
 
     const urMenu = getCustomerMainInlineKeyboard(false, 'ur');
     const prodBtn = urMenu.inline_keyboard.flat().find(b => b.callback_data === 'm:prod');
-    assert.strictEqual(prodBtn?.text, '🛍️ پروڈکٹس');
+    assert.strictEqual(prodBtn?.text, '🛍 پروڈکٹس');
 
     // Switch back to en cleanly
     await telegramBotRouter.handleUpdate({
@@ -2282,8 +2283,11 @@ export async function runComprehensiveTests() {
       }),
       getPurchaseConfirmKeyboard('sp_audit_1', 2, 'all', 1, 'en'),
       getMoreDetailsKeyboard('sp_audit_1', 'all', 1, 'en'),
+      getFreeStuffKeyboard('en'),
       getWalletKeyboard('en'),
+      getOrdersMenuKeyboard('en'),
       getDepositMethodsKeyboard('en'),
+      getSupportMenuKeyboard('en'),
       getBinanceInvoiceKeyboard('dep_audit_1', 'en'),
       getPaymentBeforeInvoiceKeyboard('en', 'dep_audit_1'),
       getLanguageKeyboard('en'),
@@ -2423,6 +2427,19 @@ export async function runComprehensiveTests() {
           from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
           date: Math.floor(Date.now() / 1000),
           text: '🎧 SUPPORT',
+        },
+      });
+      const supCall = calls.find(c => c.method === 'sendMessage' || c.method === 'editMessageText');
+      assert.ok(supCall?.body?.reply_markup?.inline_keyboard?.flat().some((b: any) => b.callback_data === 'supp:contact'));
+      assert.ok(supCall?.body?.reply_markup?.inline_keyboard?.flat().some((b: any) => b.callback_data === 'supp:faq'));
+
+      await telegramBotRouter.handleUpdate({
+        update_id: 40012,
+        callback_query: {
+          id: 'cb_a2_supp_contact',
+          from: { id: 70001, is_bot: false, first_name: 'Customer 1' },
+          data: 'supp:contact',
+          message: { message_id: 9101, chat: { id: 70001, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Support' },
         },
       });
       const fsm = await redis.getFsmState<any>('70001');
@@ -2571,7 +2588,7 @@ export async function runComprehensiveTests() {
         },
       });
       assert.strictEqual(rApi.status, 'API_PROCESSED');
-      assert.ok(String(calls[0]?.body?.text).includes('RESELLER API'));
+      assert.ok(String(calls[0]?.body?.text).toUpperCase().includes('RESELLER API'));
     } finally {
       telegramClient.setTransportOverride(null);
     }
@@ -5232,15 +5249,15 @@ export async function runComprehensiveTests() {
         /Access denied/
       );
 
-      // Verify My Orders displays BOTH items for qty=2
+      // Verify Order History displays BOTH items for qty=2
       dmDeliveries.length = 0;
       await telegramBotRouter.handleUpdate({
         update_id: 91051,
         callback_query: {
           id: 'cb_m_ord_sec',
           from: { id: Number(ownerId), is_bot: false, first_name: 'Owner' },
-          data: 'm:ord',
-          message: { message_id: 551, chat: { id: Number(ownerId), type: 'private' }, date: 1, text: 'home' },
+          data: 'ord:hist',
+          message: { message_id: 551, chat: { id: Number(ownerId), type: 'private' }, date: 1, text: 'orders' },
         },
       });
       const ordHistoryMsg = dmDeliveries.find(m => m.text.includes(ordRow.id));
@@ -6240,7 +6257,7 @@ export async function runComprehensiveTests() {
         },
       });
       assert.ok(
-        sent.some(m => m.method === 'editMessageText' && String(m.body.text).includes('XERO KHAN')),
+        sent.some(m => m.method === 'editMessageText' && String(m.body.text).includes('Master Xero')),
         'ch:verify must unlock customer main menu in-place'
       );
     } finally {
@@ -7409,6 +7426,250 @@ export async function runComprehensiveTests() {
       else delete process.env.BOT_USERNAME;
       if (origEnvTgBotUsername !== undefined) process.env.TELEGRAM_BOT_USERNAME = origEnvTgBotUsername;
       else delete process.env.TELEGRAM_BOT_USERNAME;
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  // =========================================================================
+  // 26. MASTER XERO MINIMAL FRONTEND REDESIGN SUITE (CONTRACT 14)
+  // =========================================================================
+  currentCategory = 'Master Xero Minimal Frontend Redesign (Contract 14)';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 14.1: Home screen shows Welcome to Master Xero + ONLY 5 minimal customer buttons', 'mock_integration', async () => {
+    const custId = 98401;
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9841 } };
+    });
+
+    try {
+      await telegramBotRouter.handleUpdate({
+        update_id: 984101,
+        message: {
+          message_id: 1,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'MinimalUser' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/start',
+        },
+      });
+
+      const welcomeMsg = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('Master Xero'));
+      assert.ok(welcomeMsg, 'Home screen must display Master Xero welcome message');
+      assert.ok(String(welcomeMsg!.body.text).includes('Welcome to Master Xero'));
+      assert.ok(String(welcomeMsg!.body.text).includes('Premium Digital Marketplace'));
+
+      const homeButtons = (welcomeMsg!.body.reply_markup?.inline_keyboard || []).flat();
+      assert.strictEqual(homeButtons.length, 5, `Customer home must have exactly 5 buttons, got ${homeButtons.length}`);
+      assert.deepStrictEqual(
+        homeButtons.map((b: any) => b.callback_data),
+        ['m:prod', 'm:free', 'm:wall', 'm:ord', 'm:supp']
+      );
+      assert.ok(homeButtons[0].text.includes('Products'));
+      assert.ok(homeButtons[1].text.includes('Get Free Stuff'));
+      assert.ok(homeButtons[2].text.includes('Wallet'));
+      assert.ok(homeButtons[3].text.includes('Orders'));
+      assert.ok(homeButtons[4].text.includes('Support'));
+
+      // Verify zero bloat / admin leakage on customer Home
+      const homeJoined = homeButtons.map((b: any) => `${b.text}:${b.callback_data}`).join('|').toLowerCase();
+      for (const forbidden of ['adm:', 'suppliers', 'diagnostics', 'announcements', 'channels', 'language', 'm:give', 'm:ref']) {
+        assert.strictEqual(homeJoined.includes(forbidden), false, `Customer home must not expose "${forbidden}"`);
+      }
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('Contract 14.2: Products shows 6 clean 2-column categories & Get Free Stuff unites Invite/Giveaways/Rewards', 'mock_integration', async () => {
+    const custId = 98402;
+    const adminId = String(config.telegram.adminIds[0]);
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9842 } };
+    });
+
+    const tierId = await referralService.createRewardTier(
+      {
+        title: 'Master Xero Bonus',
+        requiredQualifiedReferrals: 2,
+        rewardType: 'WALLET_USDT',
+        rewardAmount: '1.50',
+        isActive: true,
+      },
+      adminId
+    );
+
+    try {
+      await ensureAuditUser(String(custId), '0.0000');
+
+      // 1. Products (m:prod) renders max 2-column grid with the 6 clean categories
+      await telegramBotRouter.handleUpdate({
+        update_id: 984201,
+        callback_query: {
+          id: 'cb_c14_prod',
+          from: { id: custId, is_bot: false, first_name: 'ShopUser' },
+          data: 'm:prod',
+          message: { message_id: 9842, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Home' },
+        },
+      });
+      const prodCall = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Products'));
+      assert.ok(prodCall, 'm:prod must render Products category menu');
+      const rows = prodCall!.body.reply_markup.inline_keyboard as any[][];
+      const catButtons = rows.flat().filter((b: any) => String(b.callback_data).startsWith('cat:cat_'));
+      assert.strictEqual(catButtons.length, 6, 'Products screen must show all 6 clean categories');
+      for (const row of rows) {
+        assert.ok(row.length <= 2, `Category row must have at most 2 columns, got ${row.length}`);
+      }
+      const catNames = catButtons.map((b: any) => b.text).join('|');
+      for (const expectedCat of ['AI Tools', 'Design Tools', 'Courses', 'Streaming', 'VPN', 'Gaming']) {
+        assert.ok(catNames.includes(expectedCat), `Missing category "${expectedCat}" in ${catNames}`);
+      }
+
+      // 2. Get Free Stuff (m:free) contains Invite Friends, Giveaways, Rewards
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 984202,
+        callback_query: {
+          id: 'cb_c14_free',
+          from: { id: custId, is_bot: false, first_name: 'ShopUser' },
+          data: 'm:free',
+          message: { message_id: 9842, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Home' },
+        },
+      });
+      const freeCall = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Get Free Stuff'));
+      assert.ok(freeCall, 'm:free must render Get Free Stuff hub');
+      const freeCbs = freeCall!.body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+      assert.ok(freeCbs.includes('m:ref') && freeCbs.includes('m:give') && freeCbs.includes('m:rew'));
+
+      // 3. Rewards screen (m:rew) lists milestone tiers cleanly
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 984203,
+        callback_query: {
+          id: 'cb_c14_rew',
+          from: { id: custId, is_bot: false, first_name: 'ShopUser' },
+          data: 'm:rew',
+          message: { message_id: 9842, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Free' },
+        },
+      });
+      const rewCall = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Master Xero Bonus'));
+      assert.ok(rewCall, 'm:rew must display active referral reward tiers');
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await referralService.deleteRewardTier(tierId, adminId).catch(() => {});
+    }
+  });
+
+  await it('Contract 14.3: Wallet Balance/Add Funds/Transactions, Orders Active/History Split, Support Contact/FAQ & Intact Admin Panel', 'mock_integration', async () => {
+    const custId = 98403;
+    const adminId = Number(config.telegram.adminIds[0]);
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9843 } };
+    });
+
+    try {
+      await ensureAuditUser(String(custId), '12.5000');
+
+      // 1. Wallet menu contains Balance, Add Funds, Transactions
+      await telegramBotRouter.handleUpdate({
+        update_id: 984301,
+        callback_query: {
+          id: 'cb_c14_wall',
+          from: { id: custId, is_bot: false, first_name: 'WalletUser' },
+          data: 'm:wall',
+          message: { message_id: 9843, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Home' },
+        },
+      });
+      const wallCall = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('12.50 USDT'));
+      assert.ok(wallCall, 'm:wall must show wallet balance');
+      const wallCbs = wallCall!.body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+      assert.ok(wallCbs.includes('m:wall') && wallCbs.includes('m:dep') && wallCbs.includes('w:hist'));
+
+      // 2. Orders hub splits Active Orders and Order History
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 984302,
+        callback_query: {
+          id: 'cb_c14_ord',
+          from: { id: custId, is_bot: false, first_name: 'WalletUser' },
+          data: 'm:ord',
+          message: { message_id: 9843, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Home' },
+        },
+      });
+      const ordCall = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Orders'));
+      assert.ok(ordCall);
+      const ordCbs = ordCall!.body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+      assert.ok(ordCbs.includes('ord:act') && ordCbs.includes('ord:hist'));
+
+      // Active & History routes respond cleanly
+      await telegramBotRouter.handleUpdate({
+        update_id: 984303,
+        callback_query: {
+          id: 'cb_c14_ord_act',
+          from: { id: custId, is_bot: false, first_name: 'WalletUser' },
+          data: 'ord:act',
+          message: { message_id: 9843, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Orders' },
+        },
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 984304,
+        callback_query: {
+          id: 'cb_c14_ord_hist',
+          from: { id: custId, is_bot: false, first_name: 'WalletUser' },
+          data: 'ord:hist',
+          message: { message_id: 9843, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Orders' },
+        },
+      });
+      assert.ok(sent.some(m => String(m.body.text).includes('Active Orders')));
+      assert.ok(sent.some(m => String(m.body.text).includes('Order History')));
+
+      // 3. Support hub offers Contact Support + FAQ cleanly
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 984305,
+        callback_query: {
+          id: 'cb_c14_supp',
+          from: { id: custId, is_bot: false, first_name: 'WalletUser' },
+          data: 'm:supp',
+          message: { message_id: 9843, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Home' },
+        },
+      });
+      const suppCall = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Support'));
+      assert.ok(suppCall);
+      const suppCbs = suppCall!.body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+      assert.ok(suppCbs.includes('supp:contact') && suppCbs.includes('supp:faq'));
+
+      await telegramBotRouter.handleUpdate({
+        update_id: 984306,
+        callback_query: {
+          id: 'cb_c14_faq',
+          from: { id: custId, is_bot: false, first_name: 'WalletUser' },
+          data: 'supp:faq',
+          message: { message_id: 9843, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Support' },
+        },
+      });
+      assert.ok(sent.some(m => String(m.body.text).includes('FAQ — Master Xero')));
+
+      // 4. All new customer callback routes are registered & <= 64 bytes
+      for (const cb of ['m:free', 'm:rew', 'ord:act', 'ord:hist', 'supp:contact', 'supp:faq']) {
+        assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered route: ${cb}`);
+        assert.ok(Buffer.byteLength(cb, 'utf8') <= 64);
+      }
+
+      // 5. Admin Panel powers remain 100% intact
+      const adminKb = getAdminMainMenuKeyboard('en');
+      const admCbs = adminKb.inline_keyboard.flat().map((b: any) => b.callback_data);
+      for (const reqAdm of ['adm:dash', 'adm:ord', 'adm:wal', 'adm:dep', 'adm:prod:1', 'adm:gw', 'adm:ref', 'adm:ann', 'adm:sup', 'adm:diag']) {
+        assert.ok(admCbs.includes(reqAdm), `Admin control missing: ${reqAdm}`);
+      }
+      assert.ok(adminId > 0);
+    } finally {
       telegramClient.setTransportOverride(null);
     }
   });

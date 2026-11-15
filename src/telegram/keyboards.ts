@@ -37,50 +37,40 @@ export function getCustomerMainReplyKeyboard(lang: SupportedLanguage = 'en'): Te
 }
 
 /**
- * Customer Main Inline Keyboard Menu (DB-driven, colored, custom-emoji ready)
+ * Customer Main Inline Keyboard Menu — Minimal Apple-style 5-button layout
  */
 export function getCustomerMainInlineKeyboard(
   isAdmin = false,
   lang: SupportedLanguage = 'en'
 ): TelegramInlineKeyboardMarkup {
   return perfTracker.measureRender(() => {
-  const cacheKey = `main_inline:${lang}:${isAdmin ? '1' : '0'}`;
-  const cached = menuCache.get(cacheKey);
-  if (cached) return cached;
+    const cacheKey = `main_inline:${lang}:${isAdmin ? '1' : '0'}`;
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
 
-  const rows: TelegramInlineKeyboardButton[][] = [
-    ButtonBuilder.buildActionRow([
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.products', lang, callbackData: 'm:prod' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.featured', lang, callbackData: 'm:feat' }),
-    ]),
-    ButtonBuilder.buildActionRow([
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.search', lang, callbackData: 'm:srch' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.wallet', lang, callbackData: 'm:wall' }),
-    ]),
-    ButtonBuilder.buildActionRow([
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.add_funds', lang, callbackData: 'm:dep' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.orders', lang, callbackData: 'm:ord' }),
-    ]),
-    ButtonBuilder.buildActionRow([
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.giveaways', lang, callbackData: 'm:give' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.referral', lang, callbackData: 'm:ref' }),
-    ]),
-    ButtonBuilder.buildActionRow([
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.support', lang, callbackData: 'm:supp' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.profile', lang, callbackData: 'm:prof' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.menu.language', lang, callbackData: 'm:lang' }),
-    ]),
-  ];
-
-  if (isAdmin) {
-    rows.push(
+    const rows: TelegramInlineKeyboardButton[][] = [
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ settingKey: 'btn.menu.admin', lang, callbackData: 'adm:main', forceVisible: true }),
-      ])
-    );
-  }
+        ButtonBuilder.buildButton({ settingKey: 'btn.menu.products', lang, callbackData: 'm:prod' }),
+        ButtonBuilder.buildButton({ settingKey: 'btn.menu.free_stuff', lang, callbackData: 'm:free' }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ settingKey: 'btn.menu.wallet', lang, callbackData: 'm:wall' }),
+        ButtonBuilder.buildButton({ settingKey: 'btn.menu.orders', lang, callbackData: 'm:ord' }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ settingKey: 'btn.menu.support', lang, callbackData: 'm:supp' }),
+      ]),
+    ];
 
-  return menuCache.set(cacheKey, { inline_keyboard: filterNonEmptyRows(rows) });
+    if (isAdmin) {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.menu.admin', lang, callbackData: 'adm:main', forceVisible: true }),
+        ])
+      );
+    }
+
+    return menuCache.set(cacheKey, { inline_keyboard: filterNonEmptyRows(rows) });
   });
 }
 
@@ -156,7 +146,7 @@ export function getRequiredChannelsGateKeyboard(
 }
 
 /**
- * Product Categories Keyboard — Clean 3-column grid with blue primary style, counts & utility actions
+ * Product Categories Keyboard — Clean max 2-column grid with lightweight breathing room
  */
 export function getCategoryKeyboard(
   categories: Array<{ id: string; name: string }>,
@@ -165,88 +155,86 @@ export function getCategoryKeyboard(
   counts?: Record<string, number>
 ): TelegramInlineKeyboardMarkup {
   return perfTracker.measureRender(() => {
-  const countSig = counts
-    ? Object.keys(counts)
-        .sort()
-        .map(k => `${k}:${counts[k]}`)
-        .join(',')
-    : '';
-  const catSig = categories.map(c => `${c.id}:${c.name}`).join('|');
-  const cacheKey = `shop_cat:${lang}:${catPage}:${catSig}:${countSig}`;
-  const cached = menuCache.get(cacheKey);
-  if (cached) return cached;
+    const countSig = counts
+      ? Object.keys(counts)
+          .sort()
+          .map(k => `${k}:${counts[k]}`)
+          .join(',')
+      : '';
+    const catSig = categories.map(c => `${c.id}:${c.name}`).join('|');
+    const cacheKey = `shop_cat:${lang}:${catPage}:${catSig}:${countSig}`;
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
 
-  const pageSize = 9;
-  const totalPages = Math.max(1, Math.ceil(categories.length / pageSize));
-  const safePage = Math.min(Math.max(1, catPage), totalPages);
-  const start = (safePage - 1) * pageSize;
-  const pageCategories = categories.slice(start, start + pageSize);
+    const pageSize = 6;
+    const totalPages = Math.max(1, Math.ceil(categories.length / pageSize));
+    const safePage = Math.min(Math.max(1, catPage), totalPages);
+    const start = (safePage - 1) * pageSize;
+    const pageCategories = categories.slice(start, start + pageSize);
 
-  const catButtons = pageCategories.map(cat => {
-    const countVal = counts && counts[cat.id] !== undefined ? counts[cat.id] : undefined;
-    const suffix = countVal !== undefined ? ` (${countVal})` : '';
-    const customSettingKey = `btn.cat.${cat.id}`;
-    const custom = uiConfigService.getCachedSetting(customSettingKey, lang);
-    if (custom) {
+    const catButtons = pageCategories.map(cat => {
+      const countVal = counts && counts[cat.id] !== undefined ? counts[cat.id] : undefined;
+      const suffix = countVal !== undefined && countVal > 0 ? ` (${countVal})` : '';
+      const customSettingKey = `btn.cat.${cat.id}`;
+      const custom = uiConfigService.getCachedSetting(customSettingKey, lang);
+      if (custom) {
+        return ButtonBuilder.buildButton({
+          settingKey: customSettingKey,
+          lang,
+          suffix,
+          callbackData: `cat:${cat.id}:1`,
+        });
+      }
       return ButtonBuilder.buildButton({
-        settingKey: customSettingKey,
-        lang,
-        suffix,
+        text: `${cat.name}${suffix}`,
+        style: 'primary',
         callbackData: `cat:${cat.id}:1`,
       });
-    }
-    return ButtonBuilder.buildButton({
-      text: `${cat.name}${suffix}`,
-      style: 'primary',
-      callbackData: `cat:${cat.id}:1`,
     });
-  });
 
-  const rows: TelegramInlineKeyboardButton[][] = ButtonBuilder.buildGrid(catButtons, 3);
+    const rows: TelegramInlineKeyboardButton[][] = ButtonBuilder.buildGrid(catButtons, 2);
 
-  if (totalPages > 1) {
+    if (totalPages > 1) {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            settingKey: 'btn.nav.prev',
+            lang,
+            callbackData: safePage > 1 ? `catp:${safePage - 1}` : 'noop',
+            disabled: safePage <= 1,
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: `${safePage} / ${totalPages}`,
+            style: 'default',
+            callbackData: 'noop',
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            settingKey: 'btn.nav.next',
+            lang,
+            callbackData: safePage < totalPages ? `catp:${safePage + 1}` : 'noop',
+            disabled: safePage >= totalPages,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
     rows.push(
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({
-          settingKey: 'btn.nav.prev',
-          lang,
-          callbackData: safePage > 1 ? `catp:${safePage - 1}` : 'noop',
-          disabled: safePage <= 1,
-          forceVisible: true,
-        }),
-        ButtonBuilder.buildButton({
-          text: `${safePage} / ${totalPages}`,
-          style: 'default',
-          callbackData: 'noop',
-          forceVisible: true,
-        }),
-        ButtonBuilder.buildButton({
-          settingKey: 'btn.nav.next',
-          lang,
-          callbackData: safePage < totalPages ? `catp:${safePage + 1}` : 'noop',
-          disabled: safePage >= totalPages,
-          forceVisible: true,
-        }),
+        ButtonBuilder.buildButton({ settingKey: 'btn.cat.all', lang, callbackData: 'cat:all:1' }),
+        ButtonBuilder.buildButton({ settingKey: 'btn.cat.search', lang, callbackData: 'm:srch' }),
       ])
     );
-  }
 
-  rows.push(
-    ButtonBuilder.buildActionRow([
-      ButtonBuilder.buildButton({ settingKey: 'btn.cat.all', lang, callbackData: 'cat:all:1' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.cat.featured', lang, callbackData: 'm:feat' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.cat.search', lang, callbackData: 'm:srch' }),
-    ])
-  );
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
+      ])
+    );
 
-  rows.push(
-    ButtonBuilder.buildActionRow([
-      ButtonBuilder.buildButton({ settingKey: 'btn.cat.support', lang, callbackData: 'm:supp' }),
-      ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
-    ])
-  );
-
-  return menuCache.set(cacheKey, { inline_keyboard: filterNonEmptyRows(rows) });
+    return menuCache.set(cacheKey, { inline_keyboard: filterNonEmptyRows(rows) });
   });
 }
 
@@ -531,7 +519,33 @@ export function getProductCardKeyboard(
 }
 
 /**
- * Wallet Screen Keyboard
+ * Get Free Stuff Hub Keyboard (Invite Friends, Giveaways, Rewards)
+ */
+export function getFreeStuffKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
+  return perfTracker.measureRender(() => {
+    const cacheKey = `free_stuff:${lang}`;
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
+
+    return menuCache.set(cacheKey, {
+      inline_keyboard: filterNonEmptyRows([
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.free.invite', lang, callbackData: 'm:ref', forceVisible: true }),
+          ButtonBuilder.buildButton({ settingKey: 'btn.free.giveaways', lang, callbackData: 'm:give', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.free.rewards', lang, callbackData: 'm:rew', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
+        ]),
+      ]),
+    });
+  });
+}
+
+/**
+ * Wallet Screen Keyboard (Balance, Add Funds, Transactions)
  */
 export function getWalletKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
   return perfTracker.measureRender(() => {
@@ -542,10 +556,34 @@ export function getWalletKeyboard(lang: SupportedLanguage = 'en'): TelegramInlin
     return menuCache.set(cacheKey, {
       inline_keyboard: filterNonEmptyRows([
         ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.wall.balance', lang, callbackData: 'm:wall', forceVisible: true }),
           ButtonBuilder.buildButton({ settingKey: 'btn.wall.add_funds', lang, callbackData: 'm:dep', forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
-          ButtonBuilder.buildButton({ settingKey: 'btn.wall.history', lang, callbackData: 'w:hist' }),
+          ButtonBuilder.buildButton({ settingKey: 'btn.wall.history', lang, callbackData: 'w:hist', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
+        ]),
+      ]),
+    });
+  });
+}
+
+/**
+ * Orders Hub Keyboard (Active Orders, Order History)
+ */
+export function getOrdersMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
+  return perfTracker.measureRender(() => {
+    const cacheKey = `orders_menu:${lang}`;
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
+
+    return menuCache.set(cacheKey, {
+      inline_keyboard: filterNonEmptyRows([
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.ord.active', lang, callbackData: 'ord:act', forceVisible: true }),
+          ButtonBuilder.buildButton({ settingKey: 'btn.ord.history', lang, callbackData: 'ord:hist', forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
@@ -582,7 +620,7 @@ export function getDepositMethodsKeyboard(lang: SupportedLanguage = 'en'): Teleg
 }
 
 /**
- * Support Menu Keyboard (prebuilt & cached)
+ * Support Menu Keyboard (Contact Support, FAQ)
  */
 export function getSupportMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
   return perfTracker.measureRender(() => {
@@ -593,10 +631,12 @@ export function getSupportMenuKeyboard(lang: SupportedLanguage = 'en'): Telegram
     return menuCache.set(cacheKey, {
       inline_keyboard: filterNonEmptyRows([
         ButtonBuilder.buildActionRow([
-          ButtonBuilder.buildButton({ settingKey: 'btn.wall.add_funds', lang, callbackData: 'm:dep', forceVisible: true }),
-          ButtonBuilder.buildButton({ settingKey: 'btn.menu.orders', lang, callbackData: 'm:ord', forceVisible: true }),
+          ButtonBuilder.buildButton({ settingKey: 'btn.supp.contact', lang, callbackData: 'supp:contact', forceVisible: true }),
+          ButtonBuilder.buildButton({ settingKey: 'btn.supp.faq', lang, callbackData: 'supp:faq', forceVisible: true }),
         ]),
-        ButtonBuilder.buildNavigationRow('m:home', lang),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang, callbackData: 'm:home', forceVisible: true }),
+        ]),
       ]),
     });
   });
@@ -786,14 +826,19 @@ export function preloadCommonMenus(): number {
   for (const lang of langs) {
     getCustomerMainInlineKeyboard(false, lang);
     getCustomerMainInlineKeyboard(true, lang);
+    getFreeStuffKeyboard(lang);
     getWalletKeyboard(lang);
+    getOrdersMenuKeyboard(lang);
     getDepositMethodsKeyboard(lang);
     getSupportMenuKeyboard(lang);
     getLanguageKeyboard(lang);
     getStaleMenuKeyboard(lang);
     getBackHomeKeyboard('m:home', lang);
     getBackHomeKeyboard('m:prod', lang);
+    getBackHomeKeyboard('m:free', lang);
     getBackHomeKeyboard('m:wall', lang);
+    getBackHomeKeyboard('m:ord', lang);
+    getBackHomeKeyboard('m:supp', lang);
     getBackHomeKeyboard('m:dep', lang);
     getAdminMainMenuKeyboard(lang);
   }

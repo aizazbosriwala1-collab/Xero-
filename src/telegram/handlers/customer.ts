@@ -24,7 +24,9 @@ import {
   getProductDetailKeyboard,
   getPurchaseConfirmKeyboard,
   getMoreDetailsKeyboard,
+  getFreeStuffKeyboard,
   getWalletKeyboard,
+  getOrdersMenuKeyboard,
   getDepositMethodsKeyboard,
   getSupportMenuKeyboard,
   getBinanceInvoiceKeyboard,
@@ -217,6 +219,8 @@ export class CustomerHandler {
     const gatedPrefixes = [
       'm:home',
       'm:prod',
+      'm:free',
+      'm:rew',
       'catp:',
       'm:feat',
       'feat:',
@@ -324,17 +328,14 @@ export class CustomerHandler {
       return;
     }
 
-    // Navigation: Categories Grid (Redis cached categories & product counts)
+    // Navigation: Categories Grid (Clean max 2-column grid, lightweight copy)
     if (data === 'm:prod' || data.startsWith('catp:')) {
       const catPage = data.startsWith('catp:') ? Math.max(1, parseInt(data.split(':')[1] || '1', 10)) : 1;
       const [categories, catCounts] = await Promise.all([
         pricingService.getCategories(true),
         pricingService.getCategoryProductCounts(),
       ]);
-      const baseHeader = uiConfigService.getText('msg.categories_header', lang) || t('categories_header', lang);
-      const text =
-        `${baseHeader}\n\n` +
-        `📦 *Live Inventory:* \`${catCounts.totalActive}\` verified tools in stock`;
+      const text = uiConfigService.getText('msg.categories_header', lang) || t('categories_header', lang);
       await Promise.all([
         navigationService.saveState(userId, {
           screen: 'categories',
@@ -350,6 +351,71 @@ export class CustomerHandler {
           { skipNavSaveIfEdited: true }
         ),
       ]);
+      return;
+    }
+
+    // Navigation: Get Free Stuff Hub (Invite Friends, Giveaways, Rewards)
+    if (data === 'm:free') {
+      await Promise.all([
+        navigationService.saveState(userId, {
+          screen: 'free_stuff',
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.renderMenu(chatId, messageId, userId, t('free_stuff_header', lang), getFreeStuffKeyboard(lang), {
+          skipNavSaveIfEdited: true,
+        }),
+      ]);
+      return;
+    }
+
+    // Navigation: Rewards Screen (Customer claimable Referral Reward Milestones)
+    if (data === 'm:rew') {
+      const [stats, refSettings] = await Promise.all([
+        referralService.getStats(userId),
+        referralService.getSettings(),
+      ]);
+      const tiers = refSettings.rewardsEnabled
+        ? await referralService.listRewardTiers({
+            activeOnly: true,
+            userId,
+            knownQualifiedCount: stats.qualifiedCount,
+          })
+        : [];
+
+      if (tiers.length === 0) {
+        await this.renderMenu(chatId, messageId, userId, t('rewards_empty', lang), getBackHomeKeyboard('m:free', lang));
+        return;
+      }
+
+      let text = `${t('rewards_header', lang, { qualified: stats.qualifiedCount })}\n`;
+      const rows: any[][] = [];
+      for (const tier of tiers) {
+        const rewardDesc =
+          tier.rewardType === 'WALLET_USDT'
+            ? `${tier.rewardAmount} USDT Wallet Credit`
+            : `${tier.rewardProductName || 'Product'} x${tier.rewardQuantity}`;
+        const statusLabel = tier.userClaimed
+          ? '✅ Claimed'
+          : tier.userEligible
+            ? '✅ Ready to Claim'
+            : `${stats.qualifiedCount}/${tier.requiredQualifiedReferrals} Qualified`;
+        text += `• *${tier.title}* → ${rewardDesc} — _${statusLabel}_\n`;
+        if (tier.userEligible && !tier.userClaimed) {
+          rows.push(
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: `Claim: ${tier.title}`.slice(0, 36),
+                fallbackEmoji: '🏆',
+                style: 'success',
+                callbackData: `ref_cl:${tier.id}`,
+                forceVisible: true,
+              }),
+            ])
+          );
+        }
+      }
+      rows.push(ButtonBuilder.buildNavigationRow('m:free', lang));
+      await this.renderMenu(chatId, messageId, userId, text, { inline_keyboard: rows.filter(r => r.length > 0) });
       return;
     }
 
@@ -837,16 +903,61 @@ export class CustomerHandler {
       return;
     }
 
-    // My Orders
+    // Orders Hub (Active Orders & Order History)
     if (data === 'm:ord') {
-      const orders = await orderService.getCustomerOrders(userId, 5);
-      if (orders.length === 0) {
-        await this.renderMenu(chatId, messageId, userId, t('orders_empty', lang), getBackHomeKeyboard('m:home', lang));
+      const orders = await orderService.getCustomerOrders(userId, 20);
+      const activeStatuses = new Set(['PENDING', 'PROCESSING', 'PENDING_INVITE', 'UNCERTAIN']);
+      const activeCount = orders.filter(o => activeStatuses.has(o.status)).length;
+      const historyCount = orders.length - activeCount;
+
+      const text =
+        orders.length === 0
+          ? t('orders_empty', lang)
+          : t('orders_hub', lang, { activeCount, historyCount });
+
+      await this.renderMenu(chatId, messageId, userId, text, getOrdersMenuKeyboard(lang), {
+        skipNavSaveIfEdited: true,
+      });
+      return;
+    }
+
+    // Active Orders
+    if (data === 'ord:act') {
+      const orders = await orderService.getCustomerOrders(userId, 20);
+      const activeStatuses = new Set(['PENDING', 'PROCESSING', 'PENDING_INVITE', 'UNCERTAIN']);
+      const activeOrders = orders.filter(o => activeStatuses.has(o.status)).slice(0, 5);
+
+      if (activeOrders.length === 0) {
+        await this.renderMenu(chatId, messageId, userId, t('orders_active_empty', lang), getBackHomeKeyboard('m:ord', lang));
         return;
       }
 
-      let text = t('orders_header', lang);
-      for (const ord of orders) {
+      let text = t('orders_active_header', lang);
+      for (const ord of activeOrders) {
+        text +=
+          `🔹 *Order:* \`${ord.id}\`\n` +
+          `• Item: ${ord.productName} (x${ord.quantity})\n` +
+          `• Total: \`${ord.totalPrice} USDT\`\n` +
+          `• Status: *${ord.status}*\n\n`;
+      }
+
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:ord', lang));
+      return;
+    }
+
+    // Order History (Completed / Past orders with credentials)
+    if (data === 'ord:hist') {
+      const orders = await orderService.getCustomerOrders(userId, 20);
+      const activeStatuses = new Set(['PENDING', 'PROCESSING', 'PENDING_INVITE', 'UNCERTAIN']);
+      const pastOrders = orders.filter(o => !activeStatuses.has(o.status)).slice(0, 5);
+
+      if (pastOrders.length === 0) {
+        await this.renderMenu(chatId, messageId, userId, t('orders_history_empty', lang), getBackHomeKeyboard('m:ord', lang));
+        return;
+      }
+
+      let text = t('orders_history_header', lang);
+      for (const ord of pastOrders) {
         text +=
           `🔹 *Order:* \`${ord.id}\`\n` +
           `• Item: ${ord.productName} (x${ord.quantity})\n` +
@@ -858,7 +969,7 @@ export class CustomerHandler {
         text += '\n';
       }
 
-      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:ord', lang));
       return;
     }
 
@@ -869,7 +980,7 @@ export class CustomerHandler {
         giveawayService.getActiveGiveaways(userId),
       ]);
       if (!gwSettings.enabled || giveaways.length === 0) {
-        await this.renderMenu(chatId, messageId, userId, t('giveaways_empty', lang), getBackHomeKeyboard('m:home', lang));
+        await this.renderMenu(chatId, messageId, userId, t('giveaways_empty', lang), getBackHomeKeyboard('m:free', lang));
         return;
       }
 
@@ -916,7 +1027,7 @@ export class CustomerHandler {
         }
       }
 
-      rows.push(ButtonBuilder.buildNavigationRow('m:home', lang));
+      rows.push(ButtonBuilder.buildNavigationRow('m:free', lang));
       await this.renderMenu(chatId, messageId, userId, text, { inline_keyboard: rows.filter(r => r.length > 0) });
       return;
     }
@@ -1006,7 +1117,7 @@ export class CustomerHandler {
         }
       }
 
-      rows.push(ButtonBuilder.buildNavigationRow('m:home', lang));
+      rows.push(ButtonBuilder.buildNavigationRow('m:free', lang));
       await this.renderMenu(chatId, messageId, userId, text, { inline_keyboard: rows.filter(r => r.length > 0) });
       return;
     }
@@ -1018,9 +1129,9 @@ export class CustomerHandler {
       const tierId = data.slice('ref_cl:'.length);
       try {
         const res = await referralService.claimRewardTier(tierId, userId);
-        await this.renderMenu(chatId, messageId, userId, `✅ ${res.message}`, getBackHomeKeyboard('m:ref', lang));
+        await this.renderMenu(chatId, messageId, userId, `✅ ${res.message}`, getBackHomeKeyboard('m:free', lang));
       } catch (err: any) {
-        await this.renderMenu(chatId, messageId, userId, `⚠️ ${err.message}`, getBackHomeKeyboard('m:ref', lang));
+        await this.renderMenu(chatId, messageId, userId, `⚠️ ${err.message}`, getBackHomeKeyboard('m:free', lang));
       }
       return;
     }
@@ -1029,22 +1140,46 @@ export class CustomerHandler {
     if (data === 'm:srch') {
       await Promise.all([
         redis.setFsmState(userId, { step: 'AWAITING_SEARCH_QUERY' }),
-        this.renderMenu(chatId, messageId, userId, t('search_prompt', lang), getBackHomeKeyboard('m:home', lang), {
+        this.renderMenu(chatId, messageId, userId, t('search_prompt', lang), getBackHomeKeyboard('m:prod', lang), {
           skipNavSaveIfEdited: true,
         }),
       ]);
       return;
     }
 
-    // Support
+    // Support Hub (Contact Support, FAQ)
     if (data === 'm:supp') {
-      const text = uiConfigService.getText('msg.support_prompt', lang) || t('support_prompt', lang);
       await Promise.all([
-        redis.setFsmState(userId, { step: 'AWAITING_SUPPORT_MESSAGE' }),
-        this.renderMenu(chatId, messageId, userId, text, getSupportMenuKeyboard(lang), {
+        redis.clearFsmState(userId),
+        this.renderMenu(chatId, messageId, userId, t('support_hub', lang), getSupportMenuKeyboard(lang), {
           skipNavSaveIfEdited: true,
         }),
       ]);
+      return;
+    }
+
+    // Support: Contact Support (opens ticket FSM)
+    if (data === 'supp:contact') {
+      const text = uiConfigService.getText('msg.support_prompt', lang) || t('support_prompt', lang);
+      await Promise.all([
+        redis.setFsmState(userId, { step: 'AWAITING_SUPPORT_MESSAGE' }),
+        this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:supp', lang), {
+          skipNavSaveIfEdited: true,
+        }),
+      ]);
+      return;
+    }
+
+    // Support: FAQ
+    if (data === 'supp:faq') {
+      await this.renderMenu(chatId, messageId, userId, t('support_faq', lang), {
+        inline_keyboard: [
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({ settingKey: 'btn.supp.contact', lang, callbackData: 'supp:contact', forceVisible: true }),
+          ]),
+          ButtonBuilder.buildNavigationRow('m:supp', lang),
+        ],
+      });
       return;
     }
 

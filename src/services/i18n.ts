@@ -55,216 +55,229 @@ export async function getUserLanguage(userId: string): Promise<SupportedLanguage
 
 export const translations: Record<SupportedLanguage, Record<string, string>> = {
   en: {
-    welcome:
-      '⚡ *WELCOME TO XERO KHAN*\n_Digital Tools. Instant Access._\n\nBrowse premium AI, developer, streaming, design, and security tools with instant automated delivery and protected wallet payments.',
-    menu_ready: '⚡ *XERO KHAN MENU READY*\nTap *☰ MENU* anytime to open the store.',
-    categories_header:
-      '🛍️ *BROWSE CATEGORIES*\n\nSelect a category below to explore live in-stock tools, or browse all products:',
-    featured_header:
-      '🔥 *FEATURED DIGITAL TOOLS*\n\nHand-picked popular tools with instant delivery (Page {page} of {totalPages}):',
-    featured_empty:
-      '🔥 *FEATURED DIGITAL TOOLS*\n\nNo featured items are highlighted right now. Explore all live products below!',
-    search_prompt:
-      '🔎 *SEARCH CATALOGUE*\n\nType the name or keyword of the tool you are looking for (e.g., ChatGPT, Canva, Netflix, Cursor):',
-    search_results:
-      '🔎 *SEARCH RESULTS FOR "{query}"*\n\nFound *{total}* matching tools (Page {page} of {totalPages}). Tap any item to view details:',
-    search_empty:
-      '🔎 *NO MATCHING TOOLS*\n\nNo in-stock products matched `"{query}"`. Try another keyword or browse categories:',
-    wallet_info:
-      '💳 *YOUR WALLET BALANCE*\n\n• Available: `{balance} USDT`\n• Locked: `{locked} USDT`\n\nInstant Binance Pay USDT verification or manual Easypaisa / JazzCash top-ups supported.',
-    wallet_history_header: '📜 *RECENT WALLET TRANSACTIONS*\n\n',
-    wallet_history_empty: '📜 *WALLET TRANSACTIONS*\n\nNo wallet transactions recorded yet.',
-    choose_payment:
-      '➕ *ADD FUNDS TO WALLET*\n\nSelect your preferred deposit method below:',
-    binance_desc:
-      '⚡ *BINANCE PAY USDT*\n\nInstant Order ID verification. No screenshot required.',
-    manual_desc:
-      '📱 *LOCAL MOBILE PAYMENT*\n\nManual verification by admin within 5–30 minutes.',
+    welcome: '👋 *Welcome to Master Xero*\n\nPremium Digital Marketplace',
+    menu_ready: '⚡ *Master Xero Ready*\nTap *☰ MENU* anytime to open the store.',
+    categories_header: '🛍 *Products*\n\nSelect a category:',
+    featured_header: '🔥 *Featured Tools* (Page {page} of {totalPages})',
+    featured_empty: '🔥 *Featured Tools*\n\nNo featured items right now. Browse all products below.',
+    search_prompt: '🔎 *Search*\n\nType a product name or keyword (e.g. ChatGPT, Canva, Netflix):',
+    search_results: '🔎 *Results for "{query}"*\n\nFound *{total}* items (Page {page}/{totalPages}):',
+    search_empty: '🔎 *No Results*\n\nNothing matched `"{query}"`. Try another keyword or browse categories.',
+    wallet_info: '💳 *Wallet*\n\n💰 *Balance:* `{balance} USDT`\n🔒 *Locked:* `{locked} USDT`',
+    wallet_history_header: '📜 *Transactions*\n\n',
+    wallet_history_empty: '📜 *Transactions*\n\nNo transactions yet.',
+    choose_payment: '➕ *Add Funds*\n\nChoose a payment method:',
+    binance_desc: '⚡ *Binance Pay USDT*\n\nInstant Order ID verification. No screenshot needed.',
+    manual_desc: '📱 *Local Mobile Payment*\n\nVerified within 5–30 minutes.',
     order_success:
-      '🎉 *ORDER COMPLETED!*\n\nYour order `{orderId}` has been delivered successfully.\n\n*Credentials / Details:*',
-    orders_header: '📦 *YOUR RECENT ORDERS*\n\n',
-    orders_empty:
-      '📦 *MY ORDERS*\n\nYou have not placed any orders yet. Tap *🛍️ PRODUCTS* to start shopping!',
+      '🎉 *Order Completed*\n\nOrder `{orderId}` delivered successfully.\n\n*Credentials / Details:*',
+    orders_hub: '📦 *Orders*\n\n• Active: `{activeCount}`\n• Completed: `{historyCount}`',
+    orders_header: '📜 *Order History*\n\n',
+    orders_empty: '📦 *Orders*\n\nNo orders yet. Tap *🛍 Products* to get started.',
+    orders_active_header: '📦 *Active Orders*\n\n',
+    orders_active_empty: '📦 *Active Orders*\n\nNo active orders right now.',
+    orders_history_header: '📜 *Order History*\n\n',
+    orders_history_empty: '📜 *Order History*\n\nNo past orders yet.',
+    free_stuff_header:
+      '🎁 *Get Free Stuff*\n\nInvite friends, join giveaways, and claim milestone rewards.',
+    rewards_header: '🏆 *Rewards*\n\nQualified Referrals: `{qualified}`\n',
+    rewards_empty: '🏆 *Rewards*\n\nNo referral reward tiers are active right now. Invite friends or check giveaways!',
     insufficient_funds:
-      '⚠️ *INSUFFICIENT FUNDS*\n\nYou need `{required} USDT` but have `{available} USDT`. Tap *➕ ADD FUNDS* below to top up.',
-    giveaways_header: '🎁 *DYNAMIC GIVEAWAYS*\n\n',
-    giveaways_empty:
-      '🎁 *GIVEAWAYS*\n\nNo dynamic giveaways are active right now. Check back soon!',
+      '⚠️ *Insufficient Funds*\n\nRequired: `{required} USDT`\nAvailable: `{available} USDT`\n\nTap *➕ Add Funds* to top up.',
+    giveaways_header: '🎁 *Giveaways*\n\n',
+    giveaways_empty: '🎁 *Giveaways*\n\nNo active giveaways right now. Check back soon!',
     referral_title:
-      '👥 *REFER & EARN PROGRAM*\n\nShare your personal invite link. When friends complete their first purchase, you earn progress toward dynamic giveaway rewards!\n\n🔗 *Your Referral Link:*\n`{link}`\n\n📊 *Your Stats:*\n• Total Invited: `{total}`\n• Qualified: `{qualified}`\n• Pending: `{pending}`',
+      '👥 *Invite Friends*\n\nShare your personal link to unlock rewards.\n\n🔗 *Link:*\n`{link}`\n\n• Total Invited: `{total}`\n• Qualified: `{qualified}`\n• Pending: `{pending}`',
+    support_hub: '🎧 *Support*\n\nHow can we help you today?',
     support_prompt:
-      '🎧 *CUSTOMER SUPPORT TICKET*\n\nDescribe your question or issue (include your Order ID if relevant). Our support team will respond promptly:',
+      '💬 *Contact Support*\n\nSend your question or Order ID below and our team will reply shortly:',
     support_created:
-      '✅ *TICKET CREATED (#{ticketId})*\n\nOur support team has received your inquiry and will reply here shortly.',
+      '✅ *Ticket Created (#{ticketId})*\n\nSupport has received your message and will reply shortly.',
+    support_faq:
+      '❓ *FAQ — Master Xero*\n\n' +
+      '• *Delivery:* Most digital tools deliver instantly after checkout.\n' +
+      '• *Add Funds:* Instant via Binance Pay USDT, or manual PKR via Easypaisa / JazzCash.\n' +
+      '• *Orders:* Check *📦 Orders → Active Orders* for processing items or *Order History* for saved credentials.\n' +
+      '• *Need Help?* Tap *💬 Contact Support* and include your Order ID.',
     profile_header:
-      '👤 *CUSTOMER PROFILE*\n\n• Telegram ID: `{userId}`\n• Wallet Balance: `{balance} USDT`\n• Qualified Referrals: `{qualified}`\n• Language: *{langLabel}*\n\n_Protected by XERO KHAN Ledger Security._',
-    language_select:
-      '🌐 *SELECT LANGUAGE / زبان منتخب کریں*\n\nChoose your preferred interface language:',
+      '👤 *Account*\n\n• ID: `{userId}`\n• Balance: `{balance} USDT`\n• Qualified Referrals: `{qualified}`\n• Language: *{langLabel}*',
+    language_select: '🌐 *Select Language*\n\nChoose your preferred language:',
     language_updated: '✅ Language updated to *English*.',
-    stale_menu:
-      '🔄 *MENU UPDATED*\n\nThis menu session expired or was replaced. Open a fresh menu below:',
+    stale_menu: '🔄 *Menu Updated*\n\nOpen a fresh menu below:',
     confirm_purchase:
-      '🛒 *CONFIRM PURCHASE*\n\n• Product: *{name}*\n• Quantity: `{qty}`\n• Unit Price: `{unitPrice} USDT`\n• Total: `{totalPrice} USDT`\n• Your Wallet: `{balance} USDT`\n\nConfirm below to complete your order:',
-    menu_products: '🛍️ PRODUCTS',
-    menu_featured: '🔥 FEATURED',
-    menu_search: '🔎 SEARCH',
-    menu_wallet: '💳 WALLET',
-    menu_add_funds: '➕ ADD FUNDS',
-    menu_orders: '📦 MY ORDERS',
-    menu_giveaways: '🎁 GIVEAWAYS',
-    menu_referral: '👥 REFER & EARN',
-    menu_support: '🎧 SUPPORT',
-    menu_profile: '👤 PROFILE',
-    menu_language: '🌐 LANGUAGE',
+      '🛒 *Confirm Purchase*\n\n• Product: *{name}*\n• Quantity: `{qty}`\n• Price: `{unitPrice} USDT`\n• Total: `{totalPrice} USDT`\n• Balance: `{balance} USDT`',
+    menu_products: '🛍 Products',
+    menu_featured: '🔥 Featured',
+    menu_search: '🔎 Search',
+    menu_wallet: '💳 Wallet',
+    menu_add_funds: '➕ Add Funds',
+    menu_orders: '📦 Orders',
+    menu_free_stuff: '🎁 Get Free Stuff',
+    menu_giveaways: '🎁 Giveaways',
+    menu_referral: '👥 Invite Friends',
+    menu_rewards: '🏆 Rewards',
+    menu_support: '🎧 Support',
+    menu_profile: '👤 Profile',
+    menu_language: '🌐 Language',
     input_placeholder: 'Choose an option or type a message…',
     api_info:
-      '🔌 *RESELLER API ACCESS*\n\nAutomated reseller API integration is available for verified partners using wallet-funded instant fulfillment.\n\n• API Docs & Key Onboarding: Contact Support below\n• Endpoint Auth: Partner-provisioned server credentials only',
-    btn_back: '⬅️ BACK',
-    btn_home: '🏠 HOME',
-    btn_buy: '🛒 BUY NOW',
-    btn_details: '📋 MORE DETAILS',
-    btn_confirm: '✅ CONFIRM',
-    btn_cancel: '❌ CANCEL',
+      '🔌 *Reseller API Access*\n\nAutomated API integration is available for verified partners.\n\nContact Support for onboarding.',
+    btn_back: '⬅️ Back',
+    btn_home: '🏠 Home',
+    btn_buy: '🛒 Buy Now',
+    btn_details: '📋 Details',
+    btn_confirm: '✅ Confirm',
+    btn_cancel: '❌ Cancel',
   },
   ur: {
-    welcome:
-      '⚡ *زیرو خان میں خوش آمدید*\n_ڈیجیٹل ٹولز۔ فوری رسائی۔_\n\nپریمیم اے آئی، ڈویلپر، میڈیا اور سیکیورٹی ٹولز فوری ڈیلیوری اور محفوظ ادائیگی کے ساتھ حاصل کریں۔',
-    menu_ready: '⚡ *زیرو خان مینو تیار ہے*\nکسی بھی وقت *☰ MENU* دبائیں۔',
-    categories_header:
-      '🛍️ *کیٹیگریز دیکھیں*\n\nدستیاب ڈیجیٹل ٹولز دیکھنے کے لیے نیچے سے کیٹیگری منتخب کریں:',
-    featured_header:
-      '🔥 *نمایاں ڈیجیٹل ٹولز*\n\nمنتخب مقبول ٹولز فوری ڈیلیوری کے ساتھ (صفحہ {page} از {totalPages}):',
-    featured_empty:
-      '🔥 *نمایاں ڈیجیٹل ٹولز*\n\nاس وقت کوئی نمایاں آئٹم موجود نہیں ہے۔ تمام دستیاب پروڈکٹس نیچے دیکھیں!',
-    search_prompt:
-      '🔎 *کیٹلاگ میں تلاش کریں*\n\nاپنے مطلوبہ ٹول کا نام یا لفظ لکھیں (مثلاً ChatGPT, Canva, Netflix):',
-    search_results:
-      '🔎 *تلاش کے نتائج: "{query}"*\n\nکل *{total}* پروڈکٹس ملے (صفحہ {page} از {totalPages})۔ تفصیل کے لیے کلک کریں:',
-    search_empty:
-      '🔎 *کوئی پروڈکٹ نہیں ملا*\n\n`"{query}"` کے مطابق کوئی دستیاب پروڈکٹ نہیں ملا۔ کوئی اور لفظ لکھیں یا کیٹیگری دیکھیں:',
-    wallet_info:
-      '💳 *آپ کا والٹ بیلنس*\n\n• دستیاب: `{balance} USDT`\n• لاک شدہ: `{locked} USDT`\n\nفوری بائننس پے USDT یا ایزی پیسہ / جاز کیش کے ذریعے رقم جمع کریں۔',
-    wallet_history_header: '📜 *حالیہ والٹ لین دین*\n\n',
-    wallet_history_empty: '📜 *والٹ لین دین*\n\nابھی تک کوئی لین دین ریکارڈ نہیں ہوا۔',
-    choose_payment:
-      '➕ *والٹ میں رقم جمع کریں*\n\nنیچے سے ادائیگی کا طریقہ منتخب کریں:',
+    welcome: '👋 *ماسٹر زیرو میں خوش آمدید*\n\nپریمیم ڈیجیٹل مارکیٹ پلیس',
+    menu_ready: '⚡ *ماسٹر زیرو مینو تیار ہے*\nکسی بھی وقت *☰ MENU* دبائیں۔',
+    categories_header: '🛍 *پروڈکٹس*\n\nکیٹیگری منتخب کریں:',
+    featured_header: '🔥 *نمایاں ٹولز* (صفحہ {page} از {totalPages})',
+    featured_empty: '🔥 *نمایاں ٹولز*\n\nاس وقت کوئی نمایاں آئٹم نہیں۔ تمام پروڈکٹس نیچے دیکھیں۔',
+    search_prompt: '🔎 *تلاش*\n\nپروڈکٹ کا نام لکھیں (مثلاً ChatGPT, Canva, Netflix):',
+    search_results: '🔎 *نتائج: "{query}"*\n\n*{total}* آئٹمز ملے (صفحہ {page}/{totalPages}):',
+    search_empty: '🔎 *کوئی نتیجہ نہیں*\n\n`"{query}"` کے لیے کچھ نہیں ملا۔',
+    wallet_info: '💳 *والٹ*\n\n💰 *بیلنس:* `{balance} USDT`\n🔒 *لاک:* `{locked} USDT`',
+    wallet_history_header: '📜 *لین دین*\n\n',
+    wallet_history_empty: '📜 *لین دین*\n\nابھی کوئی لین دین موجود نہیں۔',
+    choose_payment: '➕ *رقم جمع کریں*\n\nادائیگی کا طریقہ منتخب کریں:',
     binance_desc: '⚡ *بائننس پے USDT*\n\nفوری آرڈر آئی ڈی تصدیق۔ اسکرین شاٹ درکار نہیں۔',
-    manual_desc: '📱 *ایزی پیسہ / جاز کیش*\n\nایڈمن کی تصدیق 5 سے 30 منٹ میں۔',
+    manual_desc: '📱 *ایزی پیسہ / جاز کیش*\n\nتصدیق 5 سے 30 منٹ میں۔',
     order_success:
-      '🎉 *آرڈر مکمل ہو گیا!*\n\nآپ کا آرڈر `{orderId}` کامیابی سے ڈیلیور ہو چکا ہے۔\n\n*تفصیلات / اسناد:*',
-    orders_header: '📦 *آپ کے حالیہ آرڈرز*\n\n',
-    orders_empty:
-      '📦 *میرے آرڈرز*\n\nآپ نے ابھی تک کوئی آرڈر نہیں دیا۔ خریداری کے لیے *🛍️ پروڈکٹس* پر کلک کریں!',
+      '🎉 *آرڈر مکمل*\n\nآرڈر `{orderId}` کامیابی سے ڈیلیور ہو گیا۔\n\n*اسناد / تفصیلات:*',
+    orders_hub: '📦 *آرڈرز*\n\n• فعال: `{activeCount}`\n• مکمل / پچھلے: `{historyCount}`',
+    orders_header: '📜 *آرڈر ہسٹری*\n\n',
+    orders_empty: '📦 *آرڈرز*\n\nابھی کوئی آرڈر نہیں۔ خریداری کے لیے *🛍 پروڈکٹس* دیکھیں۔',
+    orders_active_header: '📦 *فعال آرڈرز*\n\n',
+    orders_active_empty: '📦 *فعال آرڈرز*\n\nاس وقت کوئی فعال آرڈر نہیں ہے۔',
+    orders_history_header: '📜 *آرڈر ہسٹری*\n\n',
+    orders_history_empty: '📜 *آرڈر ہسٹری*\n\nابھی کوئی پچھلا آرڈر موجود نہیں۔',
+    free_stuff_header:
+      '🎁 *مفت انعامات حاصل کریں*\n\nدوستوں کو مدعو کریں، گیو اوے میں شامل ہوں اور انعامات حاصل کریں۔',
+    rewards_header: '🏆 *انعامات*\n\nاہل ریفرلز: `{qualified}`\n',
+    rewards_empty: '🏆 *انعامات*\n\nاس وقت کوئی ریفرل انعام فعال نہیں۔ دوستوں کو مدعو کریں یا گیو اوے دیکھیں!',
     insufficient_funds:
-      '⚠️ *ناکافی بیلنس*\n\nآپ کو `{required} USDT` درکار ہیں جبکہ دستیاب `{available} USDT` ہیں۔',
-    giveaways_header: '🎁 *انعامات / گیو اوے*\n\n',
-    giveaways_empty:
-      '🎁 *انعامات*\n\nاس وقت کوئی گیو اوے فعال نہیں ہے۔ جلد دوبارہ چیک کریں!',
+      '⚠️ *ناکافی بیلنس*\n\nدرکار: `{required} USDT`\nدستیاب: `{available} USDT`\n\nرقم جمع کرنے کے لیے *➕ رقم جمع کریں* دبائیں۔',
+    giveaways_header: '🎁 *گیو اوے*\n\n',
+    giveaways_empty: '🎁 *گیو اوے*\n\nاس وقت کوئی فعال گیو اوے نہیں ہے۔',
     referral_title:
-      '👥 *ریفرل پروگرام*\n\nاپنا لنک دوستوں کے ساتھ شیئر کریں۔ جب وہ پہلی خریداری مکمل کریں گے تو آپ انعامات کے اہل ہوں گے!\n\n🔗 *آپ کا ریفرل لنک:*\n`{link}`\n\n📊 *آپ کے اعدادوشمار:*\n• کل مدعو: `{total}`\n• اہل: `{qualified}`\n• زیر التوا: `{pending}`',
+      '👥 *دوستوں کو مدعو کریں*\n\nانعامات کے لیے اپنا لنک شیئر کریں۔\n\n🔗 *لنک:*\n`{link}`\n\n• کل مدعو: `{total}`\n• اہل: `{qualified}`\n• زیر التوا: `{pending}`',
+    support_hub: '🎧 *سپورٹ*\n\nہم آپ کی کیا مدد کر سکتے ہیں؟',
     support_prompt:
-      '🎧 *کسٹمر سپورٹ ٹکٹ*\n\nبراہ کرم اپنا سوال یا مسئلہ بیان کریں (آرڈر آئی ڈی شامل کریں اگر موجود ہو):',
+      '💬 *سپورٹ سے رابطہ*\n\nاپنا سوال یا آرڈر آئی ڈی لکھیں، ہماری ٹیم جلد جواب دے گی:',
     support_created:
-      '✅ *ٹکٹ بن گیا (#{ticketId})*\n\nہماری سپورٹ ٹیم کو آپ کا پیغام موصول ہو گیا ہے اور جلد جواب دیا جائے گا۔',
+      '✅ *ٹکٹ بن گیا (#{ticketId})*\n\nسپورٹ ٹیم کو آپ کا پیغام موصول ہو گیا ہے۔',
+    support_faq:
+      '❓ *عمومی سوالات — Master Xero*\n\n' +
+      '• *ڈیلیوری:* زیادہ تر ڈیجیٹل ٹولز فوری ڈیلیور ہوتے ہیں۔\n' +
+      '• *رقم جمع:* بائننس پے USDT فوری یا ایزی پیسہ / جاز کیش سے جمع کریں۔\n' +
+      '• *آرڈرز:* فعال آرڈرز اور محفوظ اسناد *📦 آرڈرز* میں دیکھیں۔\n' +
+      '• *مدد:* *💬 سپورٹ سے رابطہ* دبائیں اور آرڈر آئی ڈی شامل کریں۔',
     profile_header:
-      '👤 *کسٹمر پروفائل*\n\n• ٹیلیگرام آئی ڈی: `{userId}`\n• والٹ بیلنس: `{balance} USDT`\n• اہل ریفرلز: `{qualified}`\n• زبان: *{langLabel}*\n\n_زیرو خان لیجر سیکیورٹی سے محفوظ۔_',
-    language_select:
-      '🌐 *زبان منتخب کریں / SELECT LANGUAGE*\n\nاپنی پسندیدہ زبان منتخب کریں:',
+      '👤 *اکاؤنٹ*\n\n• آئی ڈی: `{userId}`\n• بیلنس: `{balance} USDT`\n• اہل ریفرلز: `{qualified}`\n• زبان: *{langLabel}*',
+    language_select: '🌐 *زبان منتخب کریں*\n\nاپنی زبان منتخب کریں:',
     language_updated: '✅ زبان *اردو* میں تبدیل کر دی گئی ہے۔',
-    stale_menu:
-      '🔄 *مینو اپڈیٹ ہو گیا*\n\nیہ مینو پرانا ہو چکا ہے۔ نیا مینو نیچے سے کھولیں:',
+    stale_menu: '🔄 *مینو اپڈیٹ*\n\nنیا مینو نیچے سے کھولیں:',
     confirm_purchase:
-      '🛒 *خریداری کی تصدیق کریں*\n\n• پروڈکٹ: *{name}*\n• تعداد: `{qty}`\n• فی قیمت: `{unitPrice} USDT`\n• کل رقم: `{totalPrice} USDT`\n• آپ کا بیلنس: `{balance} USDT`\n\nآرڈر مکمل کرنے کے لیے تصدیق کریں:',
-    menu_products: '🛍️ پروڈکٹس',
+      '🛒 *خریداری کی تصدیق*\n\n• پروڈکٹ: *{name}*\n• تعداد: `{qty}`\n• قیمت: `{unitPrice} USDT`\n• کل: `{totalPrice} USDT`\n• بیلنس: `{balance} USDT`',
+    menu_products: '🛍 پروڈکٹس',
     menu_featured: '🔥 نمایاں',
     menu_search: '🔎 تلاش',
     menu_wallet: '💳 والٹ',
     menu_add_funds: '➕ رقم جمع کریں',
-    menu_orders: '📦 میرے آرڈرز',
-    menu_giveaways: '🎁 انعامات',
-    menu_referral: '👥 ریفرل',
+    menu_orders: '📦 آرڈرز',
+    menu_free_stuff: '🎁 مفت انعامات',
+    menu_giveaways: '🎁 گیو اوے',
+    menu_referral: '👥 دوستوں کو مدعو کریں',
+    menu_rewards: '🏆 انعامات',
     menu_support: '🎧 سپورٹ',
     menu_profile: '👤 پروفائل',
     menu_language: '🌐 زبان',
     input_placeholder: 'کوئی آپشن منتخب کریں یا پیغام لکھیں…',
     api_info:
-      '🔌 *ری سیلر API رسائی*\n\nتصدیق شدہ پارٹنرز کے لیے خودکار ری سیلر API دستیاب ہے۔\n\n• API آن بورڈنگ کے لیے نیچے سپورٹ سے رابطہ کریں۔',
+      '🔌 *ری سیلر API رسائی*\n\nتصدیق شدہ پارٹنرز کے لیے API دستیاب ہے۔ سپورٹ سے رابطہ کریں۔',
     btn_back: '⬅️ واپس',
     btn_home: '🏠 ہوم',
     btn_buy: '🛒 خریدیں',
-    btn_details: '📋 مزید تفصیلات',
-    btn_confirm: '✅ تصدیق کریں',
+    btn_details: '📋 تفصیلات',
+    btn_confirm: '✅ تصدیق',
     btn_cancel: '❌ منسوخ',
   },
   'ur-ro': {
-    welcome:
-      '⚡ *XERO KHAN MEIN KHUSHAMDEED*\n_Digital Tools. Instant Access._\n\nPremium AI, Developer, Streaming aur Security tools foran delivery aur mehfooz payment ke sath hasil karein.',
-    menu_ready: '⚡ *XERO KHAN MENU TAYAR HAI*\nStore kholne ke liye kisi bhi waqt *☰ MENU* dabayein.',
-    categories_header:
-      '🛍️ *CATEGORIES DEKHEIN*\n\nDastiyab tools dekhne ke liye neeche se category chunen:',
-    featured_header:
-      '🔥 *FEATURED DIGITAL TOOLS*\n\nMuntakhab mashhoor tools foran delivery ke sath (Page {page} of {totalPages}):',
-    featured_empty:
-      '🔥 *FEATURED TOOLS*\n\nAbhi koi featured item highlight nahi hai. Neeche tamam live products dekhein!',
-    search_prompt:
-      '🔎 *CATALOGUE SEARCH*\n\nTool ka naam ya keyword likhein (jaise ChatGPT, Canva, Netflix):',
-    search_results:
-      '🔎 *SEARCH RESULTS FOR "{query}"*\n\nTotal *{total}* tools mile (Page {page} of {totalPages}). Details dekhne ke liye click karein:',
-    search_empty:
-      '🔎 *KOI PRODUCT NAHI MILA*\n\n`"{query}"` se koi dastiyab item match nahi hua. Doosra lafz try karein:',
-    wallet_info:
-      '💳 *AAP KA WALLET BALANCE*\n\n• Dastiyab: `{balance} USDT`\n• Locked: `{locked} USDT`\n\nBinance Pay USDT ya Easypaisa / JazzCash se funds add karein.',
-    wallet_history_header: '📜 *HALIYA WALLET TRANSACTIONS*\n\n',
-    wallet_history_empty: '📜 *WALLET TRANSACTIONS*\n\nAbhi tak koi transaction record nahi hui.',
-    choose_payment:
-      '➕ *WALLET MEIN FUNDS ADD KAREIN*\n\nApna pasandeeda payment method chunen:',
-    binance_desc: '⚡ *BINANCE PAY USDT*\n\nForan Order ID verification. Screenshot zaroori nahi.',
-    manual_desc: '📱 *EASYPAISA / JAZZCASH*\n\nAdmin verification 5–30 minutes mein.',
+    welcome: '👋 *Master Xero Mein Khushamdeed*\n\nPremium Digital Marketplace',
+    menu_ready: '⚡ *Master Xero Ready*\nStore kholne ke liye *☰ MENU* dabayein.',
+    categories_header: '🛍 *Products*\n\nCategory chunen:',
+    featured_header: '🔥 *Featured Tools* (Page {page}/{totalPages})',
+    featured_empty: '🔥 *Featured Tools*\n\nAbhi koi featured item nahi hai. Neeche sab products dekhein.',
+    search_prompt: '🔎 *Search*\n\nProduct ka naam likhein (jaise ChatGPT, Canva, Netflix):',
+    search_results: '🔎 *Results: "{query}"*\n\n*{total}* items mile (Page {page}/{totalPages}):',
+    search_empty: '🔎 *Koi Result Nahi*\n\n`"{query}"` se koi item match nahi hua.',
+    wallet_info: '💳 *Wallet*\n\n💰 *Balance:* `{balance} USDT`\n🔒 *Locked:* `{locked} USDT`',
+    wallet_history_header: '📜 *Transactions*\n\n',
+    wallet_history_empty: '📜 *Transactions*\n\nAbhi koi transaction nahi hai.',
+    choose_payment: '➕ *Add Funds*\n\nPayment method chunen:',
+    binance_desc: '⚡ *Binance Pay USDT*\n\nForan Order ID verification. Screenshot zaroori nahi.',
+    manual_desc: '📱 *Easypaisa / JazzCash*\n\nVerification 5–30 minutes mein.',
     order_success:
-      '🎉 *ORDER MUKAMMAL HOGAYA!*\n\nAap ka order `{orderId}` kamyabi se deliver kardiya gaya hai.\n\n*Credentials / Details:*',
-    orders_header: '📦 *AAP KE RECENT ORDERS*\n\n',
-    orders_empty:
-      '📦 *MY ORDERS*\n\nAap ne abhi tak koi order nahi diya. Shopping shuru karne ke liye *🛍️ PRODUCTS* dabayein!',
+      '🎉 *Order Completed*\n\nOrder `{orderId}` deliver ho gaya hai.\n\n*Credentials / Details:*',
+    orders_hub: '📦 *Orders*\n\n• Active: `{activeCount}`\n• Completed: `{historyCount}`',
+    orders_header: '📜 *Order History*\n\n',
+    orders_empty: '📦 *Orders*\n\nAbhi koi order nahi hai. *🛍 Products* dekhein.',
+    orders_active_header: '📦 *Active Orders*\n\n',
+    orders_active_empty: '📦 *Active Orders*\n\nAbhi koi active order nahi hai.',
+    orders_history_header: '📜 *Order History*\n\n',
+    orders_history_empty: '📜 *Order History*\n\nAbhi koi purana order nahi hai.',
+    free_stuff_header:
+      '🎁 *Get Free Stuff*\n\nDoston ko invite karein, giveaways join karein aur rewards hasil karein.',
+    rewards_header: '🏆 *Rewards*\n\nQualified Referrals: `{qualified}`\n',
+    rewards_empty: '🏆 *Rewards*\n\nAbhi koi reward tier active nahi hai.',
     insufficient_funds:
-      '⚠️ *KAM BALANCE*\n\nAap ko `{required} USDT` chahiye magar dastiyab `{available} USDT` hain. Funds add karein.',
-    giveaways_header: '🎁 *DYNAMIC GIVEAWAYS*\n\n',
-    giveaways_empty:
-      '🎁 *GIVEAWAYS*\n\nAbhi koi giveaway active nahi hai. Jald wapas check karein!',
+      '⚠️ *Kam Balance*\n\nRequired: `{required} USDT`\nAvailable: `{available} USDT`\n\nTop up ke liye *➕ Add Funds* dabayein.',
+    giveaways_header: '🎁 *Giveaways*\n\n',
+    giveaways_empty: '🎁 *Giveaways*\n\nAbhi koi giveaway active nahi hai.',
     referral_title:
-      '👥 *REFER & EARN PROGRAM*\n\nApna link doston ke sath share karein. Jab woh apna pehla order karein ge to aap rewards ke haqdar hon ge!\n\n🔗 *Aap Ka Referral Link:*\n`{link}`\n\n📊 *Aap Ke Stats:*\n• Total Invited: `{total}`\n• Qualified: `{qualified}`\n• Pending: `{pending}`',
+      '👥 *Invite Friends*\n\nRewards ke liye apna link share karein.\n\n🔗 *Link:*\n`{link}`\n\n• Total Invited: `{total}`\n• Qualified: `{qualified}`\n• Pending: `{pending}`',
+    support_hub: '🎧 *Support*\n\nHum aap ki kya madad kar sakte hain?',
     support_prompt:
-      '🎧 *CUSTOMER SUPPORT TICKET*\n\nApna sawal ya masla likhein (Order ID zaroor likhein agar ho):',
+      '💬 *Contact Support*\n\nApna sawal ya Order ID likhein, team jald jawab degi:',
     support_created:
-      '✅ *TICKET BAN GAYA (#{ticketId})*\n\nHamari team ko aap ka message mil gaya hai, jald jawab mile ga.',
+      '✅ *Ticket Ban Gaya (#{ticketId})*\n\nSupport team ko aap ka message mil gaya hai.',
+    support_faq:
+      '❓ *FAQ — Master Xero*\n\n' +
+      '• *Delivery:* Zyada tar digital tools foran deliver hote hain.\n' +
+      '• *Add Funds:* Binance Pay USDT foran ya Easypaisa / JazzCash se.\n' +
+      '• *Orders:* Active aur purane orders *📦 Orders* mein dekhein.\n' +
+      '• *Help:* *💬 Contact Support* dabayein aur Order ID likhein.',
     profile_header:
-      '👤 *CUSTOMER PROFILE*\n\n• Telegram ID: `{userId}`\n• Wallet Balance: `{balance} USDT`\n• Qualified Referrals: `{qualified}`\n• Language: *{langLabel}*\n\n_XERO KHAN Ledger Security se mehfooz._',
-    language_select:
-      '🌐 *ZUBAN CHUNEN / SELECT LANGUAGE*\n\nApni pasandeeda zuban chunen:',
-    language_updated: '✅ Zuban *Roman Urdu* mein tabdeel kar di gayi hai.',
-    stale_menu:
-      '🔄 *MENU UPDATE HO GAYA*\n\nYeh purana menu hai. Neeche se naya menu kholein:',
+      '👤 *Account*\n\n• ID: `{userId}`\n• Balance: `{balance} USDT`\n• Qualified Referrals: `{qualified}`\n• Language: *{langLabel}*',
+    language_select: '🌐 *Zuban Chunen*\n\nApni zuban chunen:',
+    language_updated: '✅ Zuban *Roman Urdu* mein tabdeel ho gayi hai.',
+    stale_menu: '🔄 *Menu Updated*\n\nNaya menu neeche se kholein:',
     confirm_purchase:
-      '🛒 *KHARIDARI CONFIRM KAREIN*\n\n• Product: *{name}*\n• Quantity: `{qty}`\n• Unit Price: `{unitPrice} USDT`\n• Total: `{totalPrice} USDT`\n• Aap Ka Wallet: `{balance} USDT`\n\nOrder mukammal karne ke liye confirm karein:',
-    menu_products: '🛍️ PRODUCTS',
-    menu_featured: '🔥 FEATURED',
-    menu_search: '🔎 SEARCH',
-    menu_wallet: '💳 WALLET',
-    menu_add_funds: '➕ ADD FUNDS',
-    menu_orders: '📦 MY ORDERS',
-    menu_giveaways: '🎁 GIVEAWAYS',
-    menu_referral: '👥 REFER & EARN',
-    menu_support: '🎧 SUPPORT',
-    menu_profile: '👤 PROFILE',
-    menu_language: '🌐 ZUBAN',
+      '🛒 *Confirm Purchase*\n\n• Product: *{name}*\n• Qty: `{qty}`\n• Price: `{unitPrice} USDT`\n• Total: `{totalPrice} USDT`\n• Balance: `{balance} USDT`',
+    menu_products: '🛍 Products',
+    menu_featured: '🔥 Featured',
+    menu_search: '🔎 Search',
+    menu_wallet: '💳 Wallet',
+    menu_add_funds: '➕ Add Funds',
+    menu_orders: '📦 Orders',
+    menu_free_stuff: '🎁 Get Free Stuff',
+    menu_giveaways: '🎁 Giveaways',
+    menu_referral: '👥 Invite Friends',
+    menu_rewards: '🏆 Rewards',
+    menu_support: '🎧 Support',
+    menu_profile: '👤 Profile',
+    menu_language: '🌐 Zuban',
     input_placeholder: 'Option chunen ya message likhein…',
     api_info:
-      '🔌 *RESELLER API ACCESS*\n\nVerified partners ke liye automated Reseller API integration dastiyab hai.\n\n• Onboarding ke liye neeche Support se rabta karein.',
-    btn_back: '⬅️ WAPAS',
-    btn_home: '🏠 HOME',
-    btn_buy: '🛒 KHAREEDEIN',
-    btn_details: '📋 DETAILS',
-    btn_confirm: '✅ CONFIRM',
-    btn_cancel: '❌ CANCEL',
+      '🔌 *Reseller API Access*\n\nVerified partners ke liye API dastiyab hai. Support se rabta karein.',
+    btn_back: '⬅️ Wapas',
+    btn_home: '🏠 Home',
+    btn_buy: '🛒 Khareedein',
+    btn_details: '📋 Details',
+    btn_confirm: '✅ Confirm',
+    btn_cancel: '❌ Cancel',
   },
 };
 
