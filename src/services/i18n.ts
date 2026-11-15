@@ -69,6 +69,8 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     choose_payment: '➕ *Add Funds*\n\nChoose a payment method:',
     binance_desc: '⚡ *Binance Pay USDT*\n\nInstant Order ID verification. No screenshot needed.',
     manual_desc: '📱 *Local Mobile Payment*\n\nVerified within 5–30 minutes.',
+    order_received_wait:
+      '✅ *Order received.*\n\nPlease wait a moment.\nWe are preparing your order.',
     order_success:
       '🎉 *Order Completed*\n\nOrder `{orderId}` delivered successfully.\n\n*Credentials / Details:*',
     orders_hub: '📦 *Orders*\n\n• Active: `{activeCount}`\n• Completed: `{historyCount}`',
@@ -87,18 +89,19 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     giveaways_header: '🎁 *Giveaways*\n\n',
     giveaways_empty: '🎁 *Giveaways*\n\nNo active giveaways right now. Check back soon!',
     referral_title:
-      '👥 *Invite Friends*\n\nShare your personal link to unlock rewards.\n\n🔗 *Link:*\n`{link}`\n\n• Total Invited: `{total}`\n• Qualified: `{qualified}`\n• Pending: `{pending}`',
+      '👥 *Invite Friends*\n\n🔗 *Referral Link:*\n`{link}`\n\n👥 *Total Referrals:* `{total}`\n💰 *Qualified Referrals:* `{qualified}`',
     support_hub: '🎧 *Support*\n\nHow can we help you today?',
-    support_prompt:
-      '💬 *Contact Support*\n\nSend your question or Order ID below and our team will reply shortly:',
+    support_prompt: 'Describe your issue.',
     support_created:
-      '✅ *Ticket Created (#{ticketId})*\n\nSupport has received your message and will reply shortly.',
+      '✅ *Ticket Created*\n\n• Ticket: *#{ticketId}*\n• Status: *OPEN*\n\nOur support team will reply here shortly.',
+    support_reply_notice:
+      '🎫 *Support Reply (#{ticketId})*\n\n*Message:*\n{message}',
     support_faq:
       '❓ *FAQ — Master Xero*\n\n' +
       '• *Delivery:* Most digital tools deliver instantly after checkout.\n' +
       '• *Add Funds:* Instant via Binance Pay USDT, or manual PKR via Easypaisa / JazzCash.\n' +
       '• *Orders:* Check *📦 Orders → Active Orders* for processing items or *Order History* for saved credentials.\n' +
-      '• *Need Help?* Tap *💬 Contact Support* and include your Order ID.',
+      '• *Need Help?* Tap *➕ Open Ticket* and describe your issue.',
     profile_header:
       '👤 *Account*\n\n• ID: `{userId}`\n• Balance: `{balance} USDT`\n• Qualified Referrals: `{qualified}`\n• Language: *{langLabel}*',
     language_select: '🌐 *Select Language*\n\nChoose your preferred language:',
@@ -144,6 +147,8 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     choose_payment: '➕ *رقم جمع کریں*\n\nادائیگی کا طریقہ منتخب کریں:',
     binance_desc: '⚡ *بائننس پے USDT*\n\nفوری آرڈر آئی ڈی تصدیق۔ اسکرین شاٹ درکار نہیں۔',
     manual_desc: '📱 *ایزی پیسہ / جاز کیش*\n\nتصدیق 5 سے 30 منٹ میں۔',
+    order_received_wait:
+      '✅ *آرڈر موصول ہو گیا۔*\n\nبراہ کرم تھوڑا انتظار کریں۔\nہم آپ کا آرڈر تیار کر رہے ہیں۔',
     order_success:
       '🎉 *آرڈر مکمل*\n\nآرڈر `{orderId}` کامیابی سے ڈیلیور ہو گیا۔\n\n*اسناد / تفصیلات:*',
     orders_hub: '📦 *آرڈرز*\n\n• فعال: `{activeCount}`\n• مکمل / پچھلے: `{historyCount}`',
@@ -162,18 +167,19 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     giveaways_header: '🎁 *گیو اوے*\n\n',
     giveaways_empty: '🎁 *گیو اوے*\n\nاس وقت کوئی فعال گیو اوے نہیں ہے۔',
     referral_title:
-      '👥 *دوستوں کو مدعو کریں*\n\nانعامات کے لیے اپنا لنک شیئر کریں۔\n\n🔗 *لنک:*\n`{link}`\n\n• کل مدعو: `{total}`\n• اہل: `{qualified}`\n• زیر التوا: `{pending}`',
+      '👥 *دوستوں کو مدعو کریں*\n\n🔗 *ریفرل لنک:*\n`{link}`\n\n👥 *کل ریفرلز:* `{total}`\n💰 *اہل ریفرلز:* `{qualified}`',
     support_hub: '🎧 *سپورٹ*\n\nہم آپ کی کیا مدد کر سکتے ہیں؟',
-    support_prompt:
-      '💬 *سپورٹ سے رابطہ*\n\nاپنا سوال یا آرڈر آئی ڈی لکھیں، ہماری ٹیم جلد جواب دے گی:',
+    support_prompt: 'اپنا مسئلہ بیان کریں۔',
     support_created:
-      '✅ *ٹکٹ بن گیا (#{ticketId})*\n\nسپورٹ ٹیم کو آپ کا پیغام موصول ہو گیا ہے۔',
+      '✅ *ٹکٹ بن گیا*\n\n• ٹکٹ: *#{ticketId}*\n• اسٹیٹس: *OPEN*\n\nسپورٹ ٹیم جلد یہاں جواب دے گی۔',
+    support_reply_notice:
+      '🎫 *سپورٹ کا جواب (#{ticketId})*\n\n*پیغام:*\n{message}',
     support_faq:
       '❓ *عمومی سوالات — Master Xero*\n\n' +
       '• *ڈیلیوری:* زیادہ تر ڈیجیٹل ٹولز فوری ڈیلیور ہوتے ہیں۔\n' +
       '• *رقم جمع:* بائننس پے USDT فوری یا ایزی پیسہ / جاز کیش سے جمع کریں۔\n' +
       '• *آرڈرز:* فعال آرڈرز اور محفوظ اسناد *📦 آرڈرز* میں دیکھیں۔\n' +
-      '• *مدد:* *💬 سپورٹ سے رابطہ* دبائیں اور آرڈر آئی ڈی شامل کریں۔',
+      '• *مدد:* *➕ اوپن ٹکٹ* دبائیں اور اپنا مسئلہ لکھیں۔',
     profile_header:
       '👤 *اکاؤنٹ*\n\n• آئی ڈی: `{userId}`\n• بیلنس: `{balance} USDT`\n• اہل ریفرلز: `{qualified}`\n• زبان: *{langLabel}*',
     language_select: '🌐 *زبان منتخب کریں*\n\nاپنی زبان منتخب کریں:',
@@ -219,6 +225,8 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     choose_payment: '➕ *Add Funds*\n\nPayment method chunen:',
     binance_desc: '⚡ *Binance Pay USDT*\n\nForan Order ID verification. Screenshot zaroori nahi.',
     manual_desc: '📱 *Easypaisa / JazzCash*\n\nVerification 5–30 minutes mein.',
+    order_received_wait:
+      '✅ *Order received.*\n\nPlease wait a moment.\nWe are preparing your order.',
     order_success:
       '🎉 *Order Completed*\n\nOrder `{orderId}` deliver ho gaya hai.\n\n*Credentials / Details:*',
     orders_hub: '📦 *Orders*\n\n• Active: `{activeCount}`\n• Completed: `{historyCount}`',
@@ -237,18 +245,19 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     giveaways_header: '🎁 *Giveaways*\n\n',
     giveaways_empty: '🎁 *Giveaways*\n\nAbhi koi giveaway active nahi hai.',
     referral_title:
-      '👥 *Invite Friends*\n\nRewards ke liye apna link share karein.\n\n🔗 *Link:*\n`{link}`\n\n• Total Invited: `{total}`\n• Qualified: `{qualified}`\n• Pending: `{pending}`',
+      '👥 *Invite Friends*\n\n🔗 *Referral Link:*\n`{link}`\n\n👥 *Total Referrals:* `{total}`\n💰 *Qualified Referrals:* `{qualified}`',
     support_hub: '🎧 *Support*\n\nHum aap ki kya madad kar sakte hain?',
-    support_prompt:
-      '💬 *Contact Support*\n\nApna sawal ya Order ID likhein, team jald jawab degi:',
+    support_prompt: 'Apna masla likhein.',
     support_created:
-      '✅ *Ticket Ban Gaya (#{ticketId})*\n\nSupport team ko aap ka message mil gaya hai.',
+      '✅ *Ticket Created*\n\n• Ticket: *#{ticketId}*\n• Status: *OPEN*\n\nSupport team jald jawab degi.',
+    support_reply_notice:
+      '🎫 *Support Reply (#{ticketId})*\n\n*Message:*\n{message}',
     support_faq:
       '❓ *FAQ — Master Xero*\n\n' +
       '• *Delivery:* Zyada tar digital tools foran deliver hote hain.\n' +
       '• *Add Funds:* Binance Pay USDT foran ya Easypaisa / JazzCash se.\n' +
       '• *Orders:* Active aur purane orders *📦 Orders* mein dekhein.\n' +
-      '• *Help:* *💬 Contact Support* dabayein aur Order ID likhein.',
+      '• *Help:* *➕ Open Ticket* dabayein aur apna masla likhein.',
     profile_header:
       '👤 *Account*\n\n• ID: `{userId}`\n• Balance: `{balance} USDT`\n• Qualified Referrals: `{qualified}`\n• Language: *{langLabel}*',
     language_select: '🌐 *Zuban Chunen*\n\nApni zuban chunen:',

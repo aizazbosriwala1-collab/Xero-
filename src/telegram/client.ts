@@ -591,6 +591,27 @@ export class TelegramClient {
     });
   }
 
+  public async getChat(chatId: number | string): Promise<any> {
+    return await this.post('getChat', {
+      chat_id: chatId,
+    });
+  }
+
+  public async getActiveBotId(): Promise<number | undefined> {
+    if (!this.token && !this.transportOverride) {
+      return undefined;
+    }
+    try {
+      const res = await this.getMe();
+      if (res?.ok && res?.result?.id) {
+        return Number(res.result.id);
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   public async answerCallbackQuery(callbackQueryId: string, text?: string, showAlert = false): Promise<any> {
     return await this.post('answerCallbackQuery', {
       callback_query_id: callbackQueryId,

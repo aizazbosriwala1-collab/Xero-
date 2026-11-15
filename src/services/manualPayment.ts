@@ -19,7 +19,7 @@ export interface ManualPaymentSubmission {
 export interface LocalManualDepositSubmission {
   userId: string;
   methodCode: 'EASYPAISA' | 'JAZZCASH';
-  senderPhone: string;
+  senderPhone?: string | null;
   proofFileId: string;
   ocrText?: string;
   submittedPkrAmount?: string | number;
@@ -289,15 +289,15 @@ export class ManualPaymentService {
 
   /**
    * Simplified local-customer manual deposit (Easypaisa / JazzCash):
-   * Requires ONLY Screenshot (proofFileId) + Sender Phone Number.
-   * No TXID or reference number required.
+   * Supports ultra-simple Amount -> Payment Screenshot ONLY flow (no TXID, no phone required),
+   * while remaining backwards-compatible when senderPhone is provided.
    */
   public async submitLocalDeposit(
     data: LocalManualDepositSubmission
   ): Promise<{
     depositId: string;
     status: string;
-    senderPhone: string;
+    senderPhone: string | null;
     submittedPkrAmount: string | null;
     suggestedUsdAmount: string | null;
   }> {
@@ -310,7 +310,10 @@ export class ManualPaymentService {
       throw new Error('Payment screenshot is required.');
     }
 
-    const senderPhone = this.normalizeSenderPhone(data.senderPhone);
+    const senderPhone =
+      data.senderPhone && String(data.senderPhone).trim().length > 0
+        ? this.normalizeSenderPhone(data.senderPhone)
+        : null;
     const settings = await this.getDepositSettings();
 
     let submittedPkrAmount: string | null = null;

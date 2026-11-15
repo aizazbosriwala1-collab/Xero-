@@ -16,6 +16,7 @@ const MIGRATIONS: Array<{ version: number; name: string; filename: string }> = [
   { version: 4, name: '004_public_release_polish', filename: '004_public_release_polish.sql' },
   { version: 5, name: '005_payment_ux_and_perf', filename: '005_payment_ux_and_perf.sql' },
   { version: 6, name: '006_referral_giveaway_ann_perf', filename: '006_referral_giveaway_ann_perf.sql' },
+  { version: 7, name: '007_tickets_promotions_analytics', filename: '007_tickets_promotions_analytics.sql' },
 ];
 
 function readMigrationSql(filename: string): string {

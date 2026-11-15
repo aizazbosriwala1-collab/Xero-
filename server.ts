@@ -11,6 +11,7 @@ import { apiRouter } from './src/api/routes.js';
 import { telegramClient } from './src/telegram/client.js';
 import { supplierService } from './src/services/supplier.js';
 import { encryptionService } from './src/services/encryption.js';
+import { promotionService } from './src/services/promotion.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -119,7 +120,8 @@ async function startServer() {
     void telegramClient.registerBotCommandsSafely();
   }
 
-  // 7. Non-blocking initial catalogue sync in background
+  // 7. Non-blocking initial catalogue sync & auto-promotion scheduler in background
+  promotionService.startScheduler();
   setTimeout(() => {
     supplierService.syncCatalogue()
       .then((syncRes) => {
@@ -133,6 +135,7 @@ async function startServer() {
   // 8. Graceful Shutdown handlers
   const handleShutdown = async (signal: string) => {
     logger.info(`Received ${signal}. Starting graceful shutdown...`);
+    promotionService.stopScheduler();
     server.close(async () => {
       logger.info('HTTP server closed');
       try {

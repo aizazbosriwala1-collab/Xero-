@@ -340,13 +340,16 @@ export class OrderService {
       });
     });
 
-    // 7. Call Supplier Reseller API
-    const supplierRes = await supplierService.placeOrder({
-      product_id: product.supplier_product_id,
-      quantity: qty,
-      customer_email: request.customerEmail,
-      idempotency_key: idempotencyKey,
-    });
+    // 7. Call Supplier Reseller API (with automatic failover if disabled/failed pre-fulfillment)
+    const supplierRes = await supplierService.placeOrder(
+      {
+        product_id: product.supplier_product_id,
+        quantity: qty,
+        customer_email: request.customerEmail,
+        idempotency_key: idempotencyKey,
+      },
+      { preferredSupplierId: product.supplier || 'aitoolshop' }
+    );
 
     const delivered = supplierRes.delivered_items || [];
     const sanitizedRawPayload = sanitizeSupplierPayload(supplierRes.raw);

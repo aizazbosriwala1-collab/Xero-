@@ -16,6 +16,15 @@ export interface ReferralStats {
   pendingCount: number;
 }
 
+export interface TopReferrerRecord {
+  userId: string;
+  username: string | null;
+  firstName: string | null;
+  totalReferrals: number;
+  qualifiedReferrals: number;
+  totalSalesGenerated: string;
+}
+
 export interface ReferralRewardTier {
   id: string;
   title: string;
@@ -47,7 +56,10 @@ export class ReferralService {
   }
 
   public async invalidateStatsCache(userId: string): Promise<void> {
-    await redis.del(this.statsCacheKey(String(userId))).catch(() => {});
+    await Promise.all([
+      redis.del(this.statsCacheKey(String(userId))).catch(() => {}),
+      redis.del('ref:leaderboard:top').catch(() => {}),
+    ]);
   }
 
   /**
@@ -257,6 +269,93 @@ export class ReferralService {
       qualifiedCount,
       pendingCount,
     };
+  }
+
+  /**
+   * Advanced Referral Analytics: Top Referrers Leaderboard with Total Referrals,
+   * Qualified Referrals, and Total Sales Generated (COMPLETED / PENDING_INVITE orders).
+   */
+  public async getTopReferrers(
+    limit = 10,
+    options?: { bypassCache?: boolean }
+  ): Promise<TopReferrerRecord[]> {
+    const safeLimit = Math.min(50, Math.max(1, limit));
+    const cacheKey = 'ref:leaderboard:top';
+    if (!options?.bypassCache && safeLimit <= 10) {
+      try {
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+          return (JSON.parse(cached) as TopReferrerRecord[]).slice(0, safeLimit);
+        }
+      } catch {
+        // Cache miss
+      }
+    }
+
+    const [countsRes, salesRes] = await Promise.all([
+      db.query<{
+        referrerId: string;
+        username: string | null;
+        firstName: string | null;
+        totalReferrals: string;
+        qualifiedReferrals: string;
+      }>(`
+        SELECT r.referrer_id as "referrerId",
+               u.username,
+               u.first_name as "firstName",
+               COUNT(*) as "totalReferrals",
+               COALESCE(SUM(CASE WHEN r.status = 'QUALIFIED' THEN 1 ELSE 0 END), 0) as "qualifiedReferrals"
+        FROM referrals r
+        LEFT JOIN users u ON r.referrer_id = u.id
+        GROUP BY r.referrer_id, u.username, u.first_name
+      `),
+      db.query<{
+        referrerId: string;
+        totalSales: string;
+      }>(`
+        SELECT r.referrer_id as "referrerId",
+               COALESCE(SUM(o.total_price), 0) as "totalSales"
+        FROM referrals r
+        JOIN local_orders o ON o.user_id = r.referred_id
+        WHERE o.status IN ('COMPLETED', 'PENDING_INVITE')
+        GROUP BY r.referrer_id
+      `),
+    ]);
+
+    const salesMap = new Map<string, Decimal>();
+    for (const s of salesRes.rows) {
+      salesMap.set(String(s.referrerId), new Decimal(s.totalSales || 0));
+    }
+
+    const leaderboard: TopReferrerRecord[] = countsRes.rows
+      .map(row => {
+        const userId = String(row.referrerId);
+        const totalReferrals = parseInt(row.totalReferrals || '0', 10);
+        const qualifiedReferrals = parseInt(row.qualifiedReferrals || '0', 10);
+        const salesDec = salesMap.get(userId) || new Decimal(0);
+        return {
+          userId,
+          username: row.username || null,
+          firstName: row.firstName || null,
+          totalReferrals,
+          qualifiedReferrals,
+          totalSalesGenerated: salesDec.toFixed(2),
+        };
+      })
+      .sort((a, b) => {
+        if (b.qualifiedReferrals !== a.qualifiedReferrals) {
+          return b.qualifiedReferrals - a.qualifiedReferrals;
+        }
+        const salesDiff = new Decimal(b.totalSalesGenerated).comparedTo(new Decimal(a.totalSalesGenerated));
+        if (salesDiff !== 0) return salesDiff;
+        return b.totalReferrals - a.totalReferrals;
+      });
+
+    if (safeLimit <= 10) {
+      await redis.set(cacheKey, JSON.stringify(leaderboard.slice(0, 10)), 45).catch(() => {});
+    }
+
+    return leaderboard.slice(0, safeLimit);
   }
 
   private async invalidateCaches(): Promise<void> {

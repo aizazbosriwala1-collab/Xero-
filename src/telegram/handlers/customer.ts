@@ -110,6 +110,37 @@ export class CustomerHandler {
       return;
     }
 
+    const needsReplyKbAttach = navState?.filters?.replyKbVersion !== 'v2_2btn';
+
+    // Smart deep links from Channel Promotions (e.g. ?start=orders or ?start=orders_<productId>)
+    if (referrerCode === 'orders' || (referrerCode && referrerCode.startsWith('orders_'))) {
+      if (needsReplyKbAttach) {
+        const quickBarHint =
+          lang === 'ur'
+            ? '⚡ فوری رسائی نیچے فعال ہے: رقم جمع کریں یا سپورٹ۔'
+            : '⚡ Quick actions enabled below: Deposit or Support.';
+        await telegramClient.sendMessage(msg.chat.id, quickBarHint, {
+          disable_notification: true,
+          reply_markup: getCustomerMainReplyKeyboard(lang),
+        });
+        await navigationService.saveState(userId, {
+          filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' },
+          existingState: navState,
+        });
+      }
+
+      if (referrerCode.startsWith('orders_')) {
+        const promoProdId = referrerCode.slice('orders_'.length).trim();
+        const item = promoProdId ? await pricingService.getCatalogItemById(promoProdId).catch(() => null) : null;
+        if (item) {
+          await this.showProductDetail(msg.chat.id, undefined, item.id, 1, 'all', 1, lang);
+          return;
+        }
+      }
+      await this.dispatchCallback(msg.chat.id, undefined, userId, 'm:ord', isAdmin);
+      return;
+    }
+
     const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
 
     // Send single polished welcome screen (with optional banner photo if configured) + colored inline dashboard
@@ -122,7 +153,6 @@ export class CustomerHandler {
         });
 
     // Attach/upgrade persistent 2-button bottom reply keyboard ([ Deposit ] [ Support ]) cleanly without duplicating home screen
-    const needsReplyKbAttach = navState?.filters?.replyKbVersion !== 'v2_2btn';
     if (needsReplyKbAttach) {
       const quickBarHint =
         lang === 'ur'
@@ -799,7 +829,7 @@ export class CustomerHandler {
       return;
     }
 
-    // Method: Easypaisa or JazzCash (Simplified PKR UX: Screenshot + Sender Phone, NO TXID or USD prompt)
+    // Method: Easypaisa or JazzCash (Ultra-Simple PKR Flow: Amount -> Account -> Screenshot Only)
     if (data === 'dep_m:easypaisa' || data === 'dep_m:jazzcash') {
       const code = data === 'dep_m:easypaisa' ? 'EASYPAISA' : 'JAZZCASH';
       const [method, depCfg] = await Promise.all([
@@ -817,21 +847,15 @@ export class CustomerHandler {
         return;
       }
 
-      await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_PROOF', data: { methodCode: code } });
+      await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_PKR_AMOUNT', data: { methodCode: code } });
       const title = code === 'EASYPAISA' ? 'Easypaisa Deposit' : 'JazzCash Deposit';
       const prompt =
         `💰 *${title}*\n\n` +
-        `*Exchange Rate:*\n\`1 USD = ${depCfg.pkrPerUsd} PKR\`\n\n` +
-        `*Minimum:*\n\`${depCfg.minPkr} PKR\`\n\n` +
-        `*Maximum:*\n\`${depCfg.maxPkr} PKR\`\n\n` +
-        `Send payment to:\n\n` +
-        `*Account Title:*\n\`${method.accountTitle}\`\n\n` +
-        `*Number:*\n\`${method.accountNumber}\`\n\n` +
-        `After payment send:\n\n` +
-        `✅ *Payment Screenshot*\n` +
-        `✅ *Sender Phone Number*\n\n` +
-        `Example:\n\`03001234567\`\n\n` +
-        `📸 Please upload your *Payment Screenshot* now:`;
+        `How much would you like to send?\n\n` +
+        `• *Rate:* \`1 USD = ${depCfg.pkrPerUsd} PKR\`\n` +
+        `• *Min:* \`${depCfg.minPkr} PKR\`\n` +
+        `• *Max:* \`${depCfg.maxPkr} PKR\`\n\n` +
+        `_Enter amount in PKR (example: 500):_`;
 
       await this.renderMenu(chatId, messageId, userId, prompt, getBackHomeKeyboard('m:dep', lang));
       return;
@@ -1046,79 +1070,19 @@ export class CustomerHandler {
       return;
     }
 
-    // Refer & Earn (Two-counter Referral Program + Active Rewards & Milestones)
+    // Invite Friends / Refer & Earn (Clean Customer View: Link + Total Referrals + Qualified Referrals Only)
     if (data === 'm:ref') {
-      const [stats, refSettings] = await Promise.all([
-        referralService.getStats(userId),
-        referralService.getSettings(),
-      ]);
-      const [activeGiveaways, tiers] = await Promise.all([
-        giveawayService.getActiveGiveaways(userId, { knownStats: stats }),
-        referralService.listRewardTiers({
-          activeOnly: true,
-          userId,
-          knownQualifiedCount: stats.qualifiedCount,
-        }),
-      ]);
-
-      const activeTiersCount = refSettings.rewardsEnabled ? tiers.length : 0;
-      const activeRewardsCount = activeTiersCount + activeGiveaways.length;
-
-      let progressStr = `${stats.totalReferred} / ${Math.max(1, stats.totalReferred)} referrals`;
-      const nextTier = tiers.find(tr => !tr.userClaimed) || tiers[0];
-      if (nextTier && refSettings.rewardsEnabled) {
-        progressStr = `${stats.qualifiedCount} / ${nextTier.requiredQualifiedReferrals} qualified referrals`;
-      } else if (activeGiveaways.length > 0) {
-        const g = activeGiveaways[0];
-        if (g.requiredTotalReferrals > 0 && g.requiredQualifiedReferrals === 0) {
-          progressStr = `${stats.totalReferred} / ${g.requiredTotalReferrals} referrals`;
-        } else {
-          const target = Math.max(g.requiredQualifiedReferrals, g.requiredTotalReferrals, 1);
-          const cur = g.requiredQualifiedReferrals > 0 ? stats.qualifiedCount : stats.totalReferred;
-          progressStr = `${cur} / ${target} referrals`;
-        }
-      }
-
-      let text =
-        `👥 *Referral Program*\n\n` +
+      const stats = await referralService.getStats(userId);
+      const text =
+        `👥 *Invite Friends*\n\n` +
         `🔗 *Referral Link:*\n` +
         (stats.referralLink
           ? `\`${stats.referralLink}\`\n\n`
           : `_Referral link unavailable — configure BOT_USERNAME or active bot token._\n\n`) +
         `👥 *Total Referrals:* \`${stats.totalReferred}\`\n` +
-        `💰 *Qualified Referrals:* \`${stats.qualifiedCount}\`\n` +
-        `🎁 *Active Rewards:* \`${activeRewardsCount}\`\n\n` +
-        `📊 *Progress:* \`${progressStr}\`\n\n` +
-        `ℹ️ *Rules:* _Friends count once in Total Referrals when they join, and once in Qualified Referrals when they complete a qualifying purchase (\u2265 ${refSettings.minQualifyingOrderUsdt} USDT)._`;
+        `💰 *Qualified Referrals:* \`${stats.qualifiedCount}\``;
 
-      const rows: any[][] = [];
-      if (tiers.length > 0 && refSettings.rewardsEnabled) {
-        text += `\n\n🎁 *REFERRAL REWARD MILESTONES:*\n`;
-        for (const tier of tiers) {
-          const rewardDesc =
-            tier.rewardType === 'WALLET_USDT'
-              ? `${tier.rewardAmount} USDT Wallet Credit`
-              : `${tier.rewardProductName || 'Product'} x${tier.rewardQuantity}`;
-          const badge = tier.userClaimed ? '✅ Claimed' : tier.userEligible ? '✅ Ready to Claim' : `⚠️ ${stats.qualifiedCount}/${tier.requiredQualifiedReferrals}`;
-          text += `• *${tier.title}* (${tier.requiredQualifiedReferrals} Qualified) → ${rewardDesc} — ${badge}\n`;
-          if (tier.userEligible && !tier.userClaimed) {
-            rows.push(
-              ButtonBuilder.buildActionRow([
-                ButtonBuilder.buildButton({
-                  text: `Claim: ${tier.title}`.slice(0, 36),
-                  fallbackEmoji: '🎁',
-                  style: 'success',
-                  callbackData: `ref_cl:${tier.id}`,
-                  forceVisible: true,
-                }),
-              ])
-            );
-          }
-        }
-      }
-
-      rows.push(ButtonBuilder.buildNavigationRow('m:free', lang));
-      await this.renderMenu(chatId, messageId, userId, text, { inline_keyboard: rows.filter(r => r.length > 0) });
+      await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:free', lang));
       return;
     }
 
@@ -1147,7 +1111,7 @@ export class CustomerHandler {
       return;
     }
 
-    // Support Hub (Contact Support, FAQ)
+    // Support Hub (Open Ticket, My Tickets, FAQ)
     if (data === 'm:supp') {
       await Promise.all([
         redis.clearFsmState(userId),
@@ -1158,7 +1122,7 @@ export class CustomerHandler {
       return;
     }
 
-    // Support: Contact Support (opens ticket FSM)
+    // Support: Open Ticket (opens ticket FSM)
     if (data === 'supp:contact') {
       const text = uiConfigService.getText('msg.support_prompt', lang) || t('support_prompt', lang);
       await Promise.all([
@@ -1167,6 +1131,122 @@ export class CustomerHandler {
           skipNavSaveIfEdited: true,
         }),
       ]);
+      return;
+    }
+
+    // Support: My Tickets
+    if (data === 'supp:list') {
+      const tickets = await supportService.getUserTickets(userId);
+      if (tickets.length === 0) {
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          '🎫 *My Tickets*\n\nYou have not opened any tickets yet.\n\nTap *➕ Open Ticket* below to message support.',
+          {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ settingKey: 'btn.supp.contact', lang, callbackData: 'supp:contact', forceVisible: true }),
+              ]),
+              ButtonBuilder.buildNavigationRow('m:supp', lang),
+            ],
+          }
+        );
+        return;
+      }
+
+      let text = '🎫 *My Tickets*\n\nTap a ticket below to view conversation history or reply:\n\n';
+      const rows: any[][] = [];
+      for (const tkt of tickets.slice(0, 8)) {
+        const badge = tkt.status === 'CLOSED' ? '⚫' : tkt.status === 'WAITING' ? '🔵' : '🟢';
+        const firstMsg = tkt.messages[0]?.message || tkt.subject || 'Support request';
+        const numLabel = tkt.ticketNumber > 0 ? `#${tkt.ticketNumber}` : tkt.id;
+        text += `${badge} *Ticket ${numLabel}* — *${tkt.status}*\n_${firstMsg.slice(0, 60)}${firstMsg.length > 60 ? '…' : ''}_\n\n`;
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: `${badge} ${numLabel} • ${tkt.status} — ${firstMsg.slice(0, 22)}`.slice(0, 48),
+              style: tkt.status === 'CLOSED' ? 'default' : 'primary',
+              callbackData: `supp:v:${tkt.id}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.supp.contact', lang, callbackData: 'supp:contact', forceVisible: true }),
+        ])
+      );
+      rows.push(ButtonBuilder.buildNavigationRow('m:supp', lang));
+      await this.renderMenu(chatId, messageId, userId, text, { inline_keyboard: rows });
+      return;
+    }
+
+    // Support: View Ticket History
+    if (data.startsWith('supp:v:')) {
+      const ticketId = data.slice('supp:v:'.length);
+      const tkt = await supportService.getTicketById(ticketId);
+      if (!tkt || tkt.userId !== userId) {
+        await this.renderMenu(chatId, messageId, userId, '⚠️ Ticket not found.', getBackHomeKeyboard('supp:list', lang));
+        return;
+      }
+
+      const numLabel = tkt.ticketNumber > 0 ? `#${tkt.ticketNumber}` : tkt.id;
+      let text = `🎫 *Ticket ${numLabel}*\n• *Status:* \`${tkt.status}\`\n\n*Conversation History:*\n`;
+      for (const m of tkt.messages.slice(-8)) {
+        const who = m.senderType === 'ADMIN' ? '🛡 Support' : '👤 You';
+        const att = m.attachmentFileId ? ' 📎' : '';
+        text += `\n*${who}${att}:*\n${m.message}\n`;
+      }
+
+      const rows: any[][] = [];
+      if (tkt.status !== 'CLOSED') {
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: 'Reply',
+              fallbackEmoji: '💬',
+              style: 'primary',
+              callbackData: `supp:rep:${tkt.id}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+      rows.push(ButtonBuilder.buildNavigationRow('supp:list', lang));
+      await this.renderMenu(chatId, messageId, userId, text.slice(0, 3900), { inline_keyboard: rows });
+      return;
+    }
+
+    // Support: Customer Reply Prompt
+    if (data.startsWith('supp:rep:')) {
+      const ticketId = data.slice('supp:rep:'.length);
+      const tkt = await supportService.getTicketById(ticketId);
+      if (!tkt || tkt.userId !== userId) {
+        await this.renderMenu(chatId, messageId, userId, '⚠️ Ticket not found.', getBackHomeKeyboard('supp:list', lang));
+        return;
+      }
+      if (tkt.status === 'CLOSED') {
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          `⚠️ Ticket *#${tkt.ticketNumber}* is closed. Please tap *➕ Open Ticket* to start a new inquiry.`,
+          getBackHomeKeyboard('m:supp', lang)
+        );
+        return;
+      }
+
+      await redis.setFsmState(userId, { step: 'AWAITING_TICKET_REPLY', data: { ticketId: tkt.id } });
+      await this.renderMenu(
+        chatId,
+        messageId,
+        userId,
+        `💬 *Reply to Ticket #${tkt.ticketNumber}*\n\nSend your message or screenshot below:`,
+        getBackHomeKeyboard(`supp:v:${tkt.id}`, lang),
+        { skipNavSaveIfEdited: true }
+      );
       return;
     }
 
@@ -1396,14 +1476,66 @@ export class CustomerHandler {
       return;
     }
 
-    // FSM: Simplified Local Payment Phone Number (No TXID required)
-    if (fsm.step === 'AWAITING_MANUAL_PHONE') {
-      const { methodCode, proofFileId, ocrText } = fsm.data || {};
-      if (!proofFileId) {
-        await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_PROOF', data: { methodCode } });
+    // FSM: Simplified PKR Amount Entry for Easypaisa / JazzCash
+    if (fsm.step === 'AWAITING_MANUAL_PKR_AMOUNT') {
+      const methodCode = (fsm.data?.methodCode || 'EASYPAISA') as 'EASYPAISA' | 'JAZZCASH';
+      const [method, depCfg] = await Promise.all([
+        manualPaymentService.getMethodByCode(methodCode),
+        manualPaymentService.getDepositSettings(),
+      ]);
+
+      const cleanedNum = text.replace(/[,rs\spkr]/gi, '').trim();
+      let amtDec: Decimal;
+      try {
+        if (!cleanedNum) throw new Error('empty');
+        amtDec = new Decimal(cleanedNum);
+      } catch {
         await telegramClient.sendMessage(
           chatId,
-          '📸 Please upload your *Payment Screenshot* first before entering your phone number:',
+          `⚠️ Please enter a numeric PKR amount between *${depCfg.minPkr}* and *${depCfg.maxPkr}* PKR (example: \`500\`):`,
+          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
+        );
+        return;
+      }
+
+      if (amtDec.isNaN() || amtDec.lessThan(depCfg.minPkr) || amtDec.greaterThan(depCfg.maxPkr)) {
+        await telegramClient.sendMessage(
+          chatId,
+          `⚠️ Amount must be between *${depCfg.minPkr} PKR* and *${depCfg.maxPkr} PKR*. Please enter a valid amount:`,
+          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
+        );
+        return;
+      }
+
+      const cleanPkr = amtDec.toFixed(0);
+      await redis.setFsmState(userId, {
+        step: 'AWAITING_MANUAL_PROOF',
+        data: { methodCode, submittedPkrAmount: cleanPkr, screenshotOnly: true },
+      });
+
+      const acctTitle = method?.accountTitle || 'Muhammad Abbas';
+      const acctNum = method?.accountNumber || '03705851403';
+      const payPrompt =
+        `Send *${cleanPkr} PKR* to:\n\n` +
+        `*${acctTitle}*\n` +
+        `\`${acctNum}\`\n\n` +
+        `After payment,\n` +
+        `send screenshot only.`;
+
+      await telegramClient.sendMessage(chatId, payPrompt, {
+        reply_markup: getBackHomeKeyboard('m:dep', lang),
+      });
+      return;
+    }
+
+    // Legacy FSM: Local Payment Phone Number (preserved if directly invoked)
+    if (fsm.step === 'AWAITING_MANUAL_PHONE') {
+      const { methodCode, proofFileId, ocrText, submittedPkrAmount } = fsm.data || {};
+      if (!proofFileId) {
+        await redis.setFsmState(userId, { step: 'AWAITING_MANUAL_PROOF', data: { methodCode, submittedPkrAmount, screenshotOnly: true } });
+        await telegramClient.sendMessage(
+          chatId,
+          '📸 Please upload your *Payment Screenshot*:',
           { reply_markup: getBackHomeKeyboard('m:dep', lang) }
         );
         return;
@@ -1416,6 +1548,7 @@ export class CustomerHandler {
           senderPhone: text,
           proofFileId,
           ocrText,
+          submittedPkrAmount,
         });
         await redis.clearFsmState(userId);
 
@@ -1424,8 +1557,8 @@ export class CustomerHandler {
           `• Deposit ID: \`${sub.depositId}\`\n` +
           `• Method: *${methodCode === 'EASYPAISA' ? 'Easypaisa' : 'JazzCash'}*\n` +
           `• Screenshot: ✅ Attached\n` +
-          `• Sender Number: \`${sub.senderPhone}\`\n` +
-          (sub.submittedPkrAmount ? `• Detected Paid: \`${sub.submittedPkrAmount} PKR\`\n` : '') +
+          (sub.senderPhone ? `• Sender Number: \`${sub.senderPhone}\`\n` : '') +
+          (sub.submittedPkrAmount ? `• Submitted Paid: \`${sub.submittedPkrAmount} PKR\`\n` : '') +
           (sub.suggestedUsdAmount ? `• Estimated Credit: \`$${sub.suggestedUsdAmount} USD\`\n` : '') +
           `\nOur admin team will verify your receipt and credit your wallet balance shortly.`;
 
@@ -1479,23 +1612,26 @@ export class CustomerHandler {
       return;
     }
 
-    // FSM: Support Message
+    // FSM: Open Support Ticket Message
     if (fsm.step === 'AWAITING_SUPPORT_MESSAGE') {
       await redis.clearFsmState(userId);
       const isPreInvoice = fsm.data?.contextType === 'BINANCE_PRE_INVOICE';
       const relatedDep = fsm.data?.depositId ? String(fsm.data.depositId) : undefined;
-      const ticketId = await supportService.createTicket({
-        userId,
+      await this.createTicketAndNotifyAdmins(chatId, userId, msg.from, text, lang, {
         issueType: isPreInvoice ? 'BINANCE_PRE_INVOICE' : 'GENERAL_INQUIRY',
         subject: isPreInvoice
           ? `Pre-invoice Binance deposit (${relatedDep || 'N/A'})`.substring(0, 50)
           : text.substring(0, 50),
         message: relatedDep ? `[Invoice Ref: ${relatedDep}] ${text}` : text,
       });
+      return;
+    }
 
-      await telegramClient.sendMessage(chatId, t('support_created', lang, { ticketId }), {
-        reply_markup: getBackHomeKeyboard('m:home', lang),
-      });
+    // FSM: Customer Reply to Existing Support Ticket
+    if (fsm.step === 'AWAITING_TICKET_REPLY') {
+      const ticketId = String(fsm.data?.ticketId || '');
+      await redis.clearFsmState(userId);
+      await this.appendTicketReplyAndNotifyAdmins(chatId, userId, msg.from, ticketId, text, lang);
       return;
     }
   }
@@ -1539,13 +1675,169 @@ export class CustomerHandler {
   }
 
   /**
-   * Handle Photo uploads (e.g. proof screenshot for manual deposit)
+   * Create support ticket, confirm to customer (#ticketNumber, OPEN), and alert all admins immediately.
+   */
+  private async createTicketAndNotifyAdmins(
+    chatId: number,
+    userId: string,
+    fromUser: TelegramMessage['from'],
+    rawText: string,
+    lang: SupportedLanguage,
+    params: { issueType: string; subject: string; message: string; attachmentFileId?: string }
+  ) {
+    const created = await supportService.createTicketDetailed({
+      userId,
+      issueType: params.issueType,
+      subject: params.subject,
+      message: params.message,
+      attachmentFileId: params.attachmentFileId,
+    });
+
+    await telegramClient.sendMessage(chatId, t('support_created', lang, { ticketId: created.ticketNumber }), {
+      reply_markup: {
+        inline_keyboard: [
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: 'View Ticket',
+              fallbackEmoji: '🎫',
+              style: 'primary',
+              callbackData: `supp:v:${created.id}`,
+              forceVisible: true,
+            }),
+          ]),
+          ButtonBuilder.buildNavigationRow('m:supp', lang),
+        ],
+      },
+    });
+
+    const userLabel = fromUser?.username
+      ? `@${fromUser.username}`
+      : `${fromUser?.first_name || 'Customer'} (${userId})`;
+    const adminAlert =
+      `🎫 *New Ticket #${created.ticketNumber}*\n\n` +
+      `*User:* ${userLabel}\n` +
+      `*Status:* OPEN\n` +
+      `*Message:*\n${rawText || params.message}`;
+    const adminKb = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'Reply',
+            fallbackEmoji: '💬',
+            style: 'primary',
+            callbackData: `adm:tkt_rep:${created.id}`,
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: 'Close',
+            fallbackEmoji: '✅',
+            style: 'danger',
+            callbackData: `adm:tkt_cls:${created.id}`,
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'View Ticket',
+            fallbackEmoji: '📄',
+            style: 'default',
+            callbackData: `adm:tkt_v:${created.id}`,
+            forceVisible: true,
+          }),
+        ]),
+      ],
+    };
+
+    for (const adminId of config.telegram.adminIds) {
+      if (params.attachmentFileId) {
+        void telegramClient
+          .sendPhoto(adminId, params.attachmentFileId, adminAlert, { reply_markup: adminKb })
+          .catch(() => {});
+      } else {
+        void telegramClient.sendMessage(adminId, adminAlert, { reply_markup: adminKb }).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Append customer reply to existing ticket and notify all admins.
+   */
+  private async appendTicketReplyAndNotifyAdmins(
+    chatId: number,
+    userId: string,
+    fromUser: TelegramMessage['from'],
+    ticketId: string,
+    rawText: string,
+    lang: SupportedLanguage,
+    attachmentFileId?: string
+  ) {
+    try {
+      const res = await supportService.addMessage({
+        ticketId,
+        senderType: 'CUSTOMER',
+        senderId: userId,
+        message: rawText,
+        attachmentFileId,
+      });
+
+      await telegramClient.sendMessage(
+        chatId,
+        `✅ *Reply sent on Ticket #${res.ticketNumber}*\n\nOur support team has been notified.`,
+        { reply_markup: getBackHomeKeyboard(`supp:v:${ticketId}`, lang) }
+      );
+
+      const userLabel = fromUser?.username
+        ? `@${fromUser.username}`
+        : `${fromUser?.first_name || 'Customer'} (${userId})`;
+      const adminAlert =
+        `🎫 *Ticket #${res.ticketNumber} — Customer Reply*\n\n` +
+        `*User:* ${userLabel}\n` +
+        `*Message:*\n${rawText || '[Screenshot Attached]'}`;
+      const adminKb = {
+        inline_keyboard: [
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: 'Reply',
+              fallbackEmoji: '💬',
+              style: 'primary',
+              callbackData: `adm:tkt_rep:${ticketId}`,
+              forceVisible: true,
+            }),
+            ButtonBuilder.buildButton({
+              text: 'Close',
+              fallbackEmoji: '✅',
+              style: 'danger',
+              callbackData: `adm:tkt_cls:${ticketId}`,
+              forceVisible: true,
+            }),
+          ]),
+        ],
+      };
+      for (const adminId of config.telegram.adminIds) {
+        if (attachmentFileId) {
+          void telegramClient
+            .sendPhoto(adminId, attachmentFileId, adminAlert, { reply_markup: adminKb })
+            .catch(() => {});
+        } else {
+          void telegramClient.sendMessage(adminId, adminAlert, { reply_markup: adminKb }).catch(() => {});
+        }
+      }
+    } catch (err: any) {
+      await telegramClient.sendMessage(chatId, `⚠️ ${err.message}`, {
+        reply_markup: getBackHomeKeyboard('supp:list', lang),
+      });
+    }
+  }
+
+  /**
+   * Handle Photo uploads (screenshot-only local deposits & support ticket attachments)
    */
   public async handlePhoto(msg: TelegramMessage) {
     if (!msg.from || !msg.photo || msg.photo.length === 0) return;
     const userId = String(msg.from.id);
     const chatId = msg.chat.id;
     const lang = await getUserLanguage(userId);
+    const largestPhoto = msg.photo[msg.photo.length - 1];
 
     const fsm = await redis.getFsmState<UserFsmState>(userId);
     if (fsm?.step?.startsWith('ADMIN_')) {
@@ -1554,28 +1846,85 @@ export class CustomerHandler {
       return;
     }
 
-    if (fsm?.step === 'AWAITING_MANUAL_PROOF') {
-      const { methodCode, amount, txid } = fsm.data || {};
-      const largestPhoto = msg.photo[msg.photo.length - 1];
+    if (fsm?.step === 'AWAITING_SUPPORT_MESSAGE') {
+      await redis.clearFsmState(userId);
+      const caption = msg.caption?.trim() || '[Screenshot Attached]';
+      await this.createTicketAndNotifyAdmins(chatId, userId, msg.from, caption, lang, {
+        issueType: fsm.data?.contextType === 'BINANCE_PRE_INVOICE' ? 'BINANCE_PRE_INVOICE' : 'GENERAL_INQUIRY',
+        subject: caption.substring(0, 50),
+        message: caption,
+        attachmentFileId: largestPhoto.file_id,
+      });
+      return;
+    }
 
-      // Simplified Easypaisa/JazzCash flow: no TXID -> save screenshot + caption OCR text and request sender phone
+    if (fsm?.step === 'AWAITING_TICKET_REPLY') {
+      const ticketId = String(fsm.data?.ticketId || '');
+      await redis.clearFsmState(userId);
+      await this.appendTicketReplyAndNotifyAdmins(
+        chatId,
+        userId,
+        msg.from,
+        ticketId,
+        msg.caption?.trim() || '[Screenshot Attached]',
+        lang,
+        largestPhoto.file_id
+      );
+      return;
+    }
+
+    if (fsm?.step === 'AWAITING_MANUAL_PROOF') {
+      const { methodCode, amount, txid, submittedPkrAmount } = fsm.data || {};
+
+      // Simplified Easypaisa/JazzCash flow: Amount -> Screenshot ONLY -> Done! (No TXID or phone prompt)
       if (!txid) {
-        await redis.setFsmState(userId, {
-          step: 'AWAITING_MANUAL_PHONE',
-          data: {
-            methodCode,
-            proofFileId: largestPhoto.file_id,
-            ocrText: msg.caption || undefined,
-          },
+        await redis.clearFsmState(userId);
+        const sub = await manualPaymentService.submitLocalDeposit({
+          userId,
+          methodCode,
+          proofFileId: largestPhoto.file_id,
+          ocrText: msg.caption || undefined,
+          submittedPkrAmount,
         });
 
-        await telegramClient.sendMessage(
-          chatId,
+        const confirmMsg =
           `✅ *Payment Screenshot Received!*\n\n` +
-            `Now please send your *Sender Phone Number* used for the payment.\n\n` +
-            `Example:\n\`03001234567\``,
-          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
-        );
+          `• Deposit ID: \`${sub.depositId}\`\n` +
+          `• Method: *${methodCode === 'EASYPAISA' ? 'Easypaisa' : 'JazzCash'}*\n` +
+          (sub.submittedPkrAmount ? `• Amount: \`${sub.submittedPkrAmount} PKR\`\n` : '') +
+          (sub.suggestedUsdAmount ? `• Estimated Credit: \`$${sub.suggestedUsdAmount} USD\`\n` : '') +
+          `• Screenshot: ✅ Attached\n\n` +
+          `Done! Our admin team will verify your payment and credit your wallet shortly.`;
+
+        await telegramClient.sendMessage(chatId, confirmMsg, {
+          reply_markup: getBackHomeKeyboard('m:wall', lang),
+        });
+
+        const userLabel = msg.from.username
+          ? `@${msg.from.username}`
+          : `${msg.from.first_name || 'Customer'} (${userId})`;
+        const admAlert =
+          `💳 *New ${methodCode === 'EASYPAISA' ? 'Easypaisa' : 'JazzCash'} Deposit*\n\n` +
+          `• Customer: ${userLabel}\n` +
+          (sub.submittedPkrAmount ? `• Amount: \`${sub.submittedPkrAmount} PKR\`\n` : '') +
+          (sub.suggestedUsdAmount ? `• Suggested USD: \`$${sub.suggestedUsdAmount}\`\n` : '') +
+          `• Deposit ID: \`${sub.depositId}\``;
+        const admKb = {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({
+                text: 'Review & Credit',
+                fallbackEmoji: '💳',
+                style: 'primary',
+                callbackData: `adm:dep_v:${sub.depositId}`,
+                forceVisible: true,
+              }),
+            ]),
+          ],
+        };
+        for (const adminId of config.telegram.adminIds) {
+          void telegramClient.sendMessage(adminId, admAlert, { reply_markup: admKb }).catch(() => {});
+        }
         return;
       }
 
@@ -1617,10 +1966,11 @@ export class CustomerHandler {
     options?: { idempotencyKey?: string; expectedUnitPrice?: string }
   ) {
     try {
+      const waitMsg = t('order_received_wait', lang);
       if (messageId) {
-        await telegramClient.editMessageText(chatId, messageId, '🔄 Processing purchase securely with wallet ledger...');
+        await telegramClient.editMessageText(chatId, messageId, waitMsg);
       } else {
-        await telegramClient.sendMessage(chatId, '🔄 Processing purchase securely with wallet ledger...');
+        await telegramClient.sendMessage(chatId, waitMsg);
       }
 
       const res = await orderService.checkout({

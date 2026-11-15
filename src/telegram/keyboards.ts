@@ -620,7 +620,7 @@ export function getDepositMethodsKeyboard(lang: SupportedLanguage = 'en'): Teleg
 }
 
 /**
- * Support Menu Keyboard (Contact Support, FAQ)
+ * Support Menu Keyboard (Open Ticket, My Tickets, FAQ)
  */
 export function getSupportMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
   return perfTracker.measureRender(() => {
@@ -632,6 +632,9 @@ export function getSupportMenuKeyboard(lang: SupportedLanguage = 'en'): Telegram
       inline_keyboard: filterNonEmptyRows([
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ settingKey: 'btn.supp.contact', lang, callbackData: 'supp:contact', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ settingKey: 'btn.supp.tickets', lang, callbackData: 'supp:list', forceVisible: true }),
           ButtonBuilder.buildButton({ settingKey: 'btn.supp.faq', lang, callbackData: 'supp:faq', forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
@@ -782,7 +785,11 @@ export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): Telegr
         ButtonBuilder.buildButton({ text: 'Referrals', fallbackEmoji: '👥', style: 'default', callbackData: 'adm:ref', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Announcements', fallbackEmoji: '📢', style: 'primary', callbackData: 'adm:ann', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Tickets', fallbackEmoji: '🎫', style: 'primary', callbackData: 'adm:tkt', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Auto Promo', fallbackEmoji: '📣', style: 'primary', callbackData: 'adm:promo', forceVisible: true }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Announcements', fallbackEmoji: '📢', style: 'default', callbackData: 'adm:ann', forceVisible: true }),
         ButtonBuilder.buildButton({ text: 'Channels', fallbackEmoji: '📡', style: 'default', callbackData: 'adm:ch', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([

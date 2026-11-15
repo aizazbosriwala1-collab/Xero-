@@ -14,6 +14,7 @@ export interface SupplierControlRecord {
   id: string;
   name: string;
   baseUrl: string;
+  priority: number;
   isEnabled: boolean;
   routingEnabled: boolean;
   orderingEnabled: boolean;
@@ -204,6 +205,7 @@ export class SupplierService {
       id: r.id,
       name: r.name,
       baseUrl: r.base_url || this.baseUrl,
+      priority: Number(r.priority ?? 100),
       isEnabled: r.is_enabled !== false,
       routingEnabled: r.routing_enabled !== false,
       orderingEnabled: r.ordering_enabled !== false,
@@ -226,7 +228,7 @@ export class SupplierService {
     }
 
     const res = await db.query<any>(
-      'SELECT * FROM suppliers ORDER BY created_at ASC'
+      'SELECT * FROM suppliers ORDER BY priority ASC, created_at ASC'
     );
     const list = res.rows.length === 0
       ? [await this.getSupplierControl('aitoolshop')]
@@ -251,6 +253,7 @@ export class SupplierService {
           id: supplierId,
           name: 'AiToolShop Reseller',
           baseUrl: this.baseUrl,
+          priority: 100,
           isEnabled: true,
           routingEnabled: true,
           orderingEnabled: true,
@@ -262,6 +265,70 @@ export class SupplierService {
 
     await redis.set(cacheKey, JSON.stringify(ctrl), 45).catch(() => {});
     return ctrl;
+  }
+
+  public async registerFailoverSupplier(
+    params: { id: string; name: string; baseUrl: string; priority?: number },
+    adminId = 'SYSTEM'
+  ): Promise<SupplierControlRecord> {
+    const id = params.id.trim();
+    const baseUrl = params.baseUrl.trim().replace(/\/+$/, '');
+    const priority = Number(params.priority ?? 200);
+    await db.query(
+      `INSERT INTO suppliers (
+        id, name, base_url, priority, is_enabled, routing_enabled, ordering_enabled, sync_enabled, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO UPDATE SET
+        name = EXCLUDED.name,
+        base_url = EXCLUDED.base_url,
+        priority = EXCLUDED.priority,
+        updated_at = CURRENT_TIMESTAMP`,
+      [id, params.name.trim(), baseUrl, priority]
+    );
+    await Promise.all([
+      redis.del(`supplier_ctrl:${id}`).catch(() => {}),
+      redis.del('supplier_ctrl:list').catch(() => {}),
+    ]);
+    logger.info('Failover supplier registered', { supplierId: id, priority, adminId });
+    return await this.getSupplierControl(id);
+  }
+
+  public async getActiveRoutingSuppliers(): Promise<SupplierControlRecord[]> {
+    const all = await this.listSuppliers();
+    return all
+      .filter(s => s.isEnabled && s.routingEnabled && s.orderingEnabled)
+      .sort((a, b) => a.priority - b.priority);
+  }
+
+  public async disableSupplierOnFailure(
+    supplierId: string,
+    reason: string,
+    actor = 'SYSTEM_FAILOVER'
+  ): Promise<void> {
+    await db.query(
+      `UPDATE suppliers
+       SET is_enabled = FALSE, routing_enabled = FALSE, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [supplierId]
+    );
+    await db.query(
+      `INSERT INTO admin_audit_logs (id, admin_id, action, target_entity, target_id, details)
+       VALUES ($1, $2, 'SUPPLIER_FAILOVER_DISABLED', 'suppliers', $3, $4)`,
+      [
+        `aud_sup_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        actor,
+        supplierId,
+        JSON.stringify({ reason }),
+      ]
+    ).catch(() => {});
+    await Promise.all([
+      redis.del(`supplier_ctrl:${supplierId}`).catch(() => {}),
+      redis.del('supplier_ctrl:list').catch(() => {}),
+    ]);
+    logger.warn('Supplier disabled due to failure; traffic will route to next active supplier', {
+      supplierId,
+      reason,
+    });
   }
 
   public async setSupplierFlag(
@@ -1307,9 +1374,13 @@ export class SupplierService {
   }
 
   /**
-   * Dispatch real supplier order with strict idempotency and safety flag check.
+   * Dispatch real supplier order with strict idempotency, safety flag check,
+   * and deterministic failover routing when a supplier is disabled or fails pre-fulfillment.
    */
-  public async placeOrder(payload: SupplierOrderPayload): Promise<SupplierOrderResponse> {
+  public async placeOrder(
+    payload: SupplierOrderPayload,
+    options?: { preferredSupplierId?: string; autoDisableOnFailure?: boolean }
+  ): Promise<SupplierOrderResponse> {
     // CRITICAL SAFETY CHECK: LIVE_ORDERING_ENABLED=false MUST block real POST /order
     if (!config.safety.liveOrderingEnabled) {
       logger.warn('Supplier POST /order blocked by LIVE_ORDERING_ENABLED=false safety flag', {
@@ -1334,16 +1405,82 @@ export class SupplierService {
       };
     }
 
-    const ctrl = await this.getSupplierControl('aitoolshop');
-    if (!ctrl.isEnabled || !ctrl.orderingEnabled || !ctrl.routingEnabled) {
+    const preferredId = options?.preferredSupplierId || 'aitoolshop';
+    const primaryCtrl = await this.getSupplierControl(preferredId);
+    const activeCandidates = await this.getActiveRoutingSuppliers();
+
+    let orderedTargets: SupplierControlRecord[] = [];
+    if (primaryCtrl.isEnabled && primaryCtrl.orderingEnabled && primaryCtrl.routingEnabled) {
+      orderedTargets = [
+        primaryCtrl,
+        ...activeCandidates.filter(s => s.id !== primaryCtrl.id),
+      ];
+    } else if (activeCandidates.length > 0) {
+      // Primary supplier is disabled; automatically route traffic to next enabled supplier
+      orderedTargets = activeCandidates;
+      logger.info('Primary supplier disabled; routing order to active failover supplier', {
+        disabledSupplier: preferredId,
+        routedTo: orderedTargets[0].id,
+      });
+    } else {
       return {
         success: false,
         status: 'failed',
         error_code: 'SUPPLIER_DISABLED',
-        message: 'Ordering or routing for AiToolShop is currently disabled in Supplier Control Center.',
+        message: 'Ordering or routing for active supplier(s) is currently disabled in Supplier Control Center.',
       };
     }
 
+    const FAILOVER_ELIGIBLE_ERRORS = new Set([
+      'INSUFFICIENT_BALANCE',
+      'INVALID_API_KEY',
+      'SUPPLIER_DISABLED',
+      'SUPPLIER_UNAVAILABLE',
+    ]);
+
+    for (let idx = 0; idx < orderedTargets.length; idx++) {
+      const target = orderedTargets[idx];
+      const hasBackup = idx + 1 < orderedTargets.length;
+      const endpointBase = (target.id === 'aitoolshop' ? this.baseUrl : target.baseUrl || this.baseUrl).replace(/\/+$/, '');
+      const singleRes = await this.dispatchOrderToEndpoint(payload, endpointBase, target.id);
+
+      const isPreFulfillmentFailure =
+        !singleRes.success &&
+        singleRes.status === 'failed' &&
+        Boolean(singleRes.error_code && FAILOVER_ELIGIBLE_ERRORS.has(singleRes.error_code)) &&
+        !singleRes.order_ref;
+
+      if (isPreFulfillmentFailure && hasBackup) {
+        if (options?.autoDisableOnFailure !== false) {
+          await this.disableSupplierOnFailure(
+            target.id,
+            `Pre-fulfillment failover trigger (${singleRes.error_code})`
+          );
+        }
+        logger.warn('Supplier failed pre-fulfillment; routing traffic to next supplier', {
+          failedSupplier: target.id,
+          nextSupplier: orderedTargets[idx + 1].id,
+          errorCode: singleRes.error_code,
+        });
+        continue;
+      }
+
+      return singleRes;
+    }
+
+    return {
+      success: false,
+      status: 'failed',
+      error_code: 'SUPPLIER_DISABLED',
+      message: 'All configured suppliers failed or are disabled.',
+    };
+  }
+
+  private async dispatchOrderToEndpoint(
+    payload: SupplierOrderPayload,
+    endpointBase: string,
+    supplierId: string
+  ): Promise<SupplierOrderResponse> {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
@@ -1353,7 +1490,7 @@ export class SupplierService {
         'Idempotency-Key': payload.idempotency_key,
       };
 
-      const res = await this.performFetch(`${this.baseUrl}/order`, {
+      const res = await this.performFetch(`${endpointBase}/order`, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
@@ -1502,7 +1639,7 @@ export class SupplierService {
         raw: data,
       };
     } catch (err: any) {
-      logger.error('Supplier order request error / timeout', { error: err.message, idempotencyKey: payload.idempotency_key });
+      logger.error('Supplier order request error / timeout', { supplierId, error: err.message, idempotencyKey: payload.idempotency_key });
       return {
         success: false,
         status: 'failed',

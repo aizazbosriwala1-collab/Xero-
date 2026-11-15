@@ -48,6 +48,7 @@ import { channelService } from '../src/services/channel.js';
 import { settingsService } from '../src/services/settings.js';
 import { launchAuditService } from '../src/services/audit.js';
 import { perfTracker } from '../src/services/perfTracker.js';
+import { promotionService } from '../src/services/promotion.js';
 import { menuCache } from '../src/telegram/menuCache.js';
 import {
   getCustomerMainReplyKeyboard,
@@ -6454,7 +6455,7 @@ export async function runComprehensiveTests() {
     });
 
     try {
-      // 1. Tapping Easypaisa shows PKR details & asks for screenshot (NO USD or TXID requirement)
+      // 1. Tapping Easypaisa asks "How much would you like to send?" with PKR limits
       await telegramBotRouter.handleUpdate({
         update_id: 960001,
         callback_query: {
@@ -6467,17 +6468,13 @@ export async function runComprehensiveTests() {
       const epMsg = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Easypaisa Deposit'));
       assert.ok(epMsg, 'Must render Easypaisa Deposit screen');
       const epText = String(epMsg!.body.text);
+      assert.ok(epText.includes('How much would you like to send?'));
       assert.ok(epText.includes('1 USD = 290 PKR'));
       assert.ok(epText.includes('30 PKR'));
       assert.ok(epText.includes('6000 PKR'));
-      assert.ok(epText.includes('Muhammad Abbas'));
-      assert.ok(epText.includes('03705851403'));
-      assert.ok(epText.includes('Payment Screenshot'));
-      assert.ok(epText.includes('Sender Phone Number'));
-      assert.ok(epText.includes('03001234567'));
       assert.strictEqual(/TXID|reference number/i.test(epText), false, 'Must never ask customer for TXID or reference number');
 
-      // 2. Customer sends Screenshot with optional PKR caption "Paid Rs. 580" -> prompts for Sender Phone
+      // 2. Customer sends PKR amount (e.g. "580") -> Bot replies with exact account info + "send screenshot only"
       sent.length = 0;
       await telegramBotRouter.handleUpdate({
         update_id: 960002,
@@ -6486,16 +6483,16 @@ export async function runComprehensiveTests() {
           chat: { id: custId, type: 'private' },
           from: { id: custId, is_bot: false, first_name: 'Ali', username: 'ali_pkr' },
           date: Math.floor(Date.now() / 1000),
-          photo: [{ file_id: 'proof_photo_file_960', file_unique_id: 'uniq_960', width: 800, height: 1200 }],
-          caption: 'Paid Rs. 580 via Easypaisa',
+          text: '580',
         },
       });
-      assert.ok(
-        sent.some(m => m.method === 'sendMessage' && String(m.body.text).includes('Sender Phone Number')),
-        'Screenshot upload must transition cleanly to Sender Phone prompt'
-      );
+      const payPromptMsg = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('Send *580 PKR* to:'));
+      assert.ok(payPromptMsg, 'Must reply with account info and screenshot-only instruction');
+      assert.ok(String(payPromptMsg!.body.text).includes('Muhammad Abbas'));
+      assert.ok(String(payPromptMsg!.body.text).includes('03705851403'));
+      assert.ok(String(payPromptMsg!.body.text).includes('send screenshot only.'));
 
-      // 3. Customer sends formatted phone number +92 300-1234567 -> normalized & saved without TXID
+      // 3. Customer sends Screenshot -> Done immediately (no TXID, no phone prompt!)
       sent.length = 0;
       await telegramBotRouter.handleUpdate({
         update_id: 960003,
@@ -6504,14 +6501,15 @@ export async function runComprehensiveTests() {
           chat: { id: custId, type: 'private' },
           from: { id: custId, is_bot: false, first_name: 'Ali', username: 'ali_pkr' },
           date: Math.floor(Date.now() / 1000),
-          text: '+92 300-1234567',
+          photo: [{ file_id: 'proof_photo_file_960', file_unique_id: 'uniq_960', width: 800, height: 1200 }],
         },
       });
-      const conf = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('PAYMENT SUBMITTED'));
-      assert.ok(conf, 'Sending phone number must submit deposit for admin review');
-      assert.ok(String(conf!.body.text).includes('03001234567'));
-      assert.ok(String(conf!.body.text).includes('580.00 PKR'));
+      const conf = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('Payment Screenshot Received!'));
+      assert.ok(conf, 'Screenshot upload must immediately complete manual deposit submission');
+      assert.ok(String(conf!.body.text).includes('580.00 PKR') || String(conf!.body.text).includes('580 PKR'));
       assert.ok(String(conf!.body.text).includes('$2.00 USD'));
+      assert.ok(String(conf!.body.text).includes('Done!'));
+      assert.strictEqual(await redis.getFsmState(String(custId)), null, 'FSM must be cleared immediately after screenshot');
 
       // Verify JazzCash screen as well
       sent.length = 0;
@@ -6837,14 +6835,13 @@ export async function runComprehensiveTests() {
           message: { message_id: 9710, chat: { id: Number(referrerId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Menu' },
         },
       });
-      const refMsg = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Referral Program'));
-      assert.ok(refMsg, 'Customer m:ref must render Referral Program screen');
+      const refMsg = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Invite Friends'));
+      assert.ok(refMsg, 'Customer m:ref must render clean Invite Friends referral screen');
       const txt = String(refMsg!.body.text);
       assert.ok(txt.includes('*Referral Link:*'));
       assert.ok(txt.includes('*Total Referrals:* `2`'));
       assert.ok(txt.includes('*Qualified Referrals:* `1`'));
-      assert.ok(txt.includes('*Active Rewards:*'));
-      assert.ok(txt.includes('*Progress:*'));
+      assert.strictEqual(txt.includes('*Active Rewards:*'), false, 'Customer referral screen must remain minimal without clutter');
     } finally {
       telegramClient.setTransportOverride(null);
       await referralService.deleteRewardTier(tierId, adminId).catch(() => {});
@@ -7412,8 +7409,8 @@ export async function runComprehensiveTests() {
         },
       });
       assert.strictEqual(getMeCalls, 1, 'Subsequent referral screen must use cached active bot username');
-      const refScreen = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Referral Program'));
-      assert.ok(refScreen, 'm:ref must render Referral Program screen');
+      const refScreen = sent.find(m => m.method === 'editMessageText' && (String(m.body.text).includes('Invite Friends') || String(m.body.text).includes('Referral Program')));
+      assert.ok(refScreen, 'm:ref must render Invite Friends / Referral screen');
       const renderedText = String(refScreen!.body.text);
       assert.ok(
         renderedText.includes(`https://t.me/XeroXd_Bot?start=ref_${custId}`),
@@ -7669,6 +7666,423 @@ export async function runComprehensiveTests() {
         assert.ok(admCbs.includes(reqAdm), `Admin control missing: ${reqAdm}`);
       }
       assert.ok(adminId > 0);
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  // =========================================================================
+  // 27. CLEAN FRONTEND, MONSTER BACKEND SUITE (CONTRACT 15)
+  // =========================================================================
+  currentCategory = 'Clean Frontend, Monster Backend (Contract 15)';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 15.1: Smart Purchase Order-Received Feedback & Simplified Screenshot-Only PKR Deposit Admin Queue', 'mock_integration', async () => {
+    const custId = 98501;
+    const adminId = Number(config.telegram.adminIds[0]);
+    await ensureAuditUser(String(custId), '10.0000');
+
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9851 } };
+    });
+
+    try {
+      // 1. Trigger buyc: -> First message MUST immediately show "Order received. Please wait a moment. We are preparing your order."
+      await telegramBotRouter.handleUpdate({
+        update_id: 985101,
+        callback_query: {
+          id: 'cb_c15_buyc',
+          from: { id: custId, is_bot: false, first_name: 'FastBuyer' },
+          data: 'buyc:prod_ai_gpt:1',
+          message: { message_id: 9851, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Confirm' },
+        },
+      });
+      const firstEdit = sent.find(m => m.method === 'editMessageText');
+      assert.ok(firstEdit, 'Smart purchase must immediately acknowledge via editMessageText');
+      const waitTxt = String(firstEdit!.body.text);
+      assert.ok(waitTxt.includes('Order received.'));
+      assert.ok(waitTxt.includes('Please wait a moment.'));
+      assert.ok(waitTxt.includes('We are preparing your order.'));
+
+      // 2. Simplified JazzCash PKR flow without phone -> verify Admin Pending Deposit queue displays cleanly
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985102,
+        callback_query: {
+          id: 'cb_c15_jc',
+          from: { id: custId, is_bot: false, first_name: 'FastBuyer', username: 'fast_buyer' },
+          data: 'dep_m:jazzcash',
+          message: { message_id: 9851, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Dep' },
+        },
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 985103,
+        message: {
+          message_id: 9852,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'FastBuyer', username: 'fast_buyer' },
+          date: Math.floor(Date.now() / 1000),
+          text: '500',
+        },
+      });
+      assert.ok(sent.some(m => String(m.body.text).includes('Send *500 PKR* to:')));
+
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985104,
+        message: {
+          message_id: 9853,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'FastBuyer', username: 'fast_buyer' },
+          date: Math.floor(Date.now() / 1000),
+          photo: [{ file_id: 'jc_proof_985', file_unique_id: 'jc_u_985', width: 640, height: 960 }],
+        },
+      });
+      assert.ok(sent.some(m => String(m.body.text).includes('Payment Screenshot Received!')));
+      // Admin notification must have been fired automatically
+      assert.ok(sent.some(m => String(m.body.chat_id) === String(adminId) && String(m.body.text).includes('New JazzCash Deposit')));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await redis.clearFsmState(String(custId));
+    }
+  });
+
+  await it('Contract 15.2: Full Support Ticket System (Open Ticket -> #number/OPEN -> Admin Alert -> Reply -> Retained History -> Close)', 'mock_integration', async () => {
+    const custId = 98502;
+    const adminId = Number(config.telegram.adminIds[0]);
+    await ensureAuditUser(String(custId), '0.0000');
+    await db.query("UPDATE users SET username = 'ticket_vip' WHERE id = $1", [String(custId)]);
+
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9855 } };
+    });
+
+    try {
+      // 1. Customer opens Support Hub -> sees Open Ticket, My Tickets, FAQ
+      await telegramBotRouter.handleUpdate({
+        update_id: 985201,
+        callback_query: {
+          id: 'cb_c15_supp',
+          from: { id: custId, is_bot: false, first_name: 'TicketVip', username: 'ticket_vip' },
+          data: 'm:supp',
+          message: { message_id: 9855, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Home' },
+        },
+      });
+      const hubMsg = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Support'));
+      assert.ok(hubMsg);
+      const hubButtons = (hubMsg!.body.reply_markup?.inline_keyboard || []).flat().map((b: any) => `${b.text}|${b.callback_data}`);
+      assert.ok(hubButtons.some((s: string) => s.includes('Open Ticket') && s.endsWith('|supp:contact')));
+      assert.ok(hubButtons.some((s: string) => s.includes('My Tickets') && s.endsWith('|supp:list')));
+      assert.ok(hubButtons.some((s: string) => s.includes('FAQ') && s.endsWith('|supp:faq')));
+
+      // 2. Click Open Ticket -> prompts "Describe your issue."
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985202,
+        callback_query: {
+          id: 'cb_c15_open',
+          from: { id: custId, is_bot: false, first_name: 'TicketVip', username: 'ticket_vip' },
+          data: 'supp:contact',
+          message: { message_id: 9855, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Support' },
+        },
+      });
+      assert.ok(sent.some(m => String(m.body.text).includes('Describe your issue.')));
+
+      // 3. Customer submits issue -> creates sequential #number Ticket (OPEN) & alerts Admins with Reply/Close
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985203,
+        message: {
+          message_id: 9856,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'TicketVip', username: 'ticket_vip' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'Need help activating my ChatGPT subscription',
+        },
+      });
+
+      const custConfirm = sent.find(m => String(m.body.chat_id) === String(custId) && String(m.body.text).includes('Ticket Created'));
+      assert.ok(custConfirm, 'Customer must receive Ticket Created confirmation');
+      assert.ok(String(custConfirm!.body.text).includes('OPEN'));
+      const ticketNumMatch = String(custConfirm!.body.text).match(/#(\d+)/);
+      assert.ok(ticketNumMatch, 'Ticket confirmation must include #number');
+      const ticketNumber = Number(ticketNumMatch![1]);
+      assert.ok(ticketNumber >= 101);
+
+      const adminAlert = sent.find(m => String(m.body.chat_id) === String(adminId) && String(m.body.text).includes(`New Ticket #${ticketNumber}`));
+      assert.ok(adminAlert, 'Admin must immediately receive New Ticket alert');
+      assert.ok(String(adminAlert!.body.text).includes('@ticket_vip'));
+      assert.ok(String(adminAlert!.body.text).includes('Need help activating my ChatGPT subscription'));
+      const admCbs = (adminAlert!.body.reply_markup?.inline_keyboard || []).flat().map((b: any) => b.callback_data);
+      const repCb = admCbs.find((c: string) => c.startsWith('adm:tkt_rep:'));
+      const clsCb = admCbs.find((c: string) => c.startsWith('adm:tkt_cls:'));
+      assert.ok(repCb && clsCb, 'Admin alert must include Reply and Close buttons');
+      const ticketId = repCb!.slice('adm:tkt_rep:'.length);
+
+      // 4. Admin taps Reply and sends reply text -> customer receives Support Reply & status becomes WAITING
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985204,
+        callback_query: {
+          id: 'cb_c15_adm_rep',
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          data: repCb!,
+          message: { message_id: 9857, chat: { id: adminId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Ticket' },
+        },
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 985205,
+        message: {
+          message_id: 9858,
+          chat: { id: adminId, type: 'private' },
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'Please check your email inbox for the invite link.',
+        },
+      });
+      const custReplyNotice = sent.find(m => String(m.body.chat_id) === String(custId) && String(m.body.text).includes(`Support Reply (#${ticketNumber})`));
+      assert.ok(custReplyNotice, 'Customer must receive direct Support Reply notice');
+      assert.ok(String(custReplyNotice!.body.text).includes('Please check your email inbox for the invite link.'));
+
+      // 5. Customer attaches follow-up screenshot via supp:rep: & checks My Tickets full retained history
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985206,
+        callback_query: {
+          id: 'cb_c15_cust_rep',
+          from: { id: custId, is_bot: false, first_name: 'TicketVip', username: 'ticket_vip' },
+          data: `supp:rep:${ticketId}`,
+          message: { message_id: 9859, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Reply' },
+        },
+      });
+      await telegramBotRouter.handleUpdate({
+        update_id: 985207,
+        message: {
+          message_id: 9860,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'TicketVip', username: 'ticket_vip' },
+          date: Math.floor(Date.now() / 1000),
+          photo: [{ file_id: 'tkt_att_985', file_unique_id: 'tkt_u_985', width: 500, height: 500 }],
+          caption: 'Screenshot of inbox attached',
+        },
+      });
+
+      const retained = await supportService.getTicketById(ticketId);
+      assert.ok(retained);
+      assert.strictEqual(retained!.messages.length, 3, 'Full ticket history (open + admin reply + customer photo) must be retained');
+      assert.strictEqual(retained!.messages[2].attachmentFileId, 'tkt_att_985');
+
+      // 6. Customer views My Tickets + Admin closes ticket cleanly
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985208,
+        callback_query: {
+          id: 'cb_c15_list',
+          from: { id: custId, is_bot: false, first_name: 'TicketVip', username: 'ticket_vip' },
+          data: 'supp:list',
+          message: { message_id: 9861, chat: { id: custId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Support' },
+        },
+      });
+      assert.ok(sent.some(m => String(m.body.text).includes(`#${ticketNumber}`)));
+
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985209,
+        callback_query: {
+          id: 'cb_c15_cls',
+          from: { id: adminId, is_bot: false, first_name: 'Admin' },
+          data: clsCb!,
+          message: { message_id: 9862, chat: { id: adminId, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Ticket' },
+        },
+      });
+      const closedTkt = await supportService.getTicketById(ticketId);
+      assert.strictEqual(closedTkt?.status, 'CLOSED');
+      assert.ok(sent.some(m => String(m.body.chat_id) === String(custId) && String(m.body.text).includes(`Ticket #${ticketNumber} Closed`)));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await redis.clearFsmState(String(custId));
+      await redis.clearFsmState(String(adminId));
+    }
+  });
+
+  await it('Contract 15.3: Top Referrers Leaderboard, Channel Auto Promotion + Deep Link & Multi-Supplier Failover', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const topUserId = '98521';
+    const buyerId = '98522';
+    await ensureAuditUser(topUserId, '0.0000');
+    await ensureAuditUser(buyerId, '0.0000');
+    await db.query("UPDATE users SET username = 'rainmaker_ref' WHERE id = $1", [topUserId]);
+    const promoProdId = await insertTestProduct({ id: 'c15_gpt', name: 'ChatGPT Plus', your_cost: 8.00, stock: 5 });
+    await pricingService.setFixedRetailPrice(promoProdId, '12.50', adminId);
+
+    assert.strictEqual(await referralService.registerReferral(topUserId, buyerId), true);
+    await db.query(
+      `INSERT INTO local_orders (id, user_id, product_id, quantity, unit_price, total_price, supplier_cost, status, idempotency_key)
+       VALUES ('ord_top_ref_1', $1, $2, 1, '12.5000', '12.5000', '8.0000', 'COMPLETED', 'idem_top_ref_1')`,
+      [buyerId, promoProdId]
+    );
+    await referralService.processOrderQualification(buyerId, 'ord_top_ref_1', new Decimal('12.50'));
+
+    const leaderboard = await referralService.getTopReferrers(10, { bypassCache: true });
+    const topEntry = leaderboard.find(r => r.userId === topUserId);
+    assert.ok(topEntry, 'Top Referrers leaderboard must include referrer');
+    assert.strictEqual(topEntry!.username, 'rainmaker_ref');
+    assert.strictEqual(topEntry!.totalReferrals, 1);
+    assert.strictEqual(topEntry!.qualifiedReferrals, 1);
+    assert.strictEqual(topEntry!.totalSalesGenerated, '12.50');
+
+    // Admin leaderboard screen & Channel Auto Promotion
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (method === 'getMe') {
+        return { ok: true, result: { id: 999000, is_bot: true, username: 'XeroXd_Bot' } };
+      }
+      if (method === 'getChatMember') {
+        return { ok: true, result: { status: 'administrator' } };
+      }
+      if (method === 'getChat') {
+        return { ok: true, result: { id: -100999888, title: 'Master Xero Deals' } };
+      }
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9870 } };
+    });
+
+    try {
+      await telegramBotRouter.handleUpdate({
+        update_id: 985301,
+        callback_query: {
+          id: 'cb_c15_reftop',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:ref_top',
+          message: { message_id: 9871, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Ref' },
+        },
+      });
+      const lbMsg = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('TOP REFERRERS LEADERBOARD'));
+      assert.ok(lbMsg);
+      assert.ok(String(lbMsg!.body.text).includes('@rainmaker\\_ref') || String(lbMsg!.body.text).includes('@rainmaker_ref'));
+      assert.ok(String(lbMsg!.body.text).includes('$12.50 USDT'));
+
+      // Channel Auto Promotion: add channel with bot admin verification & post formatted promo
+      const addedCh = await promotionService.addPromoChannel({ channelIdentifier: '@MasterXeroDeals' }, adminId);
+      assert.strictEqual(addedCh.botIsAdmin, true);
+      assert.strictEqual(addedCh.title, 'Master Xero Deals');
+
+      sent.length = 0;
+      const broadcast = await promotionService.postPromotion({ adminId, productId: promoProdId });
+      assert.strictEqual(broadcast.posted, 1);
+      const promoMsg = sent.find(m => m.method === 'sendMessage' && m.body.chat_id === '@MasterXeroDeals');
+      assert.ok(promoMsg, 'Promo message must be posted to active admin channel');
+      assert.ok(String(promoMsg!.body.text).includes('LIMITED AVAILABILITY'));
+      assert.ok(String(promoMsg!.body.text).includes(`$${broadcast.rateUsd}`));
+      const getNowBtn = promoMsg!.body.reply_markup?.inline_keyboard?.[0]?.[0];
+      assert.strictEqual(getNowBtn?.text, '🛍 GET NOW');
+      assert.strictEqual(getNowBtn?.url, `https://t.me/XeroXd_Bot?start=orders_${promoProdId}`);
+
+      // Deep link /start orders_<productId> opens promoted product cleanly
+      sent.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: 985302,
+        message: {
+          message_id: 9872,
+          chat: { id: Number(buyerId), type: 'private' },
+          from: { id: Number(buyerId), is_bot: false, first_name: 'Buyer' },
+          date: Math.floor(Date.now() / 1000),
+          text: `/start orders_${promoProdId}`,
+        },
+      });
+      assert.ok(
+        sent.some(m => m.method === 'sendMessage' && String(m.body.text).includes('ChatGPT')),
+        '/start orders_<productId> deep link must open product details directly'
+      );
+
+      // Multi-supplier failover: primary pre-fulfillment failure disables primary & routes cleanly to failover supplier
+      await supplierService.registerFailoverSupplier({
+        id: 'fail_primary',
+        name: 'Failing Primary',
+        baseUrl: 'https://primary.example.invalid/v1',
+        priority: 10,
+      });
+      await supplierService.registerFailoverSupplier({
+        id: 'backup_sup',
+        name: 'Backup Supplier',
+        baseUrl: 'https://backup.example.invalid/v1',
+        priority: 200,
+      });
+
+      const originalLiveFlag = config.safety.liveOrderingEnabled;
+      supplierService.setTestApiKey('mock_audit_reseller_key');
+      supplierService.setFetchOverride(async (url) => {
+        if (String(url).startsWith('https://primary.example.invalid')) {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error_code: 'INSUFFICIENT_BALANCE',
+              message: 'Insufficient balance',
+            }),
+            { status: 402 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            success: true,
+            status: 'completed',
+            order_ref: 'BK_ORD_1',
+            delivered_items: ['backup-account@example.com:Pass123'],
+          }),
+          { status: 200 }
+        );
+      });
+
+      try {
+        // Verify LIVE_ORDERING_ENABLED=false still blocks even failover routes!
+        config.safety.liveOrderingEnabled = false;
+        const blocked = await supplierService.placeOrder(
+          {
+            product_id: promoProdId,
+            quantity: 1,
+            idempotency_key: 'idem_failover_safe_off',
+          },
+          { preferredSupplierId: 'fail_primary' }
+        );
+        assert.strictEqual(blocked.success, false);
+        assert.strictEqual(blocked.error_code, 'LIVE_ORDERING_DISABLED');
+
+        // With LIVE_ORDERING_ENABLED=true in sandbox test: primary fails pre-fulfillment -> disabled -> backup completes!
+        config.safety.liveOrderingEnabled = true;
+        const routed = await supplierService.placeOrder(
+          {
+            product_id: promoProdId,
+            quantity: 1,
+            idempotency_key: 'idem_failover_active',
+          },
+          { preferredSupplierId: 'fail_primary' }
+        );
+        assert.strictEqual(routed.success, true);
+        assert.strictEqual(routed.delivered_items?.[0], 'backup-account@example.com:Pass123');
+        const disabledRow = await db.queryRow<{ is_enabled: boolean }>(
+          'SELECT is_enabled FROM suppliers WHERE id = $1',
+          ['fail_primary']
+        );
+        assert.strictEqual(disabledRow?.is_enabled, false, 'Failing supplier must be automatically disabled');
+      } finally {
+        config.safety.liveOrderingEnabled = originalLiveFlag;
+        supplierService.resetTestState();
+        await db.query("DELETE FROM promo_channels WHERE channel_identifier = '@MasterXeroDeals'").catch(() => {});
+        await db.query("DELETE FROM suppliers WHERE id IN ('fail_primary', 'backup_sup')").catch(() => {});
+        await redis.del('supplier_ctrl:list').catch(() => {});
+        await redis.del('supplier_ctrl:fail_primary').catch(() => {});
+        await redis.del('supplier_ctrl:backup_sup').catch(() => {});
+      }
+
+      // Verify all newly added callbacks are registered and <= 64 bytes
+      for (const cb of ['supp:list', 'supp:v:123', 'supp:rep:123', 'adm:tkt', 'adm:tkt_all', 'adm:tkt_v:1', 'adm:tkt_rep:1', 'adm:tkt_cls:1', 'adm:ref_top', 'adm:promo', 'adm:promo_now', 'adm:promo_tog']) {
+        assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Route not registered: ${cb}`);
+        assert.ok(Buffer.byteLength(cb, 'utf8') <= 64);
+      }
     } finally {
       telegramClient.setTransportOverride(null);
     }

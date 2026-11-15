@@ -24,6 +24,8 @@ import {
   maskIdentifier,
 } from '../../services/binance.js';
 import { uiConfigService, UISection, UISettingRecord } from '../../services/uiConfig.js';
+import { supportService } from '../../services/support.js';
+import { promotionService } from '../../services/promotion.js';
 import { SupportedLanguage, getUserLanguage, t } from '../../services/i18n.js';
 import { ButtonBuilder } from '../buttonBuilder.js';
 import {
@@ -1286,6 +1288,182 @@ export class AdminHandler {
     // =========================================================================
     if (data === 'adm:ref') {
       await this.renderAdminReferralsHub(chatId, messageId);
+      return;
+    }
+
+    if (data === 'adm:ref_top') {
+      await this.renderAdminTopReferrers(chatId, messageId);
+      return;
+    }
+
+    // =========================================================================
+    // ADMIN SUPPORT TICKET SYSTEM (INBOX / VIEW / REPLY / CLOSE)
+    // =========================================================================
+    if (data === 'adm:tkt' || data === 'adm:tkt_all') {
+      await this.renderAdminTicketsInbox(chatId, messageId, data === 'adm:tkt_all' ? 'ALL' : 'OPEN_ONLY');
+      return;
+    }
+
+    if (data.startsWith('adm:tkt_v:')) {
+      const ticketId = data.slice('adm:tkt_v:'.length);
+      await this.renderAdminTicketDetail(chatId, messageId, ticketId);
+      return;
+    }
+
+    if (data.startsWith('adm:tkt_rep:')) {
+      const ticketId = data.slice('adm:tkt_rep:'.length);
+      const tkt = await supportService.getTicketById(ticketId);
+      if (!tkt) {
+        await this.renderAdminTicketsInbox(chatId, messageId, 'OPEN_ONLY', '⚠️ Ticket not found.');
+        return;
+      }
+      if (tkt.status === 'CLOSED') {
+        await this.renderAdminTicketDetail(chatId, messageId, ticketId, '⚠️ Ticket is already CLOSED.');
+        return;
+      }
+      await redis.setFsmState(userId, { step: 'ADMIN_TICKET_REPLY', data: { ticketId: tkt.id } });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `💬 *Reply to Ticket #${tkt.ticketNumber}*\n\nType your reply message (or upload screenshot) below to send directly to the customer:`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: `adm:tkt_v:${tkt.id}`, forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:tkt_cls:')) {
+      const ticketId = data.slice('adm:tkt_cls:'.length);
+      try {
+        const closed = await supportService.closeTicket(ticketId, userId);
+        await telegramClient
+          .sendMessage(
+            closed.userId,
+            `✅ *Ticket #${closed.ticketNumber} Closed*\n\nYour support ticket has been marked as *CLOSED*. If you need further assistance, tap *🎧 Support → ➕ Open Ticket*.`,
+            { reply_markup: getBackHomeKeyboard('m:supp') }
+          )
+          .catch(() => {});
+        await this.renderAdminTicketDetail(chatId, messageId, ticketId, `✅ Ticket #${closed.ticketNumber} closed cleanly.`);
+      } catch (err: any) {
+        await this.renderAdminTicketsInbox(chatId, messageId, 'OPEN_ONLY', `⚠️ ${err.message}`);
+      }
+      return;
+    }
+
+    // =========================================================================
+    // CHANNEL AUTO PROMOTION SYSTEM
+    // =========================================================================
+    if (data === 'adm:promo') {
+      await this.renderAdminPromoHub(chatId, messageId);
+      return;
+    }
+
+    if (data === 'adm:promo_tog') {
+      const curr = await promotionService.getConfig();
+      const updated = await promotionService.updateConfig({ enabled: !curr.enabled }, userId);
+      await this.renderAdminPromoHub(
+        chatId,
+        messageId,
+        updated.enabled ? '✅ Auto Promotion scheduler ENABLED.' : '⏸️ Auto Promotion scheduler PAUSED.'
+      );
+      return;
+    }
+
+    if (data === 'adm:promo_add') {
+      await redis.setFsmState(userId, { step: 'ADMIN_PROMO_CH_ADD' });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `➕ *Add Promotion Channel*\n\nSend the Telegram channel \`@username\` or numeric chat ID (e.g. \`-1001234567890\`):\n\n_Note: Bot must be an Administrator in that channel._`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'adm:promo', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data === 'adm:promo_int') {
+      await redis.setFsmState(userId, { step: 'ADMIN_PROMO_INTERVAL' });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `⏱️ *Auto Promotion Interval*\n\nEnter the posting interval in minutes (minimum \`15\`, example: \`180\`):`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'adm:promo', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data === 'adm:promo_now') {
+      try {
+        const sum = await promotionService.postPromotion({ adminId: userId });
+        await this.renderAdminPromoHub(
+          chatId,
+          messageId,
+          `🚀 *Posted:* *${this.escapeDiagMarkdown(sum.productName)}* ($${sum.rateUsd}) → ${sum.posted}/${sum.attempted} channel(s)`
+        );
+      } catch (err: any) {
+        await this.renderAdminPromoHub(chatId, messageId, `⚠️ ${this.escapeDiagMarkdown(err.message)}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:promo_ver:')) {
+      const chId = data.slice('adm:promo_ver:'.length);
+      try {
+        const ch = await promotionService.refreshChannelAdminStatus(chId, userId);
+        await this.renderAdminPromoHub(
+          chatId,
+          messageId,
+          ch.botIsAdmin
+            ? `✅ Verified bot is Administrator in *${this.escapeDiagMarkdown(ch.title)}*`
+            : `⚠️ Bot is NOT Administrator in *${this.escapeDiagMarkdown(ch.title)}* yet.`
+        );
+      } catch (err: any) {
+        await this.renderAdminPromoHub(chatId, messageId, `⚠️ ${this.escapeDiagMarkdown(err.message)}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:promo_togch:')) {
+      const chId = data.slice('adm:promo_togch:'.length);
+      try {
+        const ch = await promotionService.toggleChannelActive(chId, userId);
+        await this.renderAdminPromoHub(
+          chatId,
+          messageId,
+          `${ch.isActive ? '✅ Enabled' : '⏸️ Paused'} channel *${this.escapeDiagMarkdown(ch.title)}*`
+        );
+      } catch (err: any) {
+        await this.renderAdminPromoHub(chatId, messageId, `⚠️ ${this.escapeDiagMarkdown(err.message)}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm:promo_rem:')) {
+      const chId = data.slice('adm:promo_rem:'.length);
+      await promotionService.removePromoChannel(chId, userId);
+      await this.renderAdminPromoHub(chatId, messageId, '🗑️ Channel removed from Auto Promotion.');
       return;
     }
 
@@ -3295,6 +3473,74 @@ export class AdminHandler {
       }
       return;
     }
+
+    if (fsm.step === 'ADMIN_TICKET_REPLY') {
+      const ticketId = String(fsm.data?.ticketId || '');
+      try {
+        const res = await supportService.addMessage({
+          ticketId,
+          senderType: 'ADMIN',
+          senderId: userId,
+          message: text,
+        });
+        await redis.clearFsmState(userId);
+
+        const custLang = await getUserLanguage(res.userId);
+        const custNotice = t('support_reply_notice', custLang, {
+          ticketId: res.ticketNumber,
+          message: text,
+        });
+        await telegramClient
+          .sendMessage(res.userId, custNotice, {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({
+                    text: 'Reply',
+                    fallbackEmoji: '💬',
+                    style: 'primary',
+                    callbackData: `supp:rep:${ticketId}`,
+                    forceVisible: true,
+                  }),
+                  ButtonBuilder.buildButton({ settingKey: 'btn.nav.home', lang: custLang, callbackData: 'm:home', forceVisible: true }),
+                ]),
+              ],
+            },
+          })
+          .catch(() => {});
+
+        await this.renderAdminTicketDetail(chatId, undefined, ticketId, `✅ Reply delivered to customer on Ticket #${res.ticketNumber}.`);
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *REPLY FAILED*\n\n${err.message}`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_PROMO_CH_ADD') {
+      try {
+        const ch = await promotionService.addPromoChannel({ channelIdentifier: text }, userId);
+        await redis.clearFsmState(userId);
+        const note = ch.botIsAdmin
+          ? `✅ Channel *${this.escapeDiagMarkdown(ch.title)}* added & bot admin verified!`
+          : `⚠️ Channel *${this.escapeDiagMarkdown(ch.title)}* added, but bot is NOT confirmed Admin yet. Promote bot to Admin then tap Verify.`;
+        await this.renderAdminPromoHub(chatId, undefined, note);
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *INVALID CHANNEL*\n\n${err.message}\n\nPlease enter \`@ChannelUsername\` or numeric ID:`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_PROMO_INTERVAL') {
+      const mins = parseInt(text.trim(), 10);
+      if (isNaN(mins) || mins < 15) {
+        await telegramClient.sendMessage(chatId, '⚠️ Minimum interval is `15` minutes. Please enter a valid integer (e.g. `180`):');
+        return;
+      }
+      await promotionService.updateConfig({ intervalMinutes: mins }, userId);
+      await redis.clearFsmState(userId);
+      await this.renderAdminPromoHub(chatId, undefined, `✅ Auto Promotion interval set to \`${mins}\` minutes.`);
+      return;
+    }
   }
 
   public async handleAdminPhotoInput(msg: TelegramMessage, fsm: UserFsmState): Promise<void> {
@@ -3305,6 +3551,48 @@ export class AdminHandler {
     if (!this.checkAuthorization(userId)) {
       await redis.clearFsmState(userId);
       await telegramClient.sendMessage(chatId, '⛔ *ACCESS DENIED*');
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_TICKET_REPLY') {
+      const ticketId = String(fsm.data?.ticketId || '');
+      const fileId = msg.photo[msg.photo.length - 1].file_id;
+      const caption = msg.caption?.trim() || '[Screenshot Attached]';
+      try {
+        const res = await supportService.addMessage({
+          ticketId,
+          senderType: 'ADMIN',
+          senderId: userId,
+          message: caption,
+          attachmentFileId: fileId,
+        });
+        await redis.clearFsmState(userId);
+        const custLang = await getUserLanguage(res.userId);
+        const custNotice = t('support_reply_notice', custLang, {
+          ticketId: res.ticketNumber,
+          message: caption,
+        });
+        await telegramClient
+          .sendPhoto(res.userId, fileId, custNotice, {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({
+                    text: 'Reply',
+                    fallbackEmoji: '💬',
+                    style: 'primary',
+                    callbackData: `supp:rep:${ticketId}`,
+                    forceVisible: true,
+                  }),
+                ]),
+              ],
+            },
+          })
+          .catch(() => {});
+        await this.renderAdminTicketDetail(chatId, undefined, ticketId, `✅ Photo reply sent on Ticket #${res.ticketNumber}.`);
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *REPLY FAILED*\n\n${err.message}`);
+      }
       return;
     }
 
@@ -4021,6 +4309,9 @@ export class AdminHandler {
         ButtonBuilder.buildButton({ text: 'Create Reward Tier', fallbackEmoji: '➕', style: 'success', callbackData: 'adm:ref_new', forceVisible: true }),
         ButtonBuilder.buildButton({ text: 'Threshold Rules', fallbackEmoji: '⚙️', style: 'primary', callbackData: 'adm:ref_set', forceVisible: true }),
       ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Top Referrers Leaderboard', fallbackEmoji: '🏆', style: 'success', callbackData: 'adm:ref_top', forceVisible: true }),
+      ]),
     ];
 
     if (tiers.length === 0) {
@@ -4721,6 +5012,264 @@ export class AdminHandler {
       await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
     } else {
       await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminTopReferrers(
+    chatId: number,
+    messageId: number | undefined
+  ): Promise<void> {
+    const top = await referralService.getTopReferrers(15, { bypassCache: true });
+    let text = `🏆 *TOP REFERRERS LEADERBOARD*\n\n`;
+
+    if (top.length === 0) {
+      text += `_No referral activity recorded yet._`;
+    } else {
+      top.forEach((row, idx) => {
+        const handle = row.username
+          ? `@${this.escapeDiagMarkdown(row.username)}`
+          : `${this.escapeDiagMarkdown(row.firstName || 'User')} (\`${row.userId}\`)`;
+        text +=
+          `*${idx + 1}. ${handle}*\n` +
+          `• Total Referrals: \`${row.totalReferrals}\`\n` +
+          `• Qualified Referrals: \`${row.qualifiedReferrals}\`\n` +
+          `• Total Sales Generated: \`$${row.totalSalesGenerated} USDT\`\n\n`;
+      });
+    }
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Refresh', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:ref_top', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Back to Referrals', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:ref', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'ADMIN', fallbackEmoji: '👑', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminTicketsInbox(
+    chatId: number,
+    messageId: number | undefined,
+    filter: 'OPEN_ONLY' | 'ALL' = 'OPEN_ONLY',
+    notice?: string
+  ): Promise<void> {
+    const tickets = await supportService.listAdminTickets({ statusFilter: filter, limit: 12 });
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `🎫 *SUPPORT TICKETS (${filter === 'OPEN_ONLY' ? 'OPEN & WAITING' : 'ALL'})*\n\n`;
+
+    const rows: any[][] = [
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({
+          text: filter === 'OPEN_ONLY' ? 'Show All Tickets' : 'Show Open Only',
+          fallbackEmoji: '🔄',
+          style: 'primary',
+          callbackData: filter === 'OPEN_ONLY' ? 'adm:tkt_all' : 'adm:tkt',
+          forceVisible: true,
+        }),
+      ]),
+    ];
+
+    if (tickets.length === 0) {
+      text += `_No support tickets in this view._`;
+    } else {
+      for (const tkt of tickets) {
+        const badge = tkt.status === 'CLOSED' ? '⚫' : tkt.status === 'WAITING' ? '🔵' : '🟢';
+        const userLabel = tkt.username
+          ? `@${this.escapeDiagMarkdown(tkt.username)}`
+          : `\`${tkt.userId}\``;
+        const numLabel = tkt.ticketNumber > 0 ? `#${tkt.ticketNumber}` : tkt.id;
+        text += `${badge} *${numLabel}* (${tkt.status}) — ${userLabel}\n_${this.escapeDiagMarkdown(tkt.subject.slice(0, 50))}_\n\n`;
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: `${badge} ${numLabel} • ${tkt.username ? `@${tkt.username}` : tkt.userId} (${tkt.status})`.slice(0, 48),
+              style: tkt.status === 'CLOSED' ? 'default' : 'primary',
+              callbackData: `adm:tkt_v:${tkt.id}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminTicketDetail(
+    chatId: number,
+    messageId: number | undefined,
+    ticketId: string,
+    notice?: string
+  ): Promise<void> {
+    const tkt = await supportService.getTicketById(ticketId);
+    if (!tkt) {
+      await this.renderAdminTicketsInbox(chatId, messageId, 'OPEN_ONLY', '⚠️ Ticket not found.');
+      return;
+    }
+
+    const userLabel = tkt.username
+      ? `@${this.escapeDiagMarkdown(tkt.username)}`
+      : `${this.escapeDiagMarkdown(tkt.firstName || 'Customer')} (\`${tkt.userId}\`)`;
+    const numLabel = tkt.ticketNumber > 0 ? `#${tkt.ticketNumber}` : tkt.id;
+
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `🎫 *TICKET ${numLabel}*\n\n` +
+      `• *Customer:* ${userLabel}\n` +
+      `• *Status:* \`${tkt.status}\`\n` +
+      `• *Messages:* \`${tkt.messages.length}\`\n\n` +
+      `*Full History:*\n`;
+
+    for (const m of tkt.messages.slice(-10)) {
+      const who = m.senderType === 'ADMIN' ? '🛡 Admin' : '👤 Customer';
+      const att = m.attachmentFileId ? ' 📎' : '';
+      text += `\n*${who}${att}:*\n${this.escapeDiagMarkdown(m.message)}\n`;
+    }
+
+    const rows: any[][] = [];
+    if (tkt.status !== 'CLOSED') {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: 'Reply',
+            fallbackEmoji: '💬',
+            style: 'primary',
+            callbackData: `adm:tkt_rep:${tkt.id}`,
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: 'Close',
+            fallbackEmoji: '✅',
+            style: 'danger',
+            callbackData: `adm:tkt_cls:${tkt.id}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'All Tickets', fallbackEmoji: '📋', style: 'default', callbackData: 'adm:tkt', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'ADMIN', fallbackEmoji: '👑', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminPromoHub(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const [cfg, channels] = await Promise.all([
+      promotionService.getConfig(),
+      promotionService.listChannels(false),
+    ]);
+
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `📣 *CHANNEL AUTO PROMOTION*\n\n` +
+      `• *Scheduler:* ${cfg.enabled ? '✅ ENABLED' : '⏸️ PAUSED'}\n` +
+      `• *Interval:* \`Every ${cfg.intervalMinutes} min\`\n` +
+      `• *Last Posted:* ${cfg.lastPostedAt ? `\`${cfg.lastPostedAt.slice(0, 16).replace('T', ' ')}Z\`` : '_Never_'}\n` +
+      `• *Connected Channels:* \`${channels.length}\`\n\n`;
+
+    const rows: any[][] = [
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({
+          text: cfg.enabled ? 'Pause Auto Promo' : 'Enable Auto Promo',
+          fallbackEmoji: cfg.enabled ? '⏸️' : '✅',
+          style: cfg.enabled ? 'danger' : 'success',
+          callbackData: 'adm:promo_tog',
+          forceVisible: true,
+        }),
+        ButtonBuilder.buildButton({
+          text: 'Post Promo Now',
+          fallbackEmoji: '🚀',
+          style: 'primary',
+          callbackData: 'adm:promo_now',
+          forceVisible: true,
+        }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Add Channel', fallbackEmoji: '➕', style: 'success', callbackData: 'adm:promo_add', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Set Interval', fallbackEmoji: '⏱️', style: 'default', callbackData: 'adm:promo_int', forceVisible: true }),
+      ]),
+    ];
+
+    if (channels.length === 0) {
+      text += `_No promo channels added yet. Add a channel where the bot is Administrator._`;
+    } else {
+      for (const ch of channels) {
+        const admBadge = ch.botIsAdmin ? '✅ Admin' : '⚠️ Not Admin';
+        const actBadge = ch.isActive ? '🟢 Active' : '⏸️ Paused';
+        text += `• *${this.escapeDiagMarkdown(ch.title)}* (\`${this.escapeDiagMarkdown(ch.channelIdentifier)}\`) — ${admBadge} • ${actBadge}\n`;
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: `${ch.isActive ? 'Pause' : 'Enable'} ${ch.channelIdentifier.slice(0, 14)}`,
+              style: ch.isActive ? 'default' : 'success',
+              callbackData: `adm:promo_togch:${ch.id}`,
+              forceVisible: true,
+            }),
+            ButtonBuilder.buildButton({
+              text: 'Verify Admin',
+              fallbackEmoji: '🔍',
+              style: 'primary',
+              callbackData: `adm:promo_ver:${ch.id}`,
+              forceVisible: true,
+            }),
+            ButtonBuilder.buildButton({
+              text: 'Del',
+              fallbackEmoji: '🗑️',
+              style: 'danger',
+              callbackData: `adm:promo_rem:${ch.id}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
     }
   }
 }

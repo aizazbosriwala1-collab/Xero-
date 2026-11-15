@@ -173,6 +173,15 @@ export async function seedInitialData(): Promise<void> {
       },
     },
     {
+      key: 'auto_promotion_config',
+      value: {
+        enabled: false,
+        intervalMinutes: 180,
+        lastPostedAt: null,
+        lastProductId: null,
+      },
+    },
+    {
       key: 'brand_info',
       value: {
         brandName: 'XERO KHAN',
