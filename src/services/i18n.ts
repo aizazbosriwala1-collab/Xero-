@@ -55,7 +55,14 @@ export async function getUserLanguage(userId: string): Promise<SupportedLanguage
 
 export const translations: Record<SupportedLanguage, Record<string, string>> = {
   en: {
-    welcome: '👋 *Welcome to Master Xero*\n\nPremium Digital Marketplace',
+    welcome: '👑 *MASTER XERO*\n\nEverything Premium.\nOne Place.',
+    boot_header:
+      '👑 *MASTER XERO*\n\n━━━━━━━━━━━━\n\nYour Gateway to Premium Digital Access\n\n⚡ Instant Delivery\n🔒 Secure Payments\n🎁 Exclusive Rewards\n\n━━━━━━━━━━━━',
+    boot_step_init: '⏳ Preparing your workspace...',
+    boot_step_products: '⚡ Loading products...',
+    boot_step_rewards: '🎁 Loading rewards...',
+    boot_step_securing: '🔒 Securing your workspace...',
+    boot_step_ready: '✅ Workspace Ready',
     menu_ready: '⚡ *Master Xero Ready*\nTap *☰ MENU* anytime to open the store.',
     categories_header: '🛍 *Products*\n\nSelect a category:',
     featured_header: '🔥 *Featured Tools* (Page {page} of {totalPages})',
@@ -115,7 +122,7 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     menu_wallet: '💳 Wallet',
     menu_add_funds: '➕ Add Funds',
     menu_orders: '📦 Orders',
-    menu_free_stuff: '🎁 Get Free Stuff',
+    menu_free_stuff: '🎁 Free Stuff',
     menu_giveaways: '🎁 Giveaways',
     menu_referral: '👥 Invite Friends',
     menu_rewards: '🏆 Rewards',
@@ -133,7 +140,14 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     btn_cancel: '❌ Cancel',
   },
   ur: {
-    welcome: '👋 *ماسٹر زیرو میں خوش آمدید*\n\nپریمیم ڈیجیٹل مارکیٹ پلیس',
+    welcome: '👑 *MASTER XERO*\n\nہر پریمیم سروس۔\nایک جگہ۔',
+    boot_header:
+      '👑 *MASTER XERO*\n\n━━━━━━━━━━━━\n\nپریمیم ڈیجیٹل رسائی کا مرکز\n\n⚡ فوری ڈیلیوری\n🔒 محفوظ ادائیگیاں\n🎁 خصوصی انعامات\n\n━━━━━━━━━━━━',
+    boot_step_init: '⏳ ورک اسپیس تیار ہو رہا ہے...',
+    boot_step_products: '⚡ پروڈکٹس لوڈ ہو رہی ہیں...',
+    boot_step_rewards: '🎁 انعامات لوڈ ہو رہے ہیں...',
+    boot_step_securing: '🔒 سیکیورٹی چیک جاری ہے...',
+    boot_step_ready: '✅ ورک اسپیس تیار ہے',
     menu_ready: '⚡ *ماسٹر زیرو مینو تیار ہے*\nکسی بھی وقت *☰ MENU* دبائیں۔',
     categories_header: '🛍 *پروڈکٹس*\n\nکیٹیگری منتخب کریں:',
     featured_header: '🔥 *نمایاں ٹولز* (صفحہ {page} از {totalPages})',
@@ -211,7 +225,14 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     btn_cancel: '❌ منسوخ',
   },
   'ur-ro': {
-    welcome: '👋 *Master Xero Mein Khushamdeed*\n\nPremium Digital Marketplace',
+    welcome: '👑 *MASTER XERO*\n\nEverything Premium.\nOne Place.',
+    boot_header:
+      '👑 *MASTER XERO*\n\n━━━━━━━━━━━━\n\nYour Gateway to Premium Digital Access\n\n⚡ Instant Delivery\n🔒 Secure Payments\n🎁 Exclusive Rewards\n\n━━━━━━━━━━━━',
+    boot_step_init: '⏳ Workspace tayyar ho raha hai...',
+    boot_step_products: '⚡ Products load ho rahe hain...',
+    boot_step_rewards: '🎁 Rewards load ho rahe hain...',
+    boot_step_securing: '🔒 Workspace secure kiya ja raha hai...',
+    boot_step_ready: '✅ Workspace Ready',
     menu_ready: '⚡ *Master Xero Ready*\nStore kholne ke liye *☰ MENU* dabayein.',
     categories_header: '🛍 *Products*\n\nCategory chunen:',
     featured_header: '🔥 *Featured Tools* (Page {page}/{totalPages})',
@@ -271,7 +292,7 @@ export const translations: Record<SupportedLanguage, Record<string, string>> = {
     menu_wallet: '💳 Wallet',
     menu_add_funds: '➕ Add Funds',
     menu_orders: '📦 Orders',
-    menu_free_stuff: '🎁 Get Free Stuff',
+    menu_free_stuff: '🎁 Free Stuff',
     menu_giveaways: '🎁 Giveaways',
     menu_referral: '👥 Invite Friends',
     menu_rewards: '🏆 Rewards',

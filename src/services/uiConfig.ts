@@ -88,10 +88,10 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
   {
     settingKey: 'btn.menu.free_stuff',
     section: 'main_menu',
-    textValue: 'Get Free Stuff',
+    textValue: 'Free Stuff',
     fallbackEmoji: '🎁',
     buttonStyle: 'success',
-    localizedText: { en: 'Get Free Stuff', ur: 'مفت انعامات', 'ur-ro': 'Get Free Stuff' },
+    localizedText: { en: 'Free Stuff', ur: 'مفت انعامات', 'ur-ro': 'Free Stuff' },
   },
   {
     settingKey: 'btn.menu.wallet',
@@ -120,10 +120,10 @@ export const DEFAULT_UI_SETTINGS: DefaultUISettingSpec[] = [
   {
     settingKey: 'btn.menu.admin',
     section: 'main_menu',
-    textValue: 'ADMIN CONTROL CENTER',
+    textValue: 'Admin',
     fallbackEmoji: '👑',
     buttonStyle: 'danger',
-    localizedText: { en: 'ADMIN CONTROL CENTER', ur: 'ایڈمن کنٹرول سینٹر', 'ur-ro': 'ADMIN CONTROL CENTER' },
+    localizedText: { en: 'Admin', ur: 'ایڈمن', 'ur-ro': 'Admin' },
   },
 
   // Secondary / Submenu & Legacy UI Settings (preserved for UI Editor & slash-command flows)
@@ -913,9 +913,11 @@ export class UISettingService {
     const factoryUpgradeKeys = [
       'btn.dep.bin_submit',
       'btn.menu.products',
+      'btn.menu.free_stuff',
       'btn.menu.wallet',
       'btn.menu.orders',
       'btn.menu.support',
+      'btn.menu.admin',
       'btn.menu.featured',
       'btn.menu.search',
       'btn.menu.add_funds',

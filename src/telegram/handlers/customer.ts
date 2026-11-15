@@ -82,53 +82,28 @@ export class CustomerHandler {
   }
 
   /**
-   * Handle /start command
+   * Handle /start command with instant luxury boot experience & smart adaptive progress
    */
   public async handleStart(msg: TelegramMessage, referrerCode?: string) {
     if (!msg.from) return;
-    const [, userInfo] = await Promise.all([uiConfigService.ensureLoaded(), this.ensureUser(msg.from)]);
-    const { userId, isAdmin, lang } = userInfo;
 
-    const [navState, , maint, banners, membership] = await Promise.all([
-      navigationService.getState(userId),
-      redis.clearFsmState(userId),
-      settingsService.getMaintenanceConfig(),
-      settingsService.getBannerImages(),
-      channelService.checkUserMembership(userId),
-      referrerCode && referrerCode.startsWith('ref_')
-        ? referralService.registerReferral(referrerCode.replace('ref_', '').trim(), userId)
-        : Promise.resolve(false),
-    ]);
-
-    if (!isAdmin && maint.enabled) {
-      await telegramClient.sendMessage(msg.chat.id, maint.message);
-      return;
-    }
-
-    if (!membership.allowed) {
-      await this.sendRequiredChannelsGate(msg.chat.id, undefined, userId, membership.missingChannels, lang, false);
-      return;
-    }
-
-    const needsReplyKbAttach = navState?.filters?.replyKbVersion !== 'v2_2btn';
-
-    // Smart deep links from Channel Promotions (e.g. ?start=orders or ?start=orders_<productId>)
+    // Fast path for direct Channel Auto-Promotion deep links (?start=orders or ?start=orders_<productId>)
     if (referrerCode === 'orders' || (referrerCode && referrerCode.startsWith('orders_'))) {
-      if (needsReplyKbAttach) {
-        const quickBarHint =
-          lang === 'ur'
-            ? '⚡ فوری رسائی نیچے فعال ہے: رقم جمع کریں یا سپورٹ۔'
-            : '⚡ Quick actions enabled below: Deposit or Support.';
-        await telegramClient.sendMessage(msg.chat.id, quickBarHint, {
-          disable_notification: true,
-          reply_markup: getCustomerMainReplyKeyboard(lang),
-        });
-        await navigationService.saveState(userId, {
-          filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' },
-          existingState: navState,
-        });
+      const [, userInfo] = await Promise.all([uiConfigService.ensureLoaded(), this.ensureUser(msg.from)]);
+      const { userId, isAdmin, lang } = userInfo;
+      const [, maint, membership] = await Promise.all([
+        redis.clearFsmState(userId),
+        settingsService.getMaintenanceConfig(),
+        channelService.checkUserMembership(userId),
+      ]);
+      if (!isAdmin && maint.enabled) {
+        await telegramClient.sendMessage(msg.chat.id, maint.message);
+        return;
       }
-
+      if (!membership.allowed) {
+        await this.sendRequiredChannelsGate(msg.chat.id, undefined, userId, membership.missingChannels, lang, false);
+        return;
+      }
       if (referrerCode.startsWith('orders_')) {
         const promoProdId = referrerCode.slice('orders_'.length).trim();
         const item = promoProdId ? await pricingService.getCatalogItemById(promoProdId).catch(() => null) : null;
@@ -141,33 +116,110 @@ export class CustomerHandler {
       return;
     }
 
-    const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
+    // 1. Instant Startup Screen (NO buttons yet, zero silence) + concurrent user/UI initialization
+    const bootStartMs = Date.now();
+    const initialLang = resolveLanguage(msg.from.language_code);
+    const buildBootFrame = (statusKey: string, frameLang: SupportedLanguage) =>
+      `${t('boot_header', frameLang)}\n\n${t(statusKey, frameLang)}`;
 
-    // Send single polished welcome screen (with optional banner photo if configured) + colored inline dashboard
-    const sent = banners.welcomeBannerUrl
-      ? await telegramClient.sendPhoto(msg.chat.id, banners.welcomeBannerUrl, welcomeText, {
-          reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
-        })
-      : await telegramClient.sendMessage(msg.chat.id, welcomeText, {
-          reply_markup: getCustomerMainInlineKeyboard(isAdmin, lang),
-        });
+    const paceBootStep = async (stepStartedAt: number, targetStepMs: number) => {
+      const totalElapsed = Date.now() - bootStartMs;
+      if (totalElapsed >= 1300) return;
+      const stepElapsed = Date.now() - stepStartedAt;
+      const remaining = Math.min(targetStepMs - stepElapsed, 1300 - totalElapsed);
+      if (remaining > 15) {
+        await new Promise(resolve => setTimeout(resolve, remaining));
+      }
+    };
 
-    // Attach/upgrade persistent 2-button bottom reply keyboard ([ Deposit ] [ Support ]) cleanly without duplicating home screen
-    if (needsReplyKbAttach) {
-      const quickBarHint =
-        lang === 'ur'
-          ? '⚡ فوری رسائی نیچے فعال ہے: رقم جمع کریں یا سپورٹ۔'
-          : '⚡ Quick actions enabled below: Deposit or Support.';
-      await telegramClient.sendMessage(msg.chat.id, quickBarHint, {
-        disable_notification: true,
-        reply_markup: getCustomerMainReplyKeyboard(lang),
-      });
+    const [bootSent, , userInfo] = await Promise.all([
+      telegramClient.sendMessage(msg.chat.id, buildBootFrame('boot_step_init', initialLang)),
+      uiConfigService.ensureLoaded(),
+      this.ensureUser(msg.from),
+    ]);
+    const { userId, isAdmin, lang } = userInfo;
+    const bootMsgId = bootSent?.result?.message_id;
+
+    // Brief visual beat on initial greeting before first progress transition
+    await paceBootStep(bootStartMs, 130);
+
+    // 2. Smart Progress Step 1: Products cache warm + referral attribution
+    const s1 = Date.now();
+    await Promise.all([
+      bootMsgId
+        ? telegramClient.editMessageText(msg.chat.id, bootMsgId, buildBootFrame('boot_step_products', lang))
+        : Promise.resolve(),
+      pricingService.getCategories(true).catch(() => []),
+      pricingService.getCatalog({ featuredOnly: true, page: 1, pageSize: 6 }).catch(() => null),
+      referrerCode && referrerCode.startsWith('ref_')
+        ? referralService.registerReferral(referrerCode.replace('ref_', '').trim(), userId)
+        : Promise.resolve(false),
+    ]);
+    await paceBootStep(s1, 145);
+
+    // 3. Smart Progress Step 2: Rewards & Giveaways cache warm + FSM reset
+    const s2 = Date.now();
+    await Promise.all([
+      bootMsgId
+        ? telegramClient.editMessageText(msg.chat.id, bootMsgId, buildBootFrame('boot_step_rewards', lang))
+        : Promise.resolve(),
+      giveawayService.getActiveGiveaways().catch(() => []),
+      referralService.listRewardTiers({ activeOnly: true }).catch(() => []),
+      redis.clearFsmState(userId),
+    ]);
+    await paceBootStep(s2, 145);
+
+    // 4. Smart Progress Step 3: Security, Maintenance & Channel Gate verification
+    const s3 = Date.now();
+    const [, maint, membership, navState] = await Promise.all([
+      bootMsgId
+        ? telegramClient.editMessageText(msg.chat.id, bootMsgId, buildBootFrame('boot_step_securing', lang))
+        : Promise.resolve(),
+      settingsService.getMaintenanceConfig(),
+      channelService.checkUserMembership(userId),
+      navigationService.getState(userId),
+    ]);
+
+    if (!isAdmin && maint.enabled) {
+      if (bootMsgId) {
+        await telegramClient.editMessageText(msg.chat.id, bootMsgId, maint.message);
+      } else {
+        await telegramClient.sendMessage(msg.chat.id, maint.message);
+      }
+      return;
     }
 
+    if (!membership.allowed) {
+      await this.sendRequiredChannelsGate(msg.chat.id, bootMsgId, userId, membership.missingChannels, lang, false);
+      return;
+    }
+
+    await paceBootStep(s3, 145);
+
+    // 5. Workspace Ready beat -> Final compact Home Screen (edits SAME message cleanly)
+    if (bootMsgId) {
+      const s4 = Date.now();
+      await telegramClient.editMessageText(msg.chat.id, bootMsgId, buildBootFrame('boot_step_ready', lang));
+      await paceBootStep(s4, 155);
+    }
+
+    const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
+    const homeSent = await this.renderMenu(
+      msg.chat.id,
+      bootMsgId,
+      userId,
+      welcomeText,
+      getCustomerMainInlineKeyboard(isAdmin, lang),
+      { skipNavSaveIfEdited: true }
+    );
+
+    const finalMsgId = homeSent?.result?.message_id ?? bootMsgId;
     await navigationService.saveState(userId, {
       screen: 'home',
-      activeMessageId: sent?.result?.message_id,
-      filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' },
+      categoryId: 'all',
+      page: 1,
+      ...(finalMsgId ? { activeMessageId: finalMsgId } : {}),
+      filters: { ...(navState?.filters || {}) },
       rotateToken: true,
     });
   }

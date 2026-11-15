@@ -2333,13 +2333,18 @@ export async function runComprehensiveTests() {
   currentCategory = 'V2 Menu Placement & Response Speed';
   console.log(`\n--- ${currentCategory} ---`);
 
-  await it('A1. /start cleanliness: omits "MENU READY", renders welcome inline menu, attaches 2-button bar once per chat', 'mock_integration', async () => {
+  await it('A1. /start cleanliness: omits "MENU READY", uses single startup message edited to compact home menu with zero spam', 'mock_integration', async () => {
     const sentMessages: any[] = [];
+    const editedMessages: any[] = [];
     let nextMsgId = 9001;
     telegramClient.setTransportOverride(async (method, body) => {
       if (method === 'sendMessage') {
         sentMessages.push(JSON.parse(JSON.stringify(body)));
         return { ok: true, result: { message_id: nextMsgId++ } };
+      }
+      if (method === 'editMessageText') {
+        editedMessages.push(JSON.parse(JSON.stringify(body)));
+        return { ok: true, result: { message_id: body.message_id } };
       }
       return { ok: true, result: true };
     });
@@ -2349,7 +2354,7 @@ export async function runComprehensiveTests() {
       await db.query('DELETE FROM ui_navigation_states WHERE user_id = $1', [String(chatId)]);
       await redis.del(`nav:${chatId}`);
 
-      // First /start attaches 2-button bottom reply keyboard silently + renders welcome inline menu
+      // /start sends ONE startup message and transitions via editMessageText into ONE final home screen
       await telegramBotRouter.handleUpdate({
         update_id: 40001,
         message: {
@@ -2361,19 +2366,19 @@ export async function runComprehensiveTests() {
         },
       });
 
-      assert.strictEqual(sentMessages.length, 2, 'First /start sends welcome inline menu + silent 2-button reply bar');
+      assert.strictEqual(sentMessages.length, 1, '/start must send strictly one startup message');
       assert.strictEqual(
         sentMessages.some(m => String(m.text).toUpperCase().includes('MENU READY')),
         false,
         'MENU READY message must NEVER be sent'
       );
-      assert.ok(sentMessages[0].reply_markup?.inline_keyboard, 'Welcome message must contain main inline dashboard');
-      assert.ok(sentMessages[1].reply_markup?.keyboard, 'Second lightweight message attaches 2-button reply keyboard');
-      assert.strictEqual(sentMessages[1].disable_notification, true);
-      assert.strictEqual(sentMessages[1].reply_markup.keyboard[0].length, 2);
+      assert.strictEqual(sentMessages[0].reply_markup, undefined, 'Initial startup message must not attach buttons');
+      const finalHome = editedMessages[editedMessages.length - 1];
+      assert.ok(finalHome?.reply_markup?.inline_keyboard, 'Final edited home message must contain compact inline dashboard');
 
-      // Second /start sends ONLY 1 message (no duplicate reply-keyboard bar!)
+      // Second /start also sends strictly ONE startup message and edits into home
       sentMessages.length = 0;
+      editedMessages.length = 0;
       await telegramBotRouter.handleUpdate({
         update_id: 40002,
         message: {
@@ -2385,8 +2390,8 @@ export async function runComprehensiveTests() {
         },
       });
 
-      assert.strictEqual(sentMessages.length, 1, 'Subsequent /start must send only the single welcome + inline dashboard');
-      assert.ok(sentMessages[0].reply_markup?.inline_keyboard);
+      assert.strictEqual(sentMessages.length, 1, 'Subsequent /start must send only the single startup message');
+      assert.ok(editedMessages[editedMessages.length - 1]?.reply_markup?.inline_keyboard);
     } finally {
       telegramClient.setTransportOverride(null);
     }
@@ -6224,7 +6229,9 @@ export async function runComprehensiveTests() {
           text: '/start',
         },
       });
-      const gateMsg = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('Join Required Channels'));
+      const gateMsg = sent.find(
+        m => (m.method === 'sendMessage' || m.method === 'editMessageText') && String(m.body.text).includes('Join Required Channels')
+      );
       assert.ok(gateMsg, '/start must render required channels gate when unjoined');
       const gateBtns = gateMsg!.body.reply_markup.inline_keyboard.flat();
       assert.ok(gateBtns.some((b: any) => b.callback_data === 'ch:verify'));
@@ -6258,7 +6265,7 @@ export async function runComprehensiveTests() {
         },
       });
       assert.ok(
-        sent.some(m => m.method === 'editMessageText' && String(m.body.text).includes('Master Xero')),
+        sent.some(m => m.method === 'editMessageText' && String(m.body.text).toUpperCase().includes('MASTER XERO')),
         'ch:verify must unlock customer main menu in-place'
       );
     } finally {
@@ -7453,19 +7460,23 @@ export async function runComprehensiveTests() {
         },
       });
 
-      const welcomeMsg = sent.find(m => m.method === 'sendMessage' && String(m.body.text).includes('Master Xero'));
-      assert.ok(welcomeMsg, 'Home screen must display Master Xero welcome message');
-      assert.ok(String(welcomeMsg!.body.text).includes('Welcome to Master Xero'));
-      assert.ok(String(welcomeMsg!.body.text).includes('Premium Digital Marketplace'));
+      const sendCalls = sent.filter(m => m.method === 'sendMessage');
+      const editCalls = sent.filter(m => m.method === 'editMessageText');
+      assert.strictEqual(sendCalls.length, 1, '/start must send exactly one startup message without extra spam');
+      assert.strictEqual(sendCalls[0].body.reply_markup, undefined, 'Initial startup message must not have buttons yet');
+      const finalHomeMsg = editCalls[editCalls.length - 1];
+      assert.ok(finalHomeMsg, 'Home screen must replace startup message via editMessageText');
+      assert.ok(String(finalHomeMsg.body.text).includes('MASTER XERO'));
+      assert.ok(String(finalHomeMsg.body.text).includes('Everything Premium.'));
 
-      const homeButtons = (welcomeMsg!.body.reply_markup?.inline_keyboard || []).flat();
+      const homeButtons = (finalHomeMsg.body.reply_markup?.inline_keyboard || []).flat();
       assert.strictEqual(homeButtons.length, 5, `Customer home must have exactly 5 buttons, got ${homeButtons.length}`);
       assert.deepStrictEqual(
         homeButtons.map((b: any) => b.callback_data),
         ['m:prod', 'm:free', 'm:wall', 'm:ord', 'm:supp']
       );
       assert.ok(homeButtons[0].text.includes('Products'));
-      assert.ok(homeButtons[1].text.includes('Get Free Stuff'));
+      assert.ok(homeButtons[1].text.includes('Free Stuff'));
       assert.ok(homeButtons[2].text.includes('Wallet'));
       assert.ok(homeButtons[3].text.includes('Orders'));
       assert.ok(homeButtons[4].text.includes('Support'));
@@ -8083,6 +8094,76 @@ export async function runComprehensiveTests() {
         assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Route not registered: ${cb}`);
         assert.ok(Buffer.byteLength(cb, 'utf8') <= 64);
       }
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  // =========================================================================
+  // 28. MASTER XERO – PREMIUM BOOT EXPERIENCE (CONTRACT 16)
+  // =========================================================================
+  currentCategory = 'Master Xero Premium Boot Experience (Contract 16)';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 16.1: Instant /start Boot Screen (No Buttons), Smart editMessageText Progress (0.5s-1.5s), Compact Home Footprint', 'mock_integration', async () => {
+    const custId = 98601;
+    const events: Array<{ method: string; body: any; ts: number }> = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      events.push({ method, body: JSON.parse(JSON.stringify(body)), ts: Date.now() });
+      return { ok: true, result: { message_id: 9861 } };
+    });
+
+    try {
+      const startedAt = Date.now();
+      await telegramBotRouter.handleUpdate({
+        update_id: 986101,
+        message: {
+          message_id: 1,
+          chat: { id: custId, type: 'private' },
+          from: { id: custId, is_bot: false, first_name: 'BootVip' },
+          date: Math.floor(Date.now() / 1000),
+          text: '/start',
+        },
+      });
+      const totalDurationMs = Date.now() - startedAt;
+
+      assert.ok(totalDurationMs >= 450 && totalDurationMs <= 1550, `Boot sequence duration must be ~0.5s-1.5s, got ${totalDurationMs}ms`);
+
+      const sends = events.filter(e => e.method === 'sendMessage');
+      const edits = events.filter(e => e.method === 'editMessageText');
+      assert.strictEqual(sends.length, 1, 'Must send strictly one startup message');
+      assert.strictEqual(sends[0].body.reply_markup, undefined, 'Initial boot screen must have zero buttons');
+
+      const bootText = String(sends[0].body.text);
+      assert.ok(bootText.includes('MASTER XERO'));
+      assert.ok(bootText.includes('Your Gateway to Premium Digital Access'));
+      assert.ok(bootText.includes('Instant Delivery'));
+      assert.ok(bootText.includes('Secure Payments'));
+      assert.ok(bootText.includes('Exclusive Rewards'));
+      assert.ok(bootText.includes('Preparing your workspace...'));
+
+      // Every edit targets the SAME startup message ID 9861
+      assert.strictEqual(edits.length, 5, `Expected 4 progress stages + 1 final home edit, got ${edits.length}`);
+      for (const e of edits) {
+        assert.strictEqual(e.body.message_id, 9861, 'All progress/home updates must edit the same startup message');
+      }
+      assert.ok(String(edits[0].body.text).includes('Loading products...'));
+      assert.ok(String(edits[1].body.text).includes('Loading rewards...'));
+      assert.ok(String(edits[2].body.text).includes('Securing your workspace...'));
+      assert.ok(String(edits[3].body.text).includes('Workspace Ready'));
+
+      const finalHome = edits[4];
+      assert.ok(String(finalHome.body.text).includes('MASTER XERO'));
+      assert.ok(String(finalHome.body.text).includes('Everything Premium.'));
+      assert.ok(String(finalHome.body.text).includes('One Place.'));
+
+      const rows = finalHome.body.reply_markup?.inline_keyboard || [];
+      assert.strictEqual(rows.length, 3, 'Customer home keyboard must use 3 compact rows');
+      assert.strictEqual(rows.flat().length, 5);
+      assert.deepStrictEqual(
+        rows.flat().map((b: any) => b.text),
+        ['🛍 Products', '🎁 Free Stuff', '💳 Wallet', '📦 Orders', '🎧 Support']
+      );
     } finally {
       telegramClient.setTransportOverride(null);
     }
