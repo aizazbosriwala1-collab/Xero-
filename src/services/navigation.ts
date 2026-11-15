@@ -28,7 +28,7 @@ export class NavigationService {
   }
 
   public async getState(userId: string): Promise<NavigationState | null> {
-    const cached = await redis.get(`nav:${userId}`);
+    const cached = await redis.getHot(`nav:${userId}`, 4000);
     if (cached) {
       try {
         return JSON.parse(cached) as NavigationState;
@@ -73,9 +73,12 @@ export class NavigationService {
 
   public async saveState(
     userId: string,
-    patch: Partial<Omit<NavigationState, 'userId' | 'stateToken'>> & { rotateToken?: boolean }
+    patch: Partial<Omit<NavigationState, 'userId' | 'stateToken'>> & {
+      rotateToken?: boolean;
+      existingState?: NavigationState | null;
+    }
   ): Promise<NavigationState> {
-    const existing = await this.getState(userId);
+    const existing = patch.existingState !== undefined ? patch.existingState : await this.getState(userId);
     const stateToken = patch.rotateToken || !existing?.stateToken ? this.generateToken() : existing.stateToken;
     const expiresAt = new Date(Date.now() + this.defaultTtlMs).toISOString();
 
@@ -107,45 +110,49 @@ export class NavigationService {
       existing.quantity !== next.quantity ||
       existingFiltersStr !== filtersStr;
 
+    const redisPromise = redis.set(`nav:${userId}`, JSON.stringify(next), 3600);
     if (changed) {
-      try {
-        await db.query(
-          `INSERT INTO ui_navigation_states (
-            user_id, active_message_id, screen, category_id, product_id,
-            page, search_query, quantity, filters_json, state_token, expires_at, updated_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
-          ON CONFLICT (user_id) DO UPDATE SET
-            active_message_id = EXCLUDED.active_message_id,
-            screen = EXCLUDED.screen,
-            category_id = EXCLUDED.category_id,
-            product_id = EXCLUDED.product_id,
-            page = EXCLUDED.page,
-            search_query = EXCLUDED.search_query,
-            quantity = EXCLUDED.quantity,
-            filters_json = EXCLUDED.filters_json,
-            state_token = EXCLUDED.state_token,
-            expires_at = EXCLUDED.expires_at,
-            updated_at = CURRENT_TIMESTAMP`,
-          [
-            next.userId,
-            next.activeMessageId ?? null,
-            next.screen,
-            next.categoryId ?? null,
-            next.productId ?? null,
-            next.page,
-            next.searchQuery ?? null,
-            next.quantity,
-            filtersStr,
-            next.stateToken,
-            next.expiresAt,
-          ]
-        );
-      } catch (err: any) {
-        logger.warn('DB navigation state persistence skipped', { userId, error: err.message });
-      }
+      await Promise.all([
+        db
+          .query(
+            `INSERT INTO ui_navigation_states (
+              user_id, active_message_id, screen, category_id, product_id,
+              page, search_query, quantity, filters_json, state_token, expires_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id) DO UPDATE SET
+              active_message_id = EXCLUDED.active_message_id,
+              screen = EXCLUDED.screen,
+              category_id = EXCLUDED.category_id,
+              product_id = EXCLUDED.product_id,
+              page = EXCLUDED.page,
+              search_query = EXCLUDED.search_query,
+              quantity = EXCLUDED.quantity,
+              filters_json = EXCLUDED.filters_json,
+              state_token = EXCLUDED.state_token,
+              expires_at = EXCLUDED.expires_at,
+              updated_at = CURRENT_TIMESTAMP`,
+            [
+              next.userId,
+              next.activeMessageId ?? null,
+              next.screen,
+              next.categoryId ?? null,
+              next.productId ?? null,
+              next.page,
+              next.searchQuery ?? null,
+              next.quantity,
+              filtersStr,
+              next.stateToken,
+              next.expiresAt,
+            ]
+          )
+          .catch((err: any) => {
+            logger.warn('DB navigation state persistence skipped', { userId, error: err.message });
+          }),
+        redisPromise,
+      ]);
+    } else {
+      await redisPromise;
     }
-
-    await redis.set(`nav:${userId}`, JSON.stringify(next), 3600);
     return next;
   }
 

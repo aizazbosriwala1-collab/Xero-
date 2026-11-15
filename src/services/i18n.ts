@@ -23,7 +23,7 @@ export async function invalidateUserLanguageCache(userId: string): Promise<void>
 
 export async function getUserLanguage(userId: string): Promise<SupportedLanguage> {
   try {
-    const cached = await redis.get(`userlang:${userId}`);
+    const cached = await redis.getHot(`userlang:${userId}`, 4000);
     if (cached) {
       return resolveLanguage(cached);
     }

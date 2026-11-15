@@ -11,6 +11,7 @@ export interface AppConfig {
   redisUrl?: string;
   telegram: {
     botToken?: string;
+    botUsername?: string;
     webhookUrl?: string;
     webhookSecret?: string;
     adminIds: string[];
@@ -57,6 +58,20 @@ export function parseReadOnlyLiveVerifiedEnv(raw?: string): boolean {
   return raw.trim() === 'true';
 }
 
+export function normalizeBotUsername(raw?: string | null): string | undefined {
+  if (typeof raw !== 'string') {
+    return undefined;
+  }
+  const cleaned = raw
+    .trim()
+    .replace(/^https?:\/\/t\.me\//i, '')
+    .replace(/^t\.me\//i, '')
+    .replace(/^@+/, '')
+    .split(/[/?#\s]/)[0]
+    .trim();
+  return cleaned || undefined;
+}
+
 export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const adminIdsRaw = env.TELEGRAM_ADMIN_IDS || '';
   const adminIds = adminIdsRaw
@@ -74,6 +89,7 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     redisUrl: env.REDIS_URL,
     telegram: {
       botToken: env.TELEGRAM_BOT_TOKEN,
+      botUsername: normalizeBotUsername(env.BOT_USERNAME || env.TELEGRAM_BOT_USERNAME),
       webhookUrl: env.TELEGRAM_WEBHOOK_URL,
       webhookSecret: env.TELEGRAM_WEBHOOK_SECRET,
       adminIds,
@@ -126,6 +142,7 @@ export function getSanitizedConfig(): Record<string, unknown> {
     redisConfigured: Boolean(config.redisUrl),
     telegram: {
       botToken: mask(config.telegram.botToken),
+      botUsername: config.telegram.botUsername || 'AUTO_RESOLVE_GETME',
       webhookUrl: config.telegram.webhookUrl ? 'CONFIGURED' : 'NOT_CONFIGURED',
       webhookSecret: mask(config.telegram.webhookSecret),
       adminCount: config.telegram.adminIds.length,

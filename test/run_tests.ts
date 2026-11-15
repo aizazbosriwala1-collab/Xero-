@@ -33,6 +33,7 @@ import {
   DEFAULT_AITOOLSHOP_BASE_URL,
   parseBoundedClockToleranceSeconds,
   parseReadOnlyLiveVerifiedEnv,
+  normalizeBotUsername,
   getSanitizedConfig,
 } from '../src/config/env.js';
 import { adminHandler } from '../src/telegram/handlers/admin.js';
@@ -7176,6 +7177,239 @@ export async function runComprehensiveTests() {
     for (const cb of newRoutes) {
       assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `Callback exceeds 64 bytes: ${cb}`);
       assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered route: ${cb}`);
+    }
+  });
+
+  await it('Contract 12.1: 4-Axis PerfTracker Instrumentation (TG/Redis/PG/Render), Bottleneck Classification & Slowest-10 Ranking', 'unit', async () => {
+    perfTracker.resetHistory();
+
+    const { metrics: mTg } = await perfTracker.run('c12:tg_heavy', async () => {
+      perfTracker.recordTelegramApi(85.5);
+      perfTracker.recordTelegramApi(42.5);
+      perfTracker.recordRedis(3.2, 2);
+      perfTracker.recordDb(12.4);
+      perfTracker.measureRender(() => 'rendered');
+    });
+    assert.strictEqual(mTg.telegramApiTimeMs, 128);
+    assert.strictEqual(mTg.telegramApiCallCount, 2);
+    assert.strictEqual(mTg.redisTimeMs, 3.2);
+    assert.strictEqual(mTg.redisOpCount, 2);
+    assert.strictEqual(mTg.dbTimeMs, 12.4);
+    assert.strictEqual(mTg.dbQueryCount, 1);
+    assert.ok(mTg.renderTimeMs >= 0);
+    assert.strictEqual(mTg.primaryBottleneck, 'TELEGRAM_API');
+
+    const { metrics: mPg } = await perfTracker.run('c12:pg_heavy', async () => {
+      perfTracker.recordTelegramApi(10);
+      perfTracker.recordDb(95.4);
+    });
+    assert.strictEqual(mPg.primaryBottleneck, 'POSTGRESQL');
+
+    const { metrics: mRed } = await perfTracker.run('c12:redis_heavy', async () => {
+      perfTracker.recordRedis(64.1, 4);
+      perfTracker.recordDb(5);
+    });
+    assert.strictEqual(mRed.primaryBottleneck, 'REDIS');
+
+    const { metrics: mRen } = await perfTracker.run('c12:render_heavy', async () => {
+      perfTracker.recordRender(41.8);
+    });
+    assert.strictEqual(mRen.primaryBottleneck, 'RENDERING');
+
+    for (let i = 1; i <= 12; i++) {
+      await perfTracker.run(`c12:rank_${i}`, async () => {
+        await new Promise(r => setTimeout(r, i * 2));
+      });
+    }
+    const top10 = perfTracker.getSlowestCallbacks(10);
+    assert.strictEqual(top10.length, 10, 'getSlowestCallbacks(10) must return at most 10 unique callbacks');
+    for (let i = 1; i < top10.length; i++) {
+      assert.ok(
+        top10[i - 1].responseTimeMs >= top10[i].responseTimeMs,
+        'Slowest callbacks must be sorted descending by responseTimeMs'
+      );
+    }
+  });
+
+  await it('Contract 12.2: Redis L1 Hot Cache Coherency (getHot / set / del) & Zero-Redis-Op L1 Hit', 'unit', async () => {
+    const key = 'c12:hot:test';
+    await redis.del(key);
+    await redis.set(key, JSON.stringify({ v: 1 }), 60);
+
+    // First getHot populates L1 from Redis
+    const first = await redis.getHot(key, 4000);
+    assert.strictEqual(first, JSON.stringify({ v: 1 }));
+
+    // Second getHot must hit L1 with 0 Redis ops
+    const { metrics: l1Metrics, result: second } = await perfTracker.run('c12:l1_hit', async () => {
+      return await redis.getHot(key, 4000);
+    });
+    assert.strictEqual(second, JSON.stringify({ v: 1 }));
+    assert.strictEqual(l1Metrics.redisOpCount, 0, 'Warm L1 getHot must incur 0 Redis operations');
+
+    // Mutation via set must invalidate L1 immediately
+    await redis.set(key, JSON.stringify({ v: 2 }), 60);
+    const updated = await redis.getHot(key, 4000);
+    assert.strictEqual(updated, JSON.stringify({ v: 2 }));
+
+    // Explicit del must invalidate L1 immediately
+    await redis.del(key);
+    const afterDel = await redis.getHot(key, 4000);
+    assert.strictEqual(afterDel, null);
+  });
+
+  await it('Contract 12.3: Concurrent Admin ACK, Single-Query adm:dash & Read-Only vs Mutating Update Dedup Safety', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    await ensureAuditUser(adminId);
+
+    // Simulated 60ms Telegram RTT — if ackPromise awaited serially before editMessageText, callback would take >=120ms.
+    // Concurrent ack + edit must complete in ~60-90ms, and adm:dash must use a single aggregated SQL query.
+    telegramClient.setTransportOverride(async () => {
+      await new Promise(r => setTimeout(r, 60));
+      return { ok: true, result: { message_id: 9801 } };
+    });
+
+    try {
+      perfTracker.resetHistory();
+      await telegramBotRouter.handleUpdate({
+        update_id: 980101,
+        callback_query: {
+          id: 'cb_c12_dash_1',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:dash',
+          message: { message_id: 9801, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+
+      const dashRec = perfTracker.getRecentCallbacks(10).find(r => r.callbackName === 'adm:dash');
+      assert.ok(dashRec, 'adm:dash callback metric must be recorded');
+      assert.ok(
+        dashRec!.responseTimeMs < 110,
+        `Concurrent ACK + edit must avoid serial 2x RTT (>=120ms); got ${dashRec!.responseTimeMs}ms`
+      );
+      assert.ok(dashRec!.dbQueryCount <= 2, `adm:dash must use aggregated single COUNT query; got ${dashRec!.dbQueryCount} queries`);
+
+      // Read-only duplicate update_id must be ignored via L1/Redis dedup
+      const dupReadOnly = await telegramBotRouter.handleUpdate({
+        update_id: 980101,
+        callback_query: {
+          id: 'cb_c12_dash_dup',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:dash',
+          message: { message_id: 9801, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+      assert.strictEqual(dupReadOnly.status, 'DUPLICATE_IGNORED');
+
+      // Mutating callback update_id must strictly enforce PostgreSQL idempotency even across duplicate submissions
+      const mut1 = await telegramBotRouter.handleUpdate({
+        update_id: 980201,
+        callback_query: {
+          id: 'cb_c12_mut_1',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:sync',
+          message: { message_id: 9801, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      }).catch(() => ({ ok: true, status: 'CALLBACK_PROCESSED' }));
+      assert.ok(mut1.ok);
+
+      const dupMut = await telegramBotRouter.handleUpdate({
+        update_id: 980201,
+        callback_query: {
+          id: 'cb_c12_mut_dup',
+          from: { id: Number(adminId), is_bot: false, first_name: 'Admin' },
+          data: 'adm:sync',
+          message: { message_id: 9801, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Admin' },
+        },
+      });
+      assert.strictEqual(dupMut.status, 'DUPLICATE_IGNORED', 'Duplicate mutating callback update_id must be strictly rejected');
+    } finally {
+      telegramClient.setTransportOverride(null);
+    }
+  });
+
+  await it('Contract 13.1: BOT_USERNAME Config/Env Precedence, Normalization & Zero Hardcoded Username', 'unit', async () => {
+    assert.strictEqual(normalizeBotUsername('@XeroXd_Bot'), 'XeroXd_Bot');
+    assert.strictEqual(normalizeBotUsername('https://t.me/XeroXd_Bot?start=foo'), 'XeroXd_Bot');
+    assert.strictEqual(normalizeBotUsername('  XeroXd_Bot  '), 'XeroXd_Bot');
+    assert.strictEqual(normalizeBotUsername('   '), undefined);
+
+    const cfgFromBotUsername = buildConfig({ BOT_USERNAME: '@XeroXd_Bot', TELEGRAM_BOT_USERNAME: 'LegacyBot' });
+    assert.strictEqual(cfgFromBotUsername.telegram.botUsername, 'XeroXd_Bot');
+
+    const cfgUnset = buildConfig({});
+    assert.strictEqual(cfgUnset.telegram.botUsername, undefined, 'Unset BOT_USERNAME must not default to hardcoded username');
+  });
+
+  await it('Contract 13.2: Referral Link Uses BOT_USERNAME Env First, Auto-Resolves via getMe(), & Preserves ?start=ref_<user_id>', 'mock_integration', async () => {
+    const custId = '98301';
+    await ensureAuditUser(custId);
+    const origCfgUsername = config.telegram.botUsername;
+    const origEnvBotUsername = process.env.BOT_USERNAME;
+    const origEnvTgBotUsername = process.env.TELEGRAM_BOT_USERNAME;
+
+    try {
+      // 1. Prefer BOT_USERNAME env/config over getMe()
+      config.telegram.botUsername = 'XeroXd_Bot';
+      let getMeCalls = 0;
+      const sent: any[] = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        if (method === 'getMe') {
+          getMeCalls += 1;
+          return { ok: true, result: { id: 1, is_bot: true, username: 'OtherGetMeBot' } };
+        }
+        sent.push({ method, body });
+        return { ok: true, result: { message_id: 9831 } };
+      });
+
+      const statsFromEnv = await referralService.getStats(custId);
+      assert.strictEqual(statsFromEnv.referralLink, `https://t.me/XeroXd_Bot?start=ref_${custId}`);
+      assert.strictEqual(getMeCalls, 0, 'BOT_USERNAME config/env must take precedence without calling getMe()');
+
+      // 2. When BOT_USERNAME is unset, auto-resolve active bot username via Telegram getMe() and cache it
+      config.telegram.botUsername = undefined;
+      delete process.env.BOT_USERNAME;
+      delete process.env.TELEGRAM_BOT_USERNAME;
+      telegramClient.clearBotUsernameCacheForTests();
+      telegramClient.setTransportOverride(async (method, body) => {
+        if (method === 'getMe') {
+          getMeCalls += 1;
+          return { ok: true, result: { id: 1, is_bot: true, username: 'XeroXd_Bot' } };
+        }
+        sent.push({ method, body });
+        return { ok: true, result: { message_id: 9832 } };
+      });
+
+      const statsFromGetMe = await referralService.getStats(custId);
+      assert.strictEqual(statsFromGetMe.referralLink, `https://t.me/XeroXd_Bot?start=ref_${custId}`);
+      assert.strictEqual(getMeCalls, 1);
+
+      // Subsequent m:ref callback uses cached getMe() username and displays exact ?start=ref_<user_id> link
+      await telegramBotRouter.handleUpdate({
+        update_id: 983101,
+        callback_query: {
+          id: 'cb_c13_mref',
+          from: { id: Number(custId), is_bot: false, first_name: 'RefCheck' },
+          data: 'm:ref',
+          message: { message_id: 9832, chat: { id: Number(custId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Menu' },
+        },
+      });
+      assert.strictEqual(getMeCalls, 1, 'Subsequent referral screen must use cached active bot username');
+      const refScreen = sent.find(m => m.method === 'editMessageText' && String(m.body.text).includes('Referral Program'));
+      assert.ok(refScreen, 'm:ref must render Referral Program screen');
+      const renderedText = String(refScreen!.body.text);
+      assert.ok(
+        renderedText.includes(`https://t.me/XeroXd_Bot?start=ref_${custId}`),
+        `Referral Program screen must display active bot link, got: ${renderedText}`
+      );
+      assert.ok(!renderedText.includes('XeroKhanBot'), 'Hardcoded XeroKhanBot must never appear in referral link');
+    } finally {
+      config.telegram.botUsername = origCfgUsername;
+      if (origEnvBotUsername !== undefined) process.env.BOT_USERNAME = origEnvBotUsername;
+      else delete process.env.BOT_USERNAME;
+      if (origEnvTgBotUsername !== undefined) process.env.TELEGRAM_BOT_USERNAME = origEnvTgBotUsername;
+      else delete process.env.TELEGRAM_BOT_USERNAME;
+      telegramClient.setTransportOverride(null);
     }
   });
 

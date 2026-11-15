@@ -1,12 +1,14 @@
 import Redis from 'ioredis';
 import { config } from '../config/env.js';
 import { createLogger } from './logger.js';
+import { perfTracker } from './perfTracker.js';
 
 const logger = createLogger('Redis');
 
 export class RedisService {
   private client: Redis | null = null;
   private memoryCache: Map<string, { value: string; expiresAt?: number }> = new Map();
+  private l1HotCache: Map<string, { value: string; expiresAt: number }> = new Map();
   private isConnected = false;
 
   constructor() {
@@ -43,71 +45,122 @@ export class RedisService {
   }
 
   public async get(key: string): Promise<string | null> {
-    if (this.isConnected && this.client) {
-      try {
-        return await this.client.get(key);
-      } catch (err) {
-        // Fall back to memory
+    const start = performance.now();
+    try {
+      if (this.isConnected && this.client) {
+        try {
+          return await this.client.get(key);
+        } catch {
+          // Fall back to memory
+        }
       }
+
+      const item = this.memoryCache.get(key);
+      if (!item) return null;
+      if (item.expiresAt && Date.now() > item.expiresAt) {
+        this.memoryCache.delete(key);
+        return null;
+      }
+      return item.value;
+    } finally {
+      perfTracker.recordRedis(performance.now() - start, 1);
+    }
+  }
+
+  /**
+   * Short-TTL (3-5s) coherent in-process L1 read-through cache backed by Redis.
+   * Automatically invalidated on any local redis.set / redis.del / redis.setIfNotExists call.
+   */
+  public async getHot(key: string, l1TtlMs = 4000): Promise<string | null> {
+    const entry = this.l1HotCache.get(key);
+    const now = Date.now();
+    if (entry) {
+      if (now <= entry.expiresAt) {
+        return entry.value;
+      }
+      this.l1HotCache.delete(key);
     }
 
-    const item = this.memoryCache.get(key);
-    if (!item) return null;
-    if (item.expiresAt && Date.now() > item.expiresAt) {
-      this.memoryCache.delete(key);
-      return null;
+    const val = await this.get(key);
+    if (val !== null) {
+      if (this.l1HotCache.size >= 1000) {
+        const oldest = this.l1HotCache.keys().next().value;
+        if (oldest !== undefined) this.l1HotCache.delete(oldest);
+      }
+      this.l1HotCache.set(key, {
+        value: val,
+        expiresAt: now + Math.min(Math.max(500, l1TtlMs), 5000),
+      });
     }
-    return item.value;
+    return val;
   }
 
   public async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
-    if (this.isConnected && this.client) {
-      try {
-        if (ttlSeconds) {
-          await this.client.set(key, value, 'EX', ttlSeconds);
-        } else {
-          await this.client.set(key, value);
+    this.l1HotCache.delete(key);
+    const start = performance.now();
+    try {
+      if (this.isConnected && this.client) {
+        try {
+          if (ttlSeconds) {
+            await this.client.set(key, value, 'EX', ttlSeconds);
+          } else {
+            await this.client.set(key, value);
+          }
+          return;
+        } catch {
+          // Fall back to memory
         }
-        return;
-      } catch (err) {
-        // Fall back to memory
       }
-    }
 
-    const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined;
-    this.memoryCache.set(key, { value, expiresAt });
+      const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined;
+      this.memoryCache.set(key, { value, expiresAt });
+    } finally {
+      perfTracker.recordRedis(performance.now() - start, 1);
+    }
   }
 
   public async setIfNotExists(key: string, value: string, ttlSeconds: number): Promise<boolean> {
-    if (this.isConnected && this.client) {
-      try {
-        const res = await this.client.set(key, value, 'EX', ttlSeconds, 'NX');
-        return res === 'OK';
-      } catch (err) {
-        // Fall back to memory
+    this.l1HotCache.delete(key);
+    const start = performance.now();
+    try {
+      if (this.isConnected && this.client) {
+        try {
+          const res = await this.client.set(key, value, 'EX', ttlSeconds, 'NX');
+          return res === 'OK';
+        } catch {
+          // Fall back to memory
+        }
       }
-    }
 
-    const existing = this.memoryCache.get(key);
-    if (existing && (!existing.expiresAt || Date.now() <= existing.expiresAt)) {
-      return false;
-    }
+      const existing = this.memoryCache.get(key);
+      if (existing && (!existing.expiresAt || Date.now() <= existing.expiresAt)) {
+        return false;
+      }
 
-    const expiresAt = Date.now() + ttlSeconds * 1000;
-    this.memoryCache.set(key, { value, expiresAt });
-    return true;
+      const expiresAt = Date.now() + ttlSeconds * 1000;
+      this.memoryCache.set(key, { value, expiresAt });
+      return true;
+    } finally {
+      perfTracker.recordRedis(performance.now() - start, 1);
+    }
   }
 
   public async del(key: string): Promise<void> {
-    if (this.isConnected && this.client) {
-      try {
-        await this.client.del(key);
-        return;
-      } catch (err) {
-        // Fall back to memory
+    this.l1HotCache.delete(key);
+    const start = performance.now();
+    try {
+      if (this.isConnected && this.client) {
+        try {
+          await this.client.del(key);
+          return;
+        } catch {
+          // Fall back to memory
+        }
       }
+      this.memoryCache.delete(key);
+    } finally {
+      perfTracker.recordRedis(performance.now() - start, 1);
     }
-    this.memoryCache.delete(key);
   }
 
   public async getFsmState<T = any>(userId: string | number): Promise<T | null> {
@@ -145,6 +198,7 @@ export class RedisService {
       this.client = null;
     }
     this.memoryCache.clear();
+    this.l1HotCache.clear();
   }
 }
 

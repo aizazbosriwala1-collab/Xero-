@@ -1,4 +1,4 @@
-import { config } from '../config/env.js';
+import { config, normalizeBotUsername } from '../config/env.js';
 import {
   TelegramBotCommand,
   TelegramBotCommandScope,
@@ -9,6 +9,7 @@ import {
 } from './types.js';
 import { FALLBACK_TEXT_SYMBOL } from './buttonBuilder.js';
 import { uiConfigService } from '../services/uiConfig.js';
+import { perfTracker } from '../services/perfTracker.js';
 import { createLogger } from '../services/logger.js';
 
 const logger = createLogger('TelegramClient');
@@ -29,6 +30,10 @@ export class TelegramClient {
   private rejectedEmojiIds: Map<string, number> = new Map();
   private styleUnsupportedUntil = 0;
   private readonly capabilityCacheTtlMs = 10 * 60 * 1000;
+  private cachedBotUsername: string | null = null;
+  private cachedBotUsernameExpiresAt = 0;
+  private botUsernamePromise: Promise<string | undefined> | null = null;
+  private readonly botUsernameCacheTtlMs = 60 * 60 * 1000;
 
   constructor() {
     this.token = config.telegram.botToken;
@@ -37,6 +42,15 @@ export class TelegramClient {
 
   public setTransportOverride(fn: TelegramTransport | null): void {
     this.transportOverride = fn;
+    this.cachedBotUsername = null;
+    this.cachedBotUsernameExpiresAt = 0;
+    this.botUsernamePromise = null;
+  }
+
+  public clearBotUsernameCacheForTests(): void {
+    this.cachedBotUsername = null;
+    this.cachedBotUsernameExpiresAt = 0;
+    this.botUsernamePromise = null;
   }
 
   public clearCapabilityCacheForTests(): void {
@@ -216,10 +230,13 @@ export class TelegramClient {
   }
 
   private async postRaw(method: string, body: Record<string, any>): Promise<any> {
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     if (this.transportOverride) {
-      const mockRes = await this.transportOverride(method, body);
-      return mockRes;
+      try {
+        return await this.transportOverride(method, body);
+      } finally {
+        perfTracker.recordTelegramApi(performance.now() - startedAt);
+      }
     }
 
     if (!this.token) {
@@ -240,23 +257,26 @@ export class TelegramClient {
       clearTimeout(timeout);
 
       const data = await res.json();
-      const durationMs = Date.now() - startedAt;
+      const durationMs = performance.now() - startedAt;
+      perfTracker.recordTelegramApi(durationMs);
       if (!data.ok) {
         logger.warn('Telegram API method returned error', {
           method,
           errorCode: data.error_code,
           description: data.description,
-          durationMs,
+          durationMs: Math.round(durationMs * 100) / 100,
         });
       } else if (durationMs > 800) {
-        logger.info('Slow Telegram API call detected', { method, durationMs });
+        logger.info('Slow Telegram API call detected', { method, durationMs: Math.round(durationMs * 100) / 100 });
       }
       return data;
     } catch (err: any) {
+      const durationMs = performance.now() - startedAt;
+      perfTracker.recordTelegramApi(durationMs);
       logger.error('Telegram API request exception', {
         method,
         error: err.message,
-        durationMs: Date.now() - startedAt,
+        durationMs: Math.round(durationMs * 100) / 100,
       });
       return { ok: false, description: err.message };
     }
@@ -266,10 +286,14 @@ export class TelegramClient {
    * Safe post with short-TTL capability cache + automatic fallback degradation if Telegram rejects custom emojis or button styles.
    */
   private async post(method: string, body: Record<string, any>): Promise<any> {
+    const prepStart = performance.now();
     const preparedMarkup = this.preStripCachedUnsupported(
       body.reply_markup as TelegramInlineKeyboardMarkup | TelegramReplyKeyboardMarkup | undefined
     );
     const preparedBody = preparedMarkup !== body.reply_markup ? { ...body, reply_markup: preparedMarkup } : body;
+    if (body.reply_markup) {
+      perfTracker.recordRender(performance.now() - prepStart);
+    }
 
     const res = await this.postRaw(method, preparedBody);
     if (res?.ok) return res;
@@ -347,6 +371,53 @@ export class TelegramClient {
 
   public async getMe(): Promise<any> {
     return await this.post('getMe', {});
+  }
+
+  /**
+   * Resolve active Telegram bot username without any hardcoded fallback.
+   * Priority:
+   *   1. BOT_USERNAME (or TELEGRAM_BOT_USERNAME) from config / environment
+   *   2. Cached result from Telegram Bot API getMe() (1h TTL, single-flight)
+   */
+  public async getActiveBotUsername(): Promise<string | undefined> {
+    const configured =
+      normalizeBotUsername(config.telegram.botUsername) ||
+      normalizeBotUsername(process.env.BOT_USERNAME || process.env.TELEGRAM_BOT_USERNAME);
+    if (configured) {
+      return configured;
+    }
+
+    const now = Date.now();
+    if (this.cachedBotUsername && this.cachedBotUsernameExpiresAt > now) {
+      return this.cachedBotUsername;
+    }
+
+    if (!this.token && !this.transportOverride) {
+      return undefined;
+    }
+
+    if (!this.botUsernamePromise) {
+      this.botUsernamePromise = (async () => {
+        try {
+          const res = await this.getMe();
+          const username = normalizeBotUsername(res?.result?.username);
+          if (res?.ok && username) {
+            this.cachedBotUsername = username;
+            this.cachedBotUsernameExpiresAt = Date.now() + this.botUsernameCacheTtlMs;
+            logger.info('Resolved active Telegram bot username via getMe()', { username });
+            return username;
+          }
+          return undefined;
+        } catch (err: any) {
+          logger.warn('Failed to resolve active Telegram bot username via getMe()', { error: err?.message });
+          return undefined;
+        } finally {
+          this.botUsernamePromise = null;
+        }
+      })();
+    }
+
+    return await this.botUsernamePromise;
   }
 
   public async setWebhook(url: string, secretToken?: string): Promise<any> {

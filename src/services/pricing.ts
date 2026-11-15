@@ -99,7 +99,7 @@ export class PricingService {
 
   private async getCatalogVersion(): Promise<string> {
     try {
-      const v = await redis.get(this.catalogVersionKey);
+      const v = await redis.getHot(this.catalogVersionKey, 4000);
       if (v) return v;
       const init = String(Date.now());
       await redis.set(this.catalogVersionKey, init, 3600);
@@ -109,9 +109,9 @@ export class PricingService {
     }
   }
 
-  private async getGlobalPricingSettings(): Promise<{ defaultPercentMarkup?: string; defaultFixedMarkup?: string }> {
+  public async getGlobalPricingSettings(): Promise<{ defaultPercentMarkup?: string; defaultFixedMarkup?: string; minMarkupFloor?: string }> {
     try {
-      const cached = await redis.get(this.globalRuleCacheKey);
+      const cached = await redis.getHot(this.globalRuleCacheKey, 4000);
       if (cached) return JSON.parse(cached);
     } catch {
       // Cache miss
@@ -151,7 +151,7 @@ export class PricingService {
   public async getCategories(visibleOnly = true): Promise<Array<{ id: string; slug: string; name: string; isVisible: boolean }>> {
     const cacheKey = visibleOnly ? 'cat:list:vis' : 'cat:list:all';
     try {
-      const cached = await redis.get(cacheKey);
+      const cached = await redis.getHot(cacheKey, 4000);
       if (cached) return JSON.parse(cached);
     } catch {
       // Cache miss
@@ -176,7 +176,7 @@ export class PricingService {
    */
   public async getCategoryProductCounts(): Promise<{ counts: Record<string, number>; totalActive: number }> {
     try {
-      const cached = await redis.get(this.categoryCountsCacheKey);
+      const cached = await redis.getHot(this.categoryCountsCacheKey, 4000);
       if (cached) return JSON.parse(cached);
     } catch {
       // Cache miss
@@ -210,7 +210,7 @@ export class PricingService {
    */
   public async calculatePrice(productId: string): Promise<ResolvedPrice> {
     const cacheKey = `price:${productId}`;
-    const cached = await redis.get(cacheKey);
+    const cached = await redis.getHot(cacheKey, 4000);
     if (cached) {
       try {
         const parsed = JSON.parse(cached);
@@ -385,37 +385,49 @@ export class PricingService {
     const ver = await this.getCatalogVersion();
     const itemCacheKey = `catalog:item:v${ver}:${productId}`;
     try {
-      const cached = await redis.get(itemCacheKey);
+      const cached = await redis.getHot(itemCacheKey, 4000);
       if (cached) return JSON.parse(cached) as ProductCatalogItem;
     } catch {
       // Cache miss
     }
 
-    const row = await db.queryRow<any>(
-      `SELECT sp.id, sp.supplier_product_id as "supplierProductId",
-              sp.original_name as "originalName",
-              sp.original_description as "originalDescription",
-              sp.latest_cost as "latestCost",
-              sp.latest_stock as "latestStock",
-              sp.is_unlimited as "isUnlimited",
-              sp.requires_email as "requiresEmail",
-              sp.supplier_type as "supplierType",
-              sp.duration, sp.warranty_summary as "warrantySummary",
-              sp.is_available as "isAvailable",
-              po.display_name_override as "displayNameOverride",
-              po.description_override as "descriptionOverride",
-              po.is_hidden as "isHidden",
-              po.is_featured as "isFeatured",
-              pc.id as "catId", pc.slug as "catSlug", pc.name as "catName"
-       FROM supplier_products sp
-       LEFT JOIN product_overrides po ON sp.id = po.product_id
-       LEFT JOIN product_categories pc ON po.category_id = pc.id
-       WHERE sp.id = $1`,
-      [productId]
-    );
+    const [row, globalSettings] = await Promise.all([
+      db.queryRow<any>(
+        `SELECT sp.id, sp.supplier_product_id as "supplierProductId",
+                sp.original_name as "originalName",
+                sp.original_description as "originalDescription",
+                sp.latest_cost as "latestCost",
+                sp.latest_stock as "latestStock",
+                sp.is_unlimited as "isUnlimited",
+                sp.requires_email as "requiresEmail",
+                sp.supplier_type as "supplierType",
+                sp.duration, sp.warranty_summary as "warrantySummary",
+                sp.is_available as "isAvailable",
+                po.fixed_retail_price as "fixedRetailPrice",
+                po.fixed_markup as "fixedMarkup",
+                po.percent_markup as "percentMarkup",
+                po.display_name_override as "displayNameOverride",
+                po.description_override as "descriptionOverride",
+                po.is_hidden as "isHidden",
+                po.is_featured as "isFeatured",
+                pc.id as "catId", pc.slug as "catSlug", pc.name as "catName"
+         FROM supplier_products sp
+         LEFT JOIN product_overrides po ON sp.id = po.product_id
+         LEFT JOIN product_categories pc ON po.category_id = pc.id
+         WHERE sp.id = $1`,
+        [productId]
+      ),
+      this.getGlobalPricingSettings(),
+    ]);
     if (!row) return null;
 
-    const priceCalc = await this.calculatePrice(row.id);
+    const priceCalc = this.resolvePriceSync(
+      row.latestCost,
+      row.fixedRetailPrice,
+      row.fixedMarkup,
+      row.percentMarkup,
+      globalSettings
+    );
     const item: ProductCatalogItem = {
       id: row.id,
       supplierProductId: row.supplierProductId,
@@ -451,7 +463,7 @@ export class PricingService {
     const ver = await this.getCatalogVersion();
     const key = `catalog:ids:v${ver}:${catId || 'all'}`;
     try {
-      const cached = await redis.get(key);
+      const cached = await redis.getHot(key, 4000);
       if (cached) return JSON.parse(cached) as string[];
     } catch {
       // Cache miss
@@ -495,13 +507,13 @@ export class PricingService {
     const pageSize = Math.min(250, Math.max(1, params.pageSize || 10));
     const offset = (page - 1) * pageSize;
 
-    const cacheable = !params.search && !params.includeHidden;
+    const cacheable = !params.search;
     let catalogCacheKey = '';
     if (cacheable) {
       const ver = await this.getCatalogVersion();
-      catalogCacheKey = `catalog:p:v${ver}:${params.categoryId || 'all'}:${Boolean(params.featuredOnly)}:${page}:${pageSize}`;
+      catalogCacheKey = `catalog:p:v${ver}:${params.categoryId || 'all'}:${Boolean(params.featuredOnly)}:${Boolean(params.includeHidden)}:${page}:${pageSize}`;
       try {
-        const cached = await redis.get(catalogCacheKey);
+        const cached = await redis.getHot(catalogCacheKey, 4000);
         if (cached) return JSON.parse(cached) as { items: ProductCatalogItem[]; total: number };
       } catch {
         // Cache miss
@@ -538,17 +550,16 @@ export class PricingService {
       paramIndex++;
     }
 
-    // Count query
+    const countParams = [...queryParams];
+    const itemParams = [...queryParams, pageSize, offset];
+
     const countSql = `
       SELECT COUNT(*) as count
       FROM supplier_products sp
       LEFT JOIN product_overrides po ON sp.id = po.product_id
       ${whereClause}
     `;
-    const countRes = await db.queryRow<{ count: string }>(countSql, queryParams);
-    const total = parseInt(countRes?.count || '0', 10);
 
-    // Items query (single query includes pricing override columns — zero N+1 calculatePrice queries)
     const itemsSql = `
       SELECT sp.id, sp.supplier_product_id as "supplierProductId",
              sp.original_name as "originalName",
@@ -575,12 +586,13 @@ export class PricingService {
       ORDER BY po.is_featured DESC NULLS LAST, sp.original_name ASC
       LIMIT $${paramIndex++} OFFSET $${paramIndex++}
     `;
-    queryParams.push(pageSize, offset);
 
-    const [rowsRes, globalSettings] = await Promise.all([
-      db.query<any>(itemsSql, queryParams),
+    const [countRes, rowsRes, globalSettings] = await Promise.all([
+      db.queryRow<{ count: string }>(countSql, countParams),
+      db.query<any>(itemsSql, itemParams),
       this.getGlobalPricingSettings(),
     ]);
+    const total = parseInt(countRes?.count || '0', 10);
 
     const items: ProductCatalogItem[] = rowsRes.rows.map(r => {
       const priceCalc = this.resolvePriceSync(

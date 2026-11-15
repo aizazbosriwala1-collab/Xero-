@@ -1052,36 +1052,37 @@ export class OrderService {
     createdAt: string;
     updatedAt: string;
   } | null> {
-    const row = await db.queryRow<any>(
-      `SELECT lo.id,
-              lo.user_id as "userId",
-              u.username as "customerUsername",
-              u.first_name as "customerFirstName",
-              lo.product_id as "productId",
-              sp.original_name as "productName",
-              lo.quantity,
-              lo.total_price as "totalPrice",
-              lo.status,
-              lo.error_message as "errorMessage",
-              COALESCE(so.idempotency_key, lo.idempotency_key) as "idempotencyKey",
-              so.supplier_order_ref as "supplierOrderRef",
-              so.supplier_status as "supplierStatus",
-              lo.created_at as "createdAt",
-              lo.updated_at as "updatedAt"
-       FROM local_orders lo
-       LEFT JOIN supplier_orders so ON so.local_order_id = lo.id
-       LEFT JOIN supplier_products sp ON sp.id = lo.product_id
-       LEFT JOIN users u ON u.id = lo.user_id
-       WHERE lo.id = $1`,
-      [orderId]
-    );
+    const [row, delCountRes] = await Promise.all([
+      db.queryRow<any>(
+        `SELECT lo.id,
+                lo.user_id as "userId",
+                u.username as "customerUsername",
+                u.first_name as "customerFirstName",
+                lo.product_id as "productId",
+                sp.original_name as "productName",
+                lo.quantity,
+                lo.total_price as "totalPrice",
+                lo.status,
+                lo.error_message as "errorMessage",
+                COALESCE(so.idempotency_key, lo.idempotency_key) as "idempotencyKey",
+                so.supplier_order_ref as "supplierOrderRef",
+                so.supplier_status as "supplierStatus",
+                lo.created_at as "createdAt",
+                lo.updated_at as "updatedAt"
+         FROM local_orders lo
+         LEFT JOIN supplier_orders so ON so.local_order_id = lo.id
+         LEFT JOIN supplier_products sp ON sp.id = lo.product_id
+         LEFT JOIN users u ON u.id = lo.user_id
+         WHERE lo.id = $1`,
+        [orderId]
+      ),
+      db.queryRow<{ c: string }>(
+        'SELECT COUNT(*) as c FROM delivered_items WHERE local_order_id = $1',
+        [orderId]
+      ),
+    ]);
 
     if (!row) return null;
-
-    const delCountRes = await db.queryRow<{ c: string }>(
-      'SELECT COUNT(*) as c FROM delivered_items WHERE local_order_id = $1',
-      [orderId]
-    );
 
     return {
       id: row.id,
@@ -1137,43 +1138,41 @@ export class OrderService {
       createdAt: string;
     }>;
   } | null> {
-    const lo = await db.queryRow<any>(
-      `SELECT id, user_id as "userId", status, error_message as "errorMessage",
-              created_at as "createdAt", updated_at as "updatedAt"
-       FROM local_orders WHERE id = $1`,
-      [orderId]
-    );
+    const [lo, so, del, ledger, audits] = await Promise.all([
+      db.queryRow<any>(
+        `SELECT id, user_id as "userId", status, error_message as "errorMessage",
+                created_at as "createdAt", updated_at as "updatedAt"
+         FROM local_orders WHERE id = $1`,
+        [orderId]
+      ),
+      db.queryRow<any>(
+        `SELECT supplier_order_ref as "supplierOrderRef", supplier_status as "supplierStatus",
+                created_at as "createdAt", updated_at as "updatedAt"
+         FROM supplier_orders WHERE local_order_id = $1`,
+        [orderId]
+      ),
+      db.queryRow<any>(
+        `SELECT COUNT(*) as c, MIN(delivered_at) as "firstDeliveredAt"
+         FROM delivered_items WHERE local_order_id = $1`,
+        [orderId]
+      ),
+      db.query<any>(
+        `SELECT entry_type as "entryType", amount, operation_ref as "operationRef", created_at as "createdAt"
+         FROM ledger_entries
+         WHERE operation_ref IN ($1, $2)
+         ORDER BY created_at ASC`,
+        [`PURCHASE_${orderId}`, `REFUND_${orderId}`]
+      ),
+      db.query<any>(
+        `SELECT action, admin_id as "adminId", details, created_at as "createdAt"
+         FROM admin_audit_logs
+         WHERE target_entity = 'local_orders' AND target_id = $1
+         ORDER BY created_at DESC
+         LIMIT 10`,
+        [orderId]
+      ),
+    ]);
     if (!lo) return null;
-
-    const so = await db.queryRow<any>(
-      `SELECT supplier_order_ref as "supplierOrderRef", supplier_status as "supplierStatus",
-              created_at as "createdAt", updated_at as "updatedAt"
-       FROM supplier_orders WHERE local_order_id = $1`,
-      [orderId]
-    );
-
-    const del = await db.queryRow<any>(
-      `SELECT COUNT(*) as c, MIN(delivered_at) as "firstDeliveredAt"
-       FROM delivered_items WHERE local_order_id = $1`,
-      [orderId]
-    );
-
-    const ledger = await db.query<any>(
-      `SELECT entry_type as "entryType", amount, operation_ref as "operationRef", created_at as "createdAt"
-       FROM ledger_entries
-       WHERE operation_ref IN ($1, $2)
-       ORDER BY created_at ASC`,
-      [`PURCHASE_${orderId}`, `REFUND_${orderId}`]
-    );
-
-    const audits = await db.query<any>(
-      `SELECT action, admin_id as "adminId", details, created_at as "createdAt"
-       FROM admin_audit_logs
-       WHERE target_entity = 'local_orders' AND target_id = $1
-       ORDER BY created_at DESC
-       LIMIT 10`,
-      [orderId]
-    );
 
     return {
       order: {

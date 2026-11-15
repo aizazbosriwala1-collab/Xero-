@@ -88,7 +88,7 @@ export class ManualPaymentService {
    */
   public async getDepositSettings(): Promise<DepositSettings> {
     try {
-      const cached = await redis.get(this.settingsCacheKey);
+      const cached = await redis.getHot(this.settingsCacheKey, 4000);
       if (cached) return JSON.parse(cached) as DepositSettings;
     } catch {
       // Cache miss
@@ -243,7 +243,7 @@ export class ManualPaymentService {
   public async getPaymentMethods(includeDisabled = false): Promise<PaymentMethodConfig[]> {
     const cacheKey = includeDisabled ? this.methodsCacheKeyAll : this.methodsCacheKeyActive;
     try {
-      const cached = await redis.get(cacheKey);
+      const cached = await redis.getHot(cacheKey, 4000);
       if (cached) return JSON.parse(cached) as PaymentMethodConfig[];
     } catch {
       // Cache miss

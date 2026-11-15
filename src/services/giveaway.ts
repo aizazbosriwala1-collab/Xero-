@@ -151,11 +151,14 @@ export class GiveawayService {
    * Get active, public, currently-running giveaways for customer display (Redis-cached 60s),
    * annotated with user progress using a single batched claims query (no N+1).
    */
-  public async getActiveGiveaways(userId?: string): Promise<GiveawayItem[]> {
+  public async getActiveGiveaways(
+    userId?: string,
+    options?: { knownStats?: { totalReferred: number; qualifiedCount: number } }
+  ): Promise<GiveawayItem[]> {
     const now = Date.now();
     let rawRows: any[] | null = null;
     try {
-      const cached = await redis.get(this.activeRawCacheKey);
+      const cached = await redis.getHot(this.activeRawCacheKey, 4000);
       if (cached) rawRows = JSON.parse(cached);
     } catch {
       // Cache miss
@@ -197,12 +200,12 @@ export class GiveawayService {
       return true;
     });
 
-    let userStats: { totalReferred: number; qualifiedCount: number } | undefined;
+    let userStats: { totalReferred: number; qualifiedCount: number } | undefined = options?.knownStats;
     const claimMap = new Map<string, 'PENDING' | 'FULFILLED' | 'REJECTED'>();
 
     if (userId) {
       const [stats, claimsRes] = await Promise.all([
-        referralService.getStats(userId),
+        userStats ? Promise.resolve(userStats) : referralService.getStats(userId),
         db.query<{ giveaway_id: string; status: 'PENDING' | 'FULFILLED' | 'REJECTED' }>(
           'SELECT giveaway_id, status FROM giveaway_claims WHERE user_id = $1',
           [userId]
@@ -329,7 +332,7 @@ export class GiveawayService {
       throw new Error('You have already claimed this giveaway reward.');
     }
 
-    const stats = await referralService.getStats(userId, 'XeroKhanBot', { bypassCache: true });
+    const stats = await referralService.getStats(userId, undefined, { bypassCache: true });
     const reqTotal = Number(giveaway.required_total_referrals || 0);
     const reqQual = Number(giveaway.required_qualified_referrals || 0);
 
@@ -654,7 +657,7 @@ export class GiveawayService {
 
   public async getSettings(): Promise<{ enabled: boolean; defaultClaimLimit: number; notifyAdminOnClaim: boolean }> {
     try {
-      const cached = await redis.get(this.cfgCacheKey);
+      const cached = await redis.getHot(this.cfgCacheKey, 4000);
       if (cached) return JSON.parse(cached);
     } catch {
       // Cache miss

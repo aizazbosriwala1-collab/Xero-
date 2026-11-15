@@ -54,7 +54,7 @@ export class ChannelService {
 
   public async getConfig(): Promise<ChannelSettingsConfig> {
     try {
-      const cached = await redis.get(this.cfgCacheKey);
+      const cached = await redis.getHot(this.cfgCacheKey, 4000);
       if (cached) {
         const parsed = JSON.parse(cached);
         return {
@@ -106,7 +106,7 @@ export class ChannelService {
   public async listChannels(activeOnly = false): Promise<RequiredChannel[]> {
     if (!activeOnly) {
       try {
-        const cached = await redis.get(this.listCacheKey);
+        const cached = await redis.getHot(this.listCacheKey, 4000);
         if (cached) return JSON.parse(cached) as RequiredChannel[];
       } catch {
         // Fallback to DB
@@ -262,7 +262,12 @@ export class ChannelService {
     userId: string | number,
     options?: { forceRefresh?: boolean }
   ): Promise<MembershipCheckResult> {
-    const [cfg, channels] = await Promise.all([this.getConfig(), this.listChannels(true)]);
+    const cacheKey = `chan_ok:${String(userId)}`;
+    const [cfg, channels, cachedOk] = await Promise.all([
+      this.getConfig(),
+      this.listChannels(true),
+      !options?.forceRefresh ? redis.getHot(cacheKey, 4000).catch(() => null) : Promise.resolve(null),
+    ]);
 
     if (!cfg.verificationEnabled || channels.length === 0) {
       return {
@@ -274,18 +279,14 @@ export class ChannelService {
       };
     }
 
-    const cacheKey = `chan_ok:${String(userId)}`;
-    if (!options?.forceRefresh) {
-      const cachedOk = await redis.get(cacheKey).catch(() => null);
-      if (cachedOk === '1') {
-        return {
-          verificationEnabled: true,
-          allowed: true,
-          cached: true,
-          missingChannels: [],
-          details: channels.map(ch => ({ channel: ch, joined: true, memberStatus: 'cached_member' })),
-        };
-      }
+    if (!options?.forceRefresh && cachedOk === '1') {
+      return {
+        verificationEnabled: true,
+        allowed: true,
+        cached: true,
+        missingChannels: [],
+        details: channels.map(ch => ({ channel: ch, joined: true, memberStatus: 'cached_member' })),
+      };
     }
 
     const details = await Promise.all(

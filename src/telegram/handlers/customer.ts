@@ -167,14 +167,15 @@ export class CustomerHandler {
     messageId: number | undefined,
     userId: string,
     text: string,
-    reply_markup: any
+    reply_markup: any,
+    options?: { skipNavSaveIfEdited?: boolean }
   ) {
     const res = messageId
       ? await telegramClient.editMessageText(chatId, messageId, text, { reply_markup })
       : await telegramClient.sendMessage(chatId, text, { reply_markup });
 
     const resolvedMsgId = res?.result?.message_id ?? messageId;
-    if (resolvedMsgId) {
+    if (resolvedMsgId && !(options?.skipNavSaveIfEdited && messageId && resolvedMsgId === messageId)) {
       await navigationService.saveState(userId, { activeMessageId: resolvedMsgId });
     }
     return res;
@@ -186,7 +187,7 @@ export class CustomerHandler {
   public async handleCallback(cb: TelegramCallbackQuery) {
     if (!cb.data) return;
 
-    // Immediate callback acknowledgment before DB/UI lookups so Telegram stops spinner immediately
+    // Immediate callback acknowledgment concurrently with DB/UI/Telegram work
     const ackPromise =
       cb.id && cb.id !== '0'
         ? telegramClient.answerCallbackQuery(cb.id).catch(() => {})
@@ -195,23 +196,64 @@ export class CustomerHandler {
     const chatId = cb.message?.chat.id ?? cb.from.id;
     const messageId = cb.message?.message_id;
     const userId = String(cb.from.id);
-    let data = cb.data;
+    const data = cb.data;
     const isAdmin = config.telegram.adminIds.includes(userId);
 
-    const [, lang] = await Promise.all([uiConfigService.ensureLoaded(), getUserLanguage(userId)]);
+    try {
+      await this.dispatchCallback(chatId, messageId, userId, data, isAdmin);
+    } finally {
+      await ackPromise;
+    }
+  }
+
+  private async dispatchCallback(
+    chatId: number,
+    messageId: number | undefined,
+    userId: string,
+    rawData: string,
+    isAdmin: boolean
+  ): Promise<void> {
+    let data = rawData;
+    const gatedPrefixes = [
+      'm:home',
+      'm:prod',
+      'catp:',
+      'm:feat',
+      'feat:',
+      'm:srch',
+      'srch:',
+      'cat:',
+      'p:',
+      'qty:',
+      'buy:',
+      'buyc:',
+      'm:give',
+      'gw_cl:',
+      'm:ref',
+      'ref_cl:',
+      'm:dep',
+      'dep_m:',
+    ];
+    const isNavRoute = data.startsWith('nav:');
+    const isInitiallyGated =
+      isNavRoute || gatedPrefixes.some(p => (p.endsWith(':') ? data.startsWith(p) : data === p));
+
+    const [, lang, navCheck, maint, membershipGate] = await Promise.all([
+      uiConfigService.ensureLoaded(),
+      getUserLanguage(userId),
+      isNavRoute ? navigationService.validateToken(userId, data.split(':')[1]) : Promise.resolve(null),
+      isInitiallyGated && !isAdmin ? settingsService.getMaintenanceConfig() : Promise.resolve(null),
+      isInitiallyGated ? channelService.checkUserMembership(userId) : Promise.resolve(null),
+    ]);
 
     if (data === 'noop') {
-      await ackPromise;
       return;
     }
 
     // Stale token validation route
-    if (data.startsWith('nav:')) {
-      const [, token] = data.split(':');
-      const check = await navigationService.validateToken(userId, token);
-      if (!check.valid) {
+    if (isNavRoute) {
+      if (!navCheck?.valid) {
         await this.renderMenu(chatId, messageId, userId, t('stale_menu', lang), getStaleMenuKeyboard(lang));
-        await ackPromise;
         return;
       }
       data = 'm:home';
@@ -219,60 +261,66 @@ export class CustomerHandler {
 
     // Verify Required Channels Membership
     if (data === 'ch:verify') {
-      const membership = await channelService.checkUserMembership(userId, { forceRefresh: true });
+      const [membership, navState] = await Promise.all([
+        channelService.checkUserMembership(userId, { forceRefresh: true }),
+        navigationService.getState(userId),
+      ]);
       if (!membership.allowed) {
         await this.sendRequiredChannelsGate(chatId, messageId, userId, membership.missingChannels, lang, true);
-        await ackPromise;
         return;
       }
 
-      const [navState] = await Promise.all([
-        navigationService.getState(userId),
-        navigationService.saveState(userId, { screen: 'home', categoryId: 'all', page: 1 }),
-      ]);
       const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
-      await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, lang));
-      if (navState?.filters?.replyKbVersion !== 'v2_2btn') {
-        await telegramClient.sendMessage(chatId, '⚡ Quick actions enabled below: Deposit or Support.', {
-          disable_notification: true,
-          reply_markup: getCustomerMainReplyKeyboard(lang),
-        });
-        await navigationService.saveState(userId, {
-          filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' },
-        });
-      }
-      await ackPromise;
+      const needsReplyKb = navState?.filters?.replyKbVersion !== 'v2_2btn';
+      await Promise.all([
+        this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, lang), {
+          skipNavSaveIfEdited: true,
+        }),
+        needsReplyKb
+          ? telegramClient.sendMessage(chatId, '⚡ Quick actions enabled below: Deposit or Support.', {
+              disable_notification: true,
+              reply_markup: getCustomerMainReplyKeyboard(lang),
+            })
+          : Promise.resolve(),
+        navigationService.saveState(userId, {
+          screen: 'home',
+          categoryId: 'all',
+          page: 1,
+          ...(messageId ? { activeMessageId: messageId } : {}),
+          ...(needsReplyKb ? { filters: { ...(navState?.filters || {}), replyKbVersion: 'v2_2btn' } } : {}),
+          existingState: navState,
+        }),
+      ]);
       return;
     }
 
-    // Check Maintenance Mode & Required Channel Membership before shop/wallet/order actions
-    const gatedPrefixes = ['m:home', 'm:prod', 'catp:', 'm:feat', 'feat:', 'm:srch', 'srch:', 'cat:', 'p:', 'qty:', 'buy:', 'buyc:', 'm:give', 'gw_cl:', 'm:ref', 'ref_cl:', 'm:dep', 'dep_m:'];
-    if (gatedPrefixes.some(p => (p.endsWith(':') ? data.startsWith(p) : data === p))) {
-      if (!isAdmin) {
-        const maint = await settingsService.getMaintenanceConfig();
-        if (maint.enabled) {
-          await this.renderMenu(chatId, messageId, userId, maint.message, getBackHomeKeyboard('m:supp', lang));
-          await ackPromise;
-          return;
-        }
+    // Enforce Maintenance Mode & Required Channel Membership fetched concurrently above
+    if (isInitiallyGated) {
+      if (maint?.enabled) {
+        await this.renderMenu(chatId, messageId, userId, maint.message, getBackHomeKeyboard('m:supp', lang));
+        return;
       }
-      const membership = await channelService.checkUserMembership(userId);
-      if (!membership.allowed) {
-        await this.sendRequiredChannelsGate(chatId, messageId, userId, membership.missingChannels, lang, false);
-        await ackPromise;
+      if (membershipGate && !membershipGate.allowed) {
+        await this.sendRequiredChannelsGate(chatId, messageId, userId, membershipGate.missingChannels, lang, false);
         return;
       }
     }
 
     // Navigation: Home
     if (data === 'm:home') {
+      const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
       await Promise.all([
         redis.clearFsmState(userId),
-        navigationService.saveState(userId, { screen: 'home', categoryId: 'all', page: 1 }),
+        navigationService.saveState(userId, {
+          screen: 'home',
+          categoryId: 'all',
+          page: 1,
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, lang), {
+          skipNavSaveIfEdited: true,
+        }),
       ]);
-      const welcomeText = uiConfigService.getText('msg.welcome', lang) || t('welcome', lang);
-      await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, lang));
-      await ackPromise;
       return;
     }
 
@@ -283,18 +331,25 @@ export class CustomerHandler {
         pricingService.getCategories(true),
         pricingService.getCategoryProductCounts(),
       ]);
-      await navigationService.saveState(userId, { screen: 'categories', page: catPage });
       const baseHeader = uiConfigService.getText('msg.categories_header', lang) || t('categories_header', lang);
       const text =
         `${baseHeader}\n\n` +
         `📦 *Live Inventory:* \`${catCounts.totalActive}\` verified tools in stock`;
-      await this.renderMenu(
-        chatId,
-        messageId,
-        userId,
-        text,
-        getCategoryKeyboard(categories, lang, catPage, catCounts.counts)
-      );
+      await Promise.all([
+        navigationService.saveState(userId, {
+          screen: 'categories',
+          page: catPage,
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          text,
+          getCategoryKeyboard(categories, lang, catPage, catCounts.counts),
+          { skipNavSaveIfEdited: true }
+        ),
+      ]);
       return;
     }
 
@@ -323,21 +378,29 @@ export class CustomerHandler {
       }
 
       const totalPages = Math.max(1, Math.ceil(catalog.total / pageSize));
-      await navigationService.saveState(userId, { screen: 'featured', categoryId: 'all', page });
-      await this.renderMenu(
-        chatId,
-        messageId,
-        userId,
-        t('featured_header', lang, { page, totalPages }),
-        getProductListKeyboard({
-          products: catalog.items.map(p => ({ id: p.id, name: `⭐ ${p.name}`, sellingPrice: p.sellingPrice })),
+      await Promise.all([
+        navigationService.saveState(userId, {
+          screen: 'featured',
+          categoryId: 'all',
           page,
-          totalPages,
-          catId: 'all',
-          lang,
-          paginationPrefix: 'feat',
-        })
-      );
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          t('featured_header', lang, { page, totalPages }),
+          getProductListKeyboard({
+            products: catalog.items.map(p => ({ id: p.id, name: `⭐ ${p.name}`, sellingPrice: p.sellingPrice })),
+            page,
+            totalPages,
+            catId: 'all',
+            lang,
+            paginationPrefix: 'feat',
+          }),
+          { skipNavSaveIfEdited: true }
+        ),
+      ]);
       return;
     }
 
@@ -385,24 +448,32 @@ export class CustomerHandler {
         `Browse our live inventory below. Tap any product to view details and purchase:\n` +
         `_Showing ${catalog.items.length} of ${catalog.total} items (Page ${page} of ${totalPages})_`;
 
-      await navigationService.saveState(userId, { screen: 'catalog', categoryId: catId, page });
-      await this.renderMenu(
-        chatId,
-        messageId,
-        userId,
-        listHeader,
-        getProductListKeyboard({
-          products: catalog.items.map(p => ({
-            id: p.id,
-            name: p.isFeatured ? `⭐ ${p.name}` : p.name,
-            sellingPrice: p.sellingPrice,
-          })),
+      await Promise.all([
+        navigationService.saveState(userId, {
+          screen: 'catalog',
+          categoryId: catId,
           page,
-          totalPages,
-          catId,
-          lang,
-        })
-      );
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          listHeader,
+          getProductListKeyboard({
+            products: catalog.items.map(p => ({
+              id: p.id,
+              name: p.isFeatured ? `⭐ ${p.name}` : p.name,
+              sellingPrice: p.sellingPrice,
+            })),
+            page,
+            totalPages,
+            catId,
+            lang,
+          }),
+          { skipNavSaveIfEdited: true }
+        ),
+      ]);
       return;
     }
 
@@ -410,8 +481,17 @@ export class CustomerHandler {
     if (data.startsWith('p:')) {
       const [, productId, catId = 'all', pageStr = '1'] = data.split(':');
       const page = Math.max(1, parseInt(pageStr || '1', 10));
-      await navigationService.saveState(userId, { screen: 'product', productId, categoryId: catId, page, quantity: 1 });
-      await this.showProductDetail(chatId, messageId, productId, 1, catId, page, lang);
+      await Promise.all([
+        navigationService.saveState(userId, {
+          screen: 'product',
+          productId,
+          categoryId: catId,
+          page,
+          quantity: 1,
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.showProductDetail(chatId, messageId, productId, 1, catId, page, lang),
+      ]);
       return;
     }
 
@@ -420,8 +500,16 @@ export class CustomerHandler {
       const [, productId, qtyStr, backCatId = 'all', pageStr = '1'] = data.split(':');
       const qty = Math.max(1, Math.min(50, parseInt(qtyStr || '1', 10)));
       const page = Math.max(1, parseInt(pageStr || '1', 10));
-      await navigationService.saveState(userId, { productId, categoryId: backCatId, page, quantity: qty });
-      await this.showProductDetail(chatId, messageId, productId, qty, backCatId, page, lang);
+      await Promise.all([
+        navigationService.saveState(userId, {
+          productId,
+          categoryId: backCatId,
+          page,
+          quantity: qty,
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.showProductDetail(chatId, messageId, productId, qty, backCatId, page, lang),
+      ]);
       return;
     }
 
@@ -432,8 +520,15 @@ export class CustomerHandler {
 
       const [, productId, qtyStr] = data.split(':');
       const qty = Math.max(1, parseInt(qtyStr || '1', 10));
-      const product = await db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]);
-      if (!product || !product.is_available) {
+
+      const [product, priceInfo, walletBal, navState] = await Promise.all([
+        db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]),
+        pricingService.calculatePrice(productId).catch(() => null),
+        walletService.getBalance(userId),
+        navigationService.getState(userId),
+      ]);
+
+      if (!product || !product.is_available || !priceInfo) {
         await this.renderMenu(chatId, messageId, userId, '⚠️ This product is currently unavailable.', getBackHomeKeyboard('m:prod', lang));
         return;
       }
@@ -449,32 +544,33 @@ export class CustomerHandler {
         return;
       }
 
-      const priceInfo = await pricingService.calculatePrice(productId);
       const totalDec = priceInfo.customerUnitPrice.times(qty);
       const checkoutIdempotencyKey = `SUPPLIER_ORD_CHK_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
       if (product.requires_email) {
-        await redis.setFsmState(userId, {
-          step: 'AWAITING_EMAIL_FOR_ORDER',
-          data: {
-            productId,
-            quantity: qty,
-            expectedUnitPrice: priceInfo.customerUnitPrice.toFixed(4),
-            idempotencyKey: checkoutIdempotencyKey,
-          },
-        });
-        await this.renderMenu(
-          chatId,
-          messageId,
-          userId,
-          `📧 *EMAIL REQUIRED*\n\nPlease type your delivery email address for *${product.original_name}* (Qty: ${qty}, Total: ${totalDec.toFixed(2)} USDT):`,
-          getBackHomeKeyboard('m:prod', lang)
-        );
+        await Promise.all([
+          redis.setFsmState(userId, {
+            step: 'AWAITING_EMAIL_FOR_ORDER',
+            data: {
+              productId,
+              quantity: qty,
+              expectedUnitPrice: priceInfo.customerUnitPrice.toFixed(4),
+              idempotencyKey: checkoutIdempotencyKey,
+            },
+          }),
+          this.renderMenu(
+            chatId,
+            messageId,
+            userId,
+            `📧 *EMAIL REQUIRED*\n\nPlease type your delivery email address for *${product.original_name}* (Qty: ${qty}, Total: ${totalDec.toFixed(2)} USDT):`,
+            getBackHomeKeyboard('m:prod', lang),
+            { skipNavSaveIfEdited: true }
+          ),
+        ]);
         return;
       }
 
-      const { available } = await walletService.getBalance(userId);
-      const navState = await navigationService.getState(userId);
+      const { available } = walletBal;
       const catId = navState?.categoryId || 'all';
       const page = navState?.page || 1;
 
@@ -499,28 +595,30 @@ export class CustomerHandler {
         return;
       }
 
-      await redis.set(
-        `pending_checkout:${userId}:${productId}:${qty}`,
-        JSON.stringify({
-          idempotencyKey: checkoutIdempotencyKey,
-          expectedUnitPrice: priceInfo.customerUnitPrice.toFixed(4),
-        }),
-        900
-      );
-
-      await this.renderMenu(
-        chatId,
-        messageId,
-        userId,
-        t('confirm_purchase', lang, {
-          name: product.original_name,
-          qty,
-          unitPrice: priceInfo.customerUnitPrice.toFixed(2),
-          totalPrice: totalDec.toFixed(2),
-          balance: available.toFixed(2),
-        }),
-        getPurchaseConfirmKeyboard(productId, qty, catId, page, lang)
-      );
+      await Promise.all([
+        redis.set(
+          `pending_checkout:${userId}:${productId}:${qty}`,
+          JSON.stringify({
+            idempotencyKey: checkoutIdempotencyKey,
+            expectedUnitPrice: priceInfo.customerUnitPrice.toFixed(4),
+          }),
+          900
+        ),
+        this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          t('confirm_purchase', lang, {
+            name: product.original_name,
+            qty,
+            unitPrice: priceInfo.customerUnitPrice.toFixed(2),
+            totalPrice: totalDec.toFixed(2),
+            balance: available.toFixed(2),
+          }),
+          getPurchaseConfirmKeyboard(productId, qty, catId, page, lang),
+          { skipNavSaveIfEdited: true }
+        ),
+      ]);
       return;
     }
 
@@ -528,7 +626,6 @@ export class CustomerHandler {
     if (data.startsWith('buyc:')) {
       const allowed = await navigationService.acquireActionLock(userId, `buyc:${data}`, 15);
       if (!allowed) {
-        await ackPromise;
         return;
       }
       const [, productId, qtyStr] = data.split(':');
@@ -552,7 +649,6 @@ export class CustomerHandler {
         idempotencyKey: effectiveIdempotencyKey,
         expectedUnitPrice: pending.expectedUnitPrice,
       });
-      await ackPromise;
       return;
     }
 
@@ -582,8 +678,15 @@ export class CustomerHandler {
       const text = template
         .replace(/\{balance\}/g, balance.toFixed(2))
         .replace(/\{locked\}/g, locked.toFixed(2));
-      await navigationService.saveState(userId, { screen: 'wallet' });
-      await this.renderMenu(chatId, messageId, userId, text, getWalletKeyboard(lang));
+      await Promise.all([
+        navigationService.saveState(userId, {
+          screen: 'wallet',
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.renderMenu(chatId, messageId, userId, text, getWalletKeyboard(lang), {
+          skipNavSaveIfEdited: true,
+        }),
+      ]);
       return;
     }
 
@@ -607,8 +710,15 @@ export class CustomerHandler {
     // Add Funds / Payment Methods
     if (data === 'm:dep') {
       const text = uiConfigService.getText('msg.choose_payment', lang) || t('choose_payment', lang);
-      await navigationService.saveState(userId, { screen: 'deposit' });
-      await this.renderMenu(chatId, messageId, userId, text, getDepositMethodsKeyboard(lang));
+      await Promise.all([
+        navigationService.saveState(userId, {
+          screen: 'deposit',
+          ...(messageId ? { activeMessageId: messageId } : {}),
+        }),
+        this.renderMenu(chatId, messageId, userId, text, getDepositMethodsKeyboard(lang), {
+          skipNavSaveIfEdited: true,
+        }),
+      ]);
       return;
     }
 
@@ -664,7 +774,6 @@ export class CustomerHandler {
     // Binance: Submit Order ID
     if (data.startsWith('bin_tx:')) {
       const [, depositId] = data.split(':');
-      await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } });
       const prompt =
         `🔎 *SUBMIT BINANCE ORDER ID*\n\n` +
         `Please paste the Binance *Order ID* from your completed Binance Pay transfer.\n\n` +
@@ -675,29 +784,31 @@ export class CustomerHandler {
         `⚠️ Your Binance payment must be sent *after* creating this invoice.\n` +
         `_Official API Transaction IDs are also accepted for compatibility._\n\n` +
         `_Do NOT submit the invoice ID, receiver Binance ID, Binance account ID, Telegram user ID, or an Order ID from an earlier payment._`;
-
-      await telegramClient.sendMessage(chatId, prompt, {
-        reply_markup: getBackHomeKeyboard('m:dep', lang),
-      });
-      await ackPromise;
+      await Promise.all([
+        redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } }),
+        telegramClient.sendMessage(chatId, prompt, {
+          reply_markup: getBackHomeKeyboard('m:dep', lang),
+        }),
+      ]);
       return;
     }
 
     // Binance: Contact Support pre-seeded from pre-invoice / deposit notice
     if (data.startsWith('bin_sup:')) {
       const [, depositId] = data.split(':');
-      await redis.setFsmState(userId, {
-        step: 'AWAITING_SUPPORT_MESSAGE',
-        data: { contextType: 'BINANCE_PRE_INVOICE', depositId },
-      });
       const prompt =
         `🎧 *BINANCE DEPOSIT SUPPORT*\n\n` +
         `If you sent a Binance Pay payment before creating your invoice, please describe what happened (for example: approximate time and USDT amount sent).\n\n` +
         `Our support team will review and assist you promptly:`;
-      await telegramClient.sendMessage(chatId, prompt, {
-        reply_markup: getBackHomeKeyboard('m:dep', lang),
-      });
-      await ackPromise;
+      await Promise.all([
+        redis.setFsmState(userId, {
+          step: 'AWAITING_SUPPORT_MESSAGE',
+          data: { contextType: 'BINANCE_PRE_INVOICE', depositId },
+        }),
+        telegramClient.sendMessage(chatId, prompt, {
+          reply_markup: getBackHomeKeyboard('m:dep', lang),
+        }),
+      ]);
       return;
     }
 
@@ -706,24 +817,23 @@ export class CustomerHandler {
       const [, depositId] = data.split(':');
       const allowed = await navigationService.acquireActionLock(userId, `bin_r:${depositId}`, 3);
       if (!allowed) {
-        await ackPromise;
         return;
       }
 
       const lastTx = await redis.get(`bin_last_tx:${userId}:${depositId}`).catch(() => null);
       if (!lastTx) {
-        await redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } });
-        await telegramClient.sendMessage(
-          chatId,
-          '🔎 Please paste your Binance *Order ID* again to retry verification:',
-          { reply_markup: getBackHomeKeyboard('m:dep', lang) }
-        );
-        await ackPromise;
+        await Promise.all([
+          redis.setFsmState(userId, { step: 'AWAITING_BINANCE_TXID', data: { depositId } }),
+          telegramClient.sendMessage(
+            chatId,
+            '🔎 Please paste your Binance *Order ID* again to retry verification:',
+            { reply_markup: getBackHomeKeyboard('m:dep', lang) }
+          ),
+        ]);
         return;
       }
 
       await this.executeBinanceTxVerification(chatId, userId, depositId, lastTx, lang);
-      await ackPromise;
       return;
     }
 
@@ -827,16 +937,18 @@ export class CustomerHandler {
 
     // Refer & Earn (Two-counter Referral Program + Active Rewards & Milestones)
     if (data === 'm:ref') {
-      const [stats, refSettings, activeGiveaways] = await Promise.all([
+      const [stats, refSettings] = await Promise.all([
         referralService.getStats(userId),
         referralService.getSettings(),
-        giveawayService.getActiveGiveaways(userId),
       ]);
-      const tiers = await referralService.listRewardTiers({
-        activeOnly: true,
-        userId,
-        knownQualifiedCount: stats.qualifiedCount,
-      });
+      const [activeGiveaways, tiers] = await Promise.all([
+        giveawayService.getActiveGiveaways(userId, { knownStats: stats }),
+        referralService.listRewardTiers({
+          activeOnly: true,
+          userId,
+          knownQualifiedCount: stats.qualifiedCount,
+        }),
+      ]);
 
       const activeTiersCount = refSettings.rewardsEnabled ? tiers.length : 0;
       const activeRewardsCount = activeTiersCount + activeGiveaways.length;
@@ -859,7 +971,9 @@ export class CustomerHandler {
       let text =
         `👥 *Referral Program*\n\n` +
         `🔗 *Referral Link:*\n` +
-        `\`${stats.referralLink}\`\n\n` +
+        (stats.referralLink
+          ? `\`${stats.referralLink}\`\n\n`
+          : `_Referral link unavailable — configure BOT_USERNAME or active bot token._\n\n`) +
         `👥 *Total Referrals:* \`${stats.totalReferred}\`\n` +
         `💰 *Qualified Referrals:* \`${stats.qualifiedCount}\`\n` +
         `🎁 *Active Rewards:* \`${activeRewardsCount}\`\n\n` +
@@ -913,16 +1027,24 @@ export class CustomerHandler {
 
     // Search
     if (data === 'm:srch') {
-      await redis.setFsmState(userId, { step: 'AWAITING_SEARCH_QUERY' });
-      await this.renderMenu(chatId, messageId, userId, t('search_prompt', lang), getBackHomeKeyboard('m:home', lang));
+      await Promise.all([
+        redis.setFsmState(userId, { step: 'AWAITING_SEARCH_QUERY' }),
+        this.renderMenu(chatId, messageId, userId, t('search_prompt', lang), getBackHomeKeyboard('m:home', lang), {
+          skipNavSaveIfEdited: true,
+        }),
+      ]);
       return;
     }
 
     // Support
     if (data === 'm:supp') {
-      await redis.setFsmState(userId, { step: 'AWAITING_SUPPORT_MESSAGE' });
       const text = uiConfigService.getText('msg.support_prompt', lang) || t('support_prompt', lang);
-      await this.renderMenu(chatId, messageId, userId, text, getSupportMenuKeyboard(lang));
+      await Promise.all([
+        redis.setFsmState(userId, { step: 'AWAITING_SUPPORT_MESSAGE' }),
+        this.renderMenu(chatId, messageId, userId, text, getSupportMenuKeyboard(lang), {
+          skipNavSaveIfEdited: true,
+        }),
+      ]);
       return;
     }
 
@@ -940,14 +1062,12 @@ export class CustomerHandler {
         .replace(/\{qualified\}/g, String(stats.qualifiedCount))
         .replace(/\{langLabel\}/g, langLabel);
       await this.renderMenu(chatId, messageId, userId, text, getBackHomeKeyboard('m:home', lang));
-      await ackPromise;
       return;
     }
 
     // Reseller API info
     if (data === 'm:api') {
       await this.renderMenu(chatId, messageId, userId, t('api_info', lang), getBackHomeKeyboard('m:home', lang));
-      await ackPromise;
       return;
     }
 
@@ -955,14 +1075,13 @@ export class CustomerHandler {
     if (data === 'm:lang') {
       const text = uiConfigService.getText('msg.language_select', lang) || t('language_select', lang);
       await this.renderMenu(chatId, messageId, userId, text, getLanguageKeyboard(lang));
-      await ackPromise;
       return;
     }
 
     // Apply Language Selection & Immediately Refresh Menu + Localized Bottom Bar
     if (data.startsWith('lang:')) {
       const selected = resolveLanguage(data.split(':')[1]);
-      await Promise.all([
+      const [, , , existingNav] = await Promise.all([
         db.query('UPDATE users SET language_code = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [selected, userId]),
         db.query(
           `INSERT INTO user_profiles (user_id, preferred_language, created_at, updated_at)
@@ -970,25 +1089,29 @@ export class CustomerHandler {
            ON CONFLICT (user_id) DO UPDATE SET preferred_language = $2, updated_at = CURRENT_TIMESTAMP`,
           [userId, selected]
         ),
+        invalidateUserLanguageCache(userId),
+        navigationService.getState(userId),
       ]);
-      await invalidateUserLanguageCache(userId);
-      await telegramClient.sendMessage(chatId, t('language_updated', selected), {
-        disable_notification: true,
-        reply_markup: getCustomerMainReplyKeyboard(selected),
-      });
-      const existingNav = await navigationService.getState(userId);
-      await navigationService.saveState(userId, {
-        filters: { ...(existingNav?.filters || {}), replyKbVersion: 'v2_2btn' },
-      });
       const welcomeText = uiConfigService.getText('msg.welcome', selected) || t('welcome', selected);
-      await this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, selected));
-      await ackPromise;
+      await Promise.all([
+        telegramClient.sendMessage(chatId, t('language_updated', selected), {
+          disable_notification: true,
+          reply_markup: getCustomerMainReplyKeyboard(selected),
+        }),
+        this.renderMenu(chatId, messageId, userId, welcomeText, getCustomerMainInlineKeyboard(isAdmin, selected), {
+          skipNavSaveIfEdited: true,
+        }),
+        navigationService.saveState(userId, {
+          ...(messageId ? { activeMessageId: messageId } : {}),
+          filters: { ...(existingNav?.filters || {}), replyKbVersion: 'v2_2btn' },
+          existingState: existingNav,
+        }),
+      ]);
       return;
     }
 
     // Unrecognized / expired callback safe recovery
     await this.renderMenu(chatId, messageId, userId, t('stale_menu', lang), getStaleMenuKeyboard(lang));
-    await ackPromise;
   }
 
   /**

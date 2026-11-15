@@ -6,6 +6,7 @@ import {
 } from './types.js';
 import { uiConfigService } from '../services/uiConfig.js';
 import { SupportedLanguage } from '../services/i18n.js';
+import { perfTracker } from '../services/perfTracker.js';
 
 export const FALLBACK_TEXT_SYMBOL = Symbol('fallbackButtonText');
 
@@ -64,6 +65,7 @@ export class ButtonBuilder {
    * Returns null if admin marked the button hidden (unless forceVisible = true).
    */
   public static buildButton(opts: ButtonBuildOptions): TelegramInlineKeyboardButton | null {
+    return perfTracker.measureRender(() => {
     const lang = opts.lang || 'en';
     const setting = opts.settingKey ? uiConfigService.getCachedSetting(opts.settingKey, lang) : null;
 
@@ -109,6 +111,7 @@ export class ButtonBuilder {
     }
 
     return btn;
+    });
   }
 
   /**
@@ -121,6 +124,7 @@ export class ButtonBuilder {
     fallbackEmoji?: string;
     style?: ButtonStyle;
   }): TelegramReplyKeyboardButton {
+    return perfTracker.measureRender(() => {
     const lang = opts.lang || 'en';
     const setting = opts.settingKey ? uiConfigService.getCachedSetting(opts.settingKey, lang) : null;
 
@@ -148,13 +152,14 @@ export class ButtonBuilder {
     }
 
     return btn;
+    });
   }
 
   /**
    * Filter out hidden/null buttons and build a row; returns empty array if none visible.
    */
   public static buildActionRow(buttons: Array<TelegramInlineKeyboardButton | null | undefined>): TelegramInlineKeyboardButton[] {
-    return buttons.filter((b): b is TelegramInlineKeyboardButton => Boolean(b));
+    return perfTracker.measureRender(() => buttons.filter((b): b is TelegramInlineKeyboardButton => Boolean(b)));
   }
 
   /**
@@ -164,13 +169,15 @@ export class ButtonBuilder {
     buttons: Array<TelegramInlineKeyboardButton | null | undefined>,
     columns = 3
   ): TelegramInlineKeyboardButton[][] {
-    const visible = this.buildActionRow(buttons);
-    const rows: TelegramInlineKeyboardButton[][] = [];
-    const cols = Math.max(1, columns);
-    for (let i = 0; i < visible.length; i += cols) {
-      rows.push(visible.slice(i, i + cols));
-    }
-    return rows;
+    return perfTracker.measureRender(() => {
+      const visible = this.buildActionRow(buttons);
+      const rows: TelegramInlineKeyboardButton[][] = [];
+      const cols = Math.max(1, columns);
+      for (let i = 0; i < visible.length; i += cols) {
+        rows.push(visible.slice(i, i + cols));
+      }
+      return rows;
+    });
   }
 
   /**

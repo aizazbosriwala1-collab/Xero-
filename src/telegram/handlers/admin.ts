@@ -80,9 +80,21 @@ export class AdminHandler {
         ? telegramClient.answerCallbackQuery(cb.id).catch(() => {})
         : Promise.resolve();
 
-    await uiConfigService.ensureLoaded();
-    await ackPromise;
+    try {
+      await uiConfigService.ensureLoaded();
+      await this.dispatchCallback(cb, chatId, messageId, userId, data);
+    } finally {
+      await ackPromise;
+    }
+  }
 
+  private async dispatchCallback(
+    cb: TelegramCallbackQuery,
+    chatId: number,
+    messageId: number,
+    userId: string,
+    data: string
+  ): Promise<void> {
     // Admin Main Menu
     if (data === 'adm:main') {
       await redis.clearFsmState(userId);
@@ -92,19 +104,27 @@ export class AdminHandler {
       return;
     }
 
-    // Dashboard
+    // Dashboard (single aggregated SQL round-trip)
     if (data === 'adm:dash') {
-      const usersCountRes = await db.queryRow<{ count: string }>('SELECT COUNT(*) as count FROM users');
-      const ordersCountRes = await db.queryRow<{ count: string }>('SELECT COUNT(*) as count FROM local_orders');
-      const pendingDepRes = await db.queryRow<{ count: string }>("SELECT COUNT(*) as count FROM deposits WHERE status = 'PENDING_REVIEW'");
-      const productsCountRes = await db.queryRow<{ count: string }>('SELECT COUNT(*) as count FROM supplier_products');
+      const stats = await db.queryRow<{
+        usersCount: string;
+        ordersCount: string;
+        pendingDeposits: string;
+        productsCount: string;
+      }>(`
+        SELECT
+          (SELECT COUNT(*) FROM users) as "usersCount",
+          (SELECT COUNT(*) FROM local_orders) as "ordersCount",
+          (SELECT COUNT(*) FROM deposits WHERE status = 'PENDING_REVIEW') as "pendingDeposits",
+          (SELECT COUNT(*) FROM supplier_products) as "productsCount"
+      `);
 
       const text =
         `📊 *XERO KHAN EXECUTIVE DASHBOARD*\n\n` +
-        `• Registered Users: *${usersCountRes?.count || 0}*\n` +
-        `• Total Orders Placed: *${ordersCountRes?.count || 0}*\n` +
-        `• Pending Deposit Reviews: *${pendingDepRes?.count || 0}*\n` +
-        `• Catalogued Products: *${productsCountRes?.count || 0}*\n\n` +
+        `• Registered Users: *${stats?.usersCount || 0}*\n` +
+        `• Total Orders Placed: *${stats?.ordersCount || 0}*\n` +
+        `• Pending Deposit Reviews: *${stats?.pendingDeposits || 0}*\n` +
+        `• Catalogued Products: *${stats?.productsCount || 0}*\n\n` +
         `🛡️ *Safety Flags:*\n` +
         `• Recovery Mode: *${config.safety.recoveryMode}*\n` +
         `• Live Supplier Ordering: *${config.safety.liveOrderingEnabled ? 'ENABLED' : 'DISABLED (Protected)'}*\n` +
@@ -131,10 +151,9 @@ export class AdminHandler {
       return;
     }
 
-    // Pricing Overview
+    // Pricing Overview (cached global pricing rules)
     if (data === 'adm:price') {
-      const rule = await db.queryRow<any>("SELECT value FROM system_settings WHERE key = 'pricing_global_rules'");
-      const val = rule?.value || {};
+      const val = await pricingService.getGlobalPricingSettings();
       const text =
         `💲 *GLOBAL PRICING ENGINE*\n\n` +
         `• Default Percent Markup: \`${val.defaultPercentMarkup || '0.15'}\`\n` +
@@ -1862,7 +1881,7 @@ export class AdminHandler {
     if (data === 'adm:perf') {
       const perf = await launchAuditService.runPerformanceAudit();
       let text =
-        `⚡ *PERFORMANCE & CALLBACK AUDIT*\n\n` +
+        `⚡ *PERFORMANCE & 4-AXIS CALLBACK AUDIT*\n\n` +
         `• N+1 Query Guard: ${perf.nPlusOneFree ? '✅ OPTIMIZED' : '⚠️ REVIEW NEEDED'}\n` +
         `• Suite Benchmark Latency: \`${perf.totalDurationMs}ms\`\n\n`;
 
@@ -1871,19 +1890,22 @@ export class AdminHandler {
         text += `${badge} *${m.label}:* \`${m.durationMs}ms\` (${m.status})\n`;
       }
 
-      if (perf.recentCallbacks.length > 0) {
-        text += `\n📊 *Recent Callback Latencies:*\n`;
-        for (const cb of perf.recentCallbacks.slice(0, 6)) {
-          const icon = cb.slow ? '🐢' : '⚡';
-          text += `${icon} \`${this.escapeDiagMarkdown(cb.callbackName)}\` → \`${cb.responseTimeMs}ms\` (DB: \`${cb.dbTimeMs}ms\`/${cb.dbQueryCount}q, Sup: \`${cb.supplierTimeMs}ms\`)\n`;
+      const topCallbacks = perf.slowestCallbacks.length > 0 ? perf.slowestCallbacks : perf.recentCallbacks;
+      if (topCallbacks.length > 0) {
+        text += `\n📊 *Slowest Callbacks (4-Axis Breakdown):*\n`;
+        for (const cb of topCallbacks.slice(0, 10)) {
+          const icon = cb.slow ? '❌' : cb.slow300 ? '🐢' : '⚡';
+          text +=
+            `${icon} \`${this.escapeDiagMarkdown(cb.callbackName)}\` → \`${cb.responseTimeMs}ms\` ` +
+            `(TG \`${cb.telegramApiTimeMs}ms\`/${cb.telegramApiCallCount}, ` +
+            `Red \`${cb.redisTimeMs}ms\`/${cb.redisOpCount}, ` +
+            `PG \`${cb.dbTimeMs}ms\`/${cb.dbQueryCount}q, ` +
+            `Ren \`${cb.renderTimeMs}ms\` | Primary: *${cb.primaryBottleneck}*)\n`;
         }
       }
 
       if (perf.slowCallbacks300.length > 0) {
         text += `\n⚠️ *Slow Callbacks (>300ms):* \`${perf.slowCallbacks300.length}\` (>500ms: \`${perf.slowCallbacks.length}\`)\n`;
-        for (const s of perf.slowCallbacks300.slice(0, 4)) {
-          text += `• \`${this.escapeDiagMarkdown(s.callbackName)}\` — \`${s.responseTimeMs}ms\` (DB \`${s.dbTimeMs}ms\`, Sup \`${s.supplierTimeMs}ms\`)\n`;
-        }
       } else {
         text += `\n✅ *Slow Callbacks (>300ms):* \`0\` | *(>500ms):* \`0\`\n`;
       }
@@ -1999,27 +2021,29 @@ export class AdminHandler {
           customUsdAmount: usdAmount,
           isCustomInput: false,
         });
-        await telegramClient.editMessageText(
-          chatId,
-          messageId,
-          `✅ *DEPOSIT APPROVED*\n\nCredited \`$${Number(res.amount).toFixed(2)} USD\` (\`${res.amount} USDT\`) to user \`${res.userId}\`.\nWallet and immutable ledger updated atomically.`,
-          {
-            reply_markup: {
-              inline_keyboard: [
-                ButtonBuilder.buildActionRow([
-                  ButtonBuilder.buildButton({ text: 'NEXT PENDING DEPOSIT', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
-                ]),
-                ButtonBuilder.buildActionRow([
-                  ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
-                ]),
-              ],
-            },
-          }
-        );
-        await telegramClient.sendMessage(
-          res.userId,
-          `🎉 *DEPOSIT APPROVED*\n\nYour deposit of \`$${Number(res.amount).toFixed(2)} USD\` has been approved and credited to your wallet balance.`
-        ).catch(() => {});
+        await Promise.all([
+          telegramClient.editMessageText(
+            chatId,
+            messageId,
+            `✅ *DEPOSIT APPROVED*\n\nCredited \`$${Number(res.amount).toFixed(2)} USD\` (\`${res.amount} USDT\`) to user \`${res.userId}\`.\nWallet and immutable ledger updated atomically.`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  ButtonBuilder.buildActionRow([
+                    ButtonBuilder.buildButton({ text: 'NEXT PENDING DEPOSIT', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
+                  ]),
+                  ButtonBuilder.buildActionRow([
+                    ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+                  ]),
+                ],
+              },
+            }
+          ),
+          telegramClient.sendMessage(
+            res.userId,
+            `🎉 *DEPOSIT APPROVED*\n\nYour deposit of \`$${Number(res.amount).toFixed(2)} USD\` has been approved and credited to your wallet balance.`
+          ).catch(() => {}),
+        ]);
       } catch (err: any) {
         await telegramClient.editMessageText(
           chatId,
@@ -2150,27 +2174,29 @@ export class AdminHandler {
       const [, depositId] = data.split(':');
       try {
         const res = await manualPaymentService.approveDeposit(depositId, userId);
-        await telegramClient.editMessageText(
-          chatId,
-          messageId,
-          `✅ *DEPOSIT APPROVED*\n\nSuccessfully credited \`${res.amount} USDT\` to user \`${res.userId}\`. Wallet and immutable ledger updated.`,
-          {
-            reply_markup: {
-              inline_keyboard: [
-                ButtonBuilder.buildActionRow([
-                  ButtonBuilder.buildButton({ text: 'NEXT PENDING DEPOSIT', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
-                ]),
-                ButtonBuilder.buildActionRow([
-                  ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
-                ]),
-              ],
-            },
-          }
-        );
-        await telegramClient.sendMessage(
-          res.userId,
-          `🎉 *DEPOSIT APPROVED*\n\nYour deposit of \`${res.amount} USDT\` has been approved and credited to your wallet balance.`
-        ).catch(() => {});
+        await Promise.all([
+          telegramClient.editMessageText(
+            chatId,
+            messageId,
+            `✅ *DEPOSIT APPROVED*\n\nSuccessfully credited \`${res.amount} USDT\` to user \`${res.userId}\`. Wallet and immutable ledger updated.`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  ButtonBuilder.buildActionRow([
+                    ButtonBuilder.buildButton({ text: 'NEXT PENDING DEPOSIT', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
+                  ]),
+                  ButtonBuilder.buildActionRow([
+                    ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+                  ]),
+                ],
+              },
+            }
+          ),
+          telegramClient.sendMessage(
+            res.userId,
+            `🎉 *DEPOSIT APPROVED*\n\nYour deposit of \`${res.amount} USDT\` has been approved and credited to your wallet balance.`
+          ).catch(() => {}),
+        ]);
       } catch (err: any) {
         await telegramClient.editMessageText(chatId, messageId, `❌ *APPROVAL FAILED*\n\n${err.message}`, {
           reply_markup: {
@@ -2190,27 +2216,29 @@ export class AdminHandler {
       const [, depositId] = data.split(':');
       try {
         const rej = await manualPaymentService.rejectDeposit(depositId, userId, 'Payment could not be verified');
-        await telegramClient.editMessageText(
-          chatId,
-          messageId,
-          `❌ Deposit \`${depositId}\` has been marked *REJECTED*.`,
-          {
-            reply_markup: {
-              inline_keyboard: [
-                ButtonBuilder.buildActionRow([
-                  ButtonBuilder.buildButton({ text: 'NEXT PENDING DEPOSIT', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
-                ]),
-                ButtonBuilder.buildActionRow([
-                  ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
-                ]),
-              ],
-            },
-          }
-        );
-        await telegramClient.sendMessage(
-          rej.userId,
-          `⚠️ *DEPOSIT REJECTED*\n\nYour manual deposit (\`${depositId}\`) could not be verified and was rejected. Contact support if you need assistance.`
-        ).catch(() => {});
+        await Promise.all([
+          telegramClient.editMessageText(
+            chatId,
+            messageId,
+            `❌ Deposit \`${depositId}\` has been marked *REJECTED*.`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  ButtonBuilder.buildActionRow([
+                    ButtonBuilder.buildButton({ text: 'NEXT PENDING DEPOSIT', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
+                  ]),
+                  ButtonBuilder.buildActionRow([
+                    ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+                  ]),
+                ],
+              },
+            }
+          ),
+          telegramClient.sendMessage(
+            rej.userId,
+            `⚠️ *DEPOSIT REJECTED*\n\nYour manual deposit (\`${depositId}\`) could not be verified and was rejected. Contact support if you need assistance.`
+          ).catch(() => {}),
+        ]);
       } catch (err: any) {
         await telegramClient.editMessageText(chatId, messageId, `⚠️ ${err.message}`, {
           reply_markup: {

@@ -113,6 +113,9 @@ async function startServer() {
   }
 
   if (config.telegram.botToken) {
+    if (!config.telegram.botUsername) {
+      void telegramClient.getActiveBotUsername().catch(() => {});
+    }
     void telegramClient.registerBotCommandsSafely();
   }
 

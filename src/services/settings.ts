@@ -33,7 +33,7 @@ export class SettingsService {
 
   public async getMaintenanceConfig(): Promise<MaintenanceConfig> {
     try {
-      const cached = await redis.get(this.maintCacheKey);
+      const cached = await redis.getHot(this.maintCacheKey, 4000);
       if (cached) return JSON.parse(cached) as MaintenanceConfig;
     } catch {
       // Cache miss
@@ -79,7 +79,7 @@ export class SettingsService {
 
   public async getBannerImages(): Promise<BannerImagesConfig> {
     try {
-      const cached = await redis.get(this.bannerCacheKey);
+      const cached = await redis.getHot(this.bannerCacheKey, 4000);
       if (cached) return JSON.parse(cached) as BannerImagesConfig;
     } catch {
       // Cache miss

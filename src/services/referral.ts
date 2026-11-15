@@ -2,6 +2,8 @@ import Decimal from 'decimal.js';
 import { db } from '../db/index.js';
 import { redis } from './redis.js';
 import { walletService } from './wallet.js';
+import { telegramClient } from '../telegram/client.js';
+import { normalizeBotUsername } from '../config/env.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('ReferralService');
@@ -186,22 +188,36 @@ export class ReferralService {
   }
 
   /**
+   * Build Telegram referral deep-link using the active bot username while keeping
+   * the existing ?start=ref_<userId> payload format unchanged.
+   */
+  public buildReferralLink(userId: string, botUsername?: string | null): string {
+    const clean = normalizeBotUsername(botUsername ?? undefined);
+    if (!clean) {
+      return '';
+    }
+    return `https://t.me/${clean}?start=ref_${userId}`;
+  }
+
+  /**
    * Get customer referral stats in a single aggregated SQL query, Redis-cached 60s and invalidated on joins/purchases.
    */
   public async getStats(
     userId: string,
-    botUsername: string = 'XeroKhanBot',
+    botUsername?: string,
     options?: { bypassCache?: boolean }
   ): Promise<ReferralStats> {
+    const explicitUsername = normalizeBotUsername(botUsername);
     const cacheKey = this.statsCacheKey(userId);
     if (!options?.bypassCache) {
       try {
-        const cached = await redis.get(cacheKey);
+        const cached = await redis.getHot(cacheKey, 4000);
         if (cached) {
           const parsed = JSON.parse(cached) as { totalReferred: number; qualifiedCount: number; pendingCount: number };
+          const activeUsername = explicitUsername || (await telegramClient.getActiveBotUsername());
           return {
             referralCode: userId,
-            referralLink: `https://t.me/${botUsername}?start=ref_${userId}`,
+            referralLink: this.buildReferralLink(userId, activeUsername),
             totalReferred: parsed.totalReferred,
             qualifiedCount: parsed.qualifiedCount,
             pendingCount: parsed.pendingCount,
@@ -212,18 +228,21 @@ export class ReferralService {
       }
     }
 
-    const agg = await db.queryRow<{
-      total: string;
-      qualified: string;
-      pending: string;
-    }>(
-      `SELECT COUNT(*) as total,
-              COALESCE(SUM(CASE WHEN status = 'QUALIFIED' THEN 1 ELSE 0 END), 0) as qualified,
-              COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0) as pending
-       FROM referrals
-       WHERE referrer_id = $1`,
-      [userId]
-    );
+    const [agg, activeUsername] = await Promise.all([
+      db.queryRow<{
+        total: string;
+        qualified: string;
+        pending: string;
+      }>(
+        `SELECT COUNT(*) as total,
+                COALESCE(SUM(CASE WHEN status = 'QUALIFIED' THEN 1 ELSE 0 END), 0) as qualified,
+                COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0) as pending
+         FROM referrals
+         WHERE referrer_id = $1`,
+        [userId]
+      ),
+      explicitUsername ? Promise.resolve(explicitUsername) : telegramClient.getActiveBotUsername(),
+    ]);
 
     const totalReferred = parseInt(agg?.total || '0', 10);
     const qualifiedCount = parseInt(agg?.qualified || '0', 10);
@@ -233,7 +252,7 @@ export class ReferralService {
 
     return {
       referralCode: userId,
-      referralLink: `https://t.me/${botUsername}?start=ref_${userId}`,
+      referralLink: this.buildReferralLink(userId, activeUsername),
       totalReferred,
       qualifiedCount,
       pendingCount,
@@ -250,7 +269,7 @@ export class ReferralService {
 
   public async getSettings(): Promise<ReferralSettings> {
     try {
-      const cached = await redis.get(this.settingsCacheKey);
+      const cached = await redis.getHot(this.settingsCacheKey, 4000);
       if (cached) return JSON.parse(cached) as ReferralSettings;
     } catch {
       // Cache miss
@@ -309,7 +328,7 @@ export class ReferralService {
     const cacheKey = activeOnly ? this.tiersCacheActiveKey : this.tiersCacheAllKey;
     let rawRows: any[] | null = null;
     try {
-      const cached = await redis.get(cacheKey);
+      const cached = await redis.getHot(cacheKey, 4000);
       if (cached) rawRows = JSON.parse(cached);
     } catch {
       // Cache miss
@@ -529,7 +548,7 @@ export class ReferralService {
       throw new Error('This referral reward tier is inactive or no longer exists.');
     }
 
-    const stats = await this.getStats(userId, 'XeroKhanBot', { bypassCache: true });
+    const stats = await this.getStats(userId, undefined, { bypassCache: true });
     if (stats.qualifiedCount < tier.requiredQualifiedReferrals) {
       throw new Error(
         `You need ${tier.requiredQualifiedReferrals} qualified referrals to unlock "${tier.title}". Current qualified: ${stats.qualifiedCount}.`

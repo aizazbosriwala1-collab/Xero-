@@ -67,20 +67,20 @@ class DatabaseManager {
     if (!this.pool) {
       throw new Error('Database pool is not initialized');
     }
-    const start = Date.now();
+    const start = performance.now();
     try {
       const res = await this.pool.query(text, params);
-      const duration = Date.now() - start;
+      const duration = performance.now() - start;
       perfTracker.recordDb(duration);
       if (duration > 250) {
-        logger.warn('Slow query detected', { durationMs: duration, query: text.substring(0, 120) });
+        logger.warn('Slow query detected', { durationMs: Math.round(duration * 100) / 100, query: text.substring(0, 120) });
       }
       return {
         rows: res.rows || [],
         rowCount: res.rowCount || (res.rows ? res.rows.length : 0),
       };
     } catch (err: any) {
-      perfTracker.recordDb(Date.now() - start);
+      perfTracker.recordDb(performance.now() - start);
       logger.error('Database query error', { error: err.message, query: text.substring(0, 150) });
       throw err;
     }
@@ -98,20 +98,26 @@ class DatabaseManager {
     const client = await this.pool.connect();
     return {
       query: async <T = any>(text: string, params?: any[]) => {
-        const qStart = Date.now();
-        const res = await client.query(text, params);
-        perfTracker.recordDb(Date.now() - qStart);
-        return {
-          rows: res.rows || [],
-          rowCount: res.rowCount || (res.rows ? res.rows.length : 0),
-        };
+        const qStart = performance.now();
+        try {
+          const res = await client.query(text, params);
+          return {
+            rows: res.rows || [],
+            rowCount: res.rowCount || (res.rows ? res.rows.length : 0),
+          };
+        } finally {
+          perfTracker.recordDb(performance.now() - qStart);
+        }
       },
       queryRow: async <T = any>(text: string, params?: any[]) => {
-        const qStart = Date.now();
-        const res = await client.query(text, params);
-        perfTracker.recordDb(Date.now() - qStart);
-        const rows = res.rows || [];
-        return (rows[0] as T) || null;
+        const qStart = performance.now();
+        try {
+          const res = await client.query(text, params);
+          const rows = res.rows || [];
+          return (rows[0] as T) || null;
+        } finally {
+          perfTracker.recordDb(performance.now() - qStart);
+        }
       },
       release: () => client.release(),
     };

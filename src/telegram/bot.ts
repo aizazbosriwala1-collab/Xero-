@@ -4,6 +4,7 @@ import { customerHandler } from './handlers/customer.js';
 import { adminHandler } from './handlers/admin.js';
 import { TelegramUpdate } from './types.js';
 import { perfTracker } from '../services/perfTracker.js';
+import { redis } from '../services/redis.js';
 import { createLogger } from '../services/logger.js';
 
 const logger = createLogger('TelegramBotRouter');
@@ -225,6 +226,59 @@ export function isRegisteredCallbackRoute(data: string): boolean {
 
 export class TelegramBotRouter {
   private inFlightUpdates = new Set<number>();
+  private recentUpdateIds = new Set<number>();
+
+  private recordRecentUpdateId(updateId: number): void {
+    if (this.recentUpdateIds.size >= 10000) {
+      const oldest = this.recentUpdateIds.values().next().value;
+      if (oldest !== undefined) this.recentUpdateIds.delete(oldest);
+    }
+    this.recentUpdateIds.add(updateId);
+  }
+
+  private isMutatingCallback(data?: string): boolean {
+    if (!data) return false;
+    const mutatingPrefixes = [
+      'buy:',
+      'buyc:',
+      'gw_cl:',
+      'ref_cl:',
+      'bin_r:',
+      'lang:',
+      'adm_app',
+      'adm_rej',
+      'adm:ord_rec:',
+      'adm:sync',
+      'adm:sup_sync:',
+      'adm:cat_tog:',
+      'adm:gw_tog:',
+      'adm:gw_delc:',
+      'adm:gw_draft_save',
+      'adm:ref_tog:',
+      'adm:ref_del:',
+      'adm:ref_draft_save',
+      'adm:ann_sendc:',
+      'adm:ann_cancel:',
+      'adm:ch_tog',
+      'adm:ch_rem:',
+      'adm:ch_up:',
+      'adm:ch_dn:',
+      'adm:sup_tog:',
+      'adm:set_',
+      'adm:ban_',
+      'adm:dep_set_t:',
+      'adm:ui_rs',
+      'adm:ui_rst_all_c',
+      'adm_pr:',
+      'adm_set_fm:',
+      'adm_reset_pr:',
+      'adm:uie:',
+      'adm:uit:',
+      'adm:uiem:',
+      'adm:uir:',
+    ];
+    return mutatingPrefixes.some(p => (p.endsWith(':') ? data.startsWith(p) : data === p || data.startsWith(p)));
+  }
 
   /**
    * Process incoming Telegram update with duplicate update idempotency & sanitized phase timing.
@@ -249,13 +303,99 @@ export class TelegramBotRouter {
     this.inFlightUpdates.add(update.update_id);
 
     try {
-      // 2. Duplicate update protection (atomic DB insert + unique PK enforcement)
-      const dedupStartedAt = Date.now();
+      // 2. Route Callback Query (with full 4-axis instrumentation covering dedup + handler + Telegram + Redis + PG + Render)
+      if (update.callback_query) {
+        const cb = update.callback_query;
+        const cbName = cb.data || 'callback:empty';
+        const route = cb.data ? cb.data.split(':').slice(0, 2).join(':') : 'callback:empty';
+        const mutating = this.isMutatingCallback(cb.data);
+        let status = 'CALLBACK_PROCESSED';
+        let dedupMs = 0;
+
+        const { result, metrics } = await perfTracker.run(cbName, async () => {
+          const dedupStartedAt = performance.now();
+          if (mutating) {
+            try {
+              await db.query(
+                'INSERT INTO telegram_processed_updates (update_id, processed_at) VALUES ($1, CURRENT_TIMESTAMP)',
+                [update.update_id]
+              );
+              this.recordRecentUpdateId(update.update_id);
+            } catch (err: any) {
+              const msg = String(err?.message || '').toLowerCase();
+              if (err?.code === '23505' || msg.includes('duplicate') || msg.includes('unique') || msg.includes('primary')) {
+                perfTracker.discardCurrent();
+                logger.info('Duplicate Telegram update ignored', { updateId: update.update_id });
+                return { ok: true, status: 'DUPLICATE_IGNORED' };
+              }
+              logger.error('Error recording processed update', { error: err.message, updateId: update.update_id });
+            }
+          } else {
+            if (this.recentUpdateIds.has(update.update_id)) {
+              perfTracker.discardCurrent();
+              logger.info('Duplicate Telegram update ignored (L1)', { updateId: update.update_id });
+              return { ok: true, status: 'DUPLICATE_IGNORED' };
+            }
+            const fresh = await redis.setIfNotExists(`tg_upd:${update.update_id}`, '1', 86400);
+            if (!fresh) {
+              this.recordRecentUpdateId(update.update_id);
+              perfTracker.discardCurrent();
+              logger.info('Duplicate Telegram update ignored (Redis)', { updateId: update.update_id });
+              return { ok: true, status: 'DUPLICATE_IGNORED' };
+            }
+            this.recordRecentUpdateId(update.update_id);
+            void db
+              .query(
+                'INSERT INTO telegram_processed_updates (update_id, processed_at) VALUES ($1, CURRENT_TIMESTAMP) ON CONFLICT (update_id) DO NOTHING',
+                [update.update_id]
+              )
+              .catch(() => {});
+          }
+          dedupMs = Math.round((performance.now() - dedupStartedAt) * 100) / 100;
+
+          try {
+            if (cb.data?.startsWith('adm')) {
+              await adminHandler.handleCallback(cb);
+            } else {
+              await customerHandler.handleCallback(cb);
+            }
+          } catch (err: any) {
+            logger.error('Error handling callback query', { error: err.message, route });
+          }
+          return { ok: true, status: 'CALLBACK_PROCESSED' };
+        });
+
+        status = result.status;
+        if (status === 'DUPLICATE_IGNORED') {
+          return result;
+        }
+
+        logger.debug('Callback perf metrics', {
+          callbackName: metrics.callbackName,
+          responseTimeMs: metrics.responseTimeMs,
+          telegramApiTimeMs: metrics.telegramApiTimeMs,
+          telegramApiCallCount: metrics.telegramApiCallCount,
+          redisTimeMs: metrics.redisTimeMs,
+          redisOpCount: metrics.redisOpCount,
+          dbTimeMs: metrics.dbTimeMs,
+          dbQueryCount: metrics.dbQueryCount,
+          renderTimeMs: metrics.renderTimeMs,
+          supplierTimeMs: metrics.supplierTimeMs,
+          primaryBottleneck: metrics.primaryBottleneck,
+          dedupMs,
+        });
+
+        return { ok: true, status };
+      }
+
+      // 3. Duplicate update protection for non-callback updates
+      const dedupStartedAt = performance.now();
       try {
         await db.query(
           'INSERT INTO telegram_processed_updates (update_id, processed_at) VALUES ($1, CURRENT_TIMESTAMP)',
           [update.update_id]
         );
+        this.recordRecentUpdateId(update.update_id);
       } catch (err: any) {
         const msg = String(err?.message || '').toLowerCase();
         if (err?.code === '23505' || msg.includes('duplicate') || msg.includes('unique') || msg.includes('primary')) {
@@ -264,37 +404,13 @@ export class TelegramBotRouter {
         }
         logger.error('Error recording processed update', { error: err.message, updateId: update.update_id });
       }
-      const dedupMs = Date.now() - dedupStartedAt;
+      const dedupMs = Math.round((performance.now() - dedupStartedAt) * 100) / 100;
 
       let route = 'unknown';
       let status = 'IGNORED';
       const handlerStartedAt = Date.now();
 
-      // 3. Route Callback Query (with per-callback latency, DB & supplier instrumentation)
-      if (update.callback_query) {
-        const cb = update.callback_query;
-        const cbName = cb.data || 'callback:empty';
-        route = cb.data ? cb.data.split(':').slice(0, 2).join(':') : 'callback:empty';
-        try {
-          const { metrics } = await perfTracker.run(cbName, async () => {
-            if (cb.data?.startsWith('adm')) {
-              await adminHandler.handleCallback(cb);
-            } else {
-              await customerHandler.handleCallback(cb);
-            }
-          });
-          logger.debug('Callback perf metrics', {
-            callbackName: metrics.callbackName,
-            responseTimeMs: metrics.responseTimeMs,
-            dbTimeMs: metrics.dbTimeMs,
-            dbQueryCount: metrics.dbQueryCount,
-            supplierTimeMs: metrics.supplierTimeMs,
-          });
-        } catch (err: any) {
-          logger.error('Error handling callback query', { error: err.message, route });
-        }
-        status = 'CALLBACK_PROCESSED';
-      } else if (update.message) {
+      if (update.message) {
         // 4. Route Message
         const msg = update.message;
         const text = msg.text?.trim() || '';
