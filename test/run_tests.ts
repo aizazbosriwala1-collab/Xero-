@@ -8169,6 +8169,188 @@ export async function runComprehensiveTests() {
     }
   });
 
+  // =========================================================================
+  // 29. AUTO PROMOTION UX IMPROVEMENT (CONTRACT 17)
+  // =========================================================================
+  currentCategory = 'Auto Promotion UX Improvement (Contract 17)';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 17.1: Enable Auto Promo Readiness Report, Missing Requirement Errors & One-Click Send Test Promotion Diagnostics', 'mock_integration', async () => {
+    assert.strictEqual(isRegisteredCallbackRoute('adm:promo_test'), true, 'adm:promo_test route must be registered');
+    assert.ok(Buffer.byteLength('adm:promo_test', 'utf8') <= 64);
+
+    const adminId = '98701';
+    if (!config.telegram.adminIds.includes(adminId)) {
+      config.telegram.adminIds.push(adminId);
+    }
+    await db.query(
+      `INSERT INTO users (id, telegram_id, username, first_name, is_admin, created_at, updated_at)
+       VALUES ($1, $2, 'promo_owner', 'PromoOwner', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (id) DO NOTHING`,
+      [adminId, Number(adminId)]
+    );
+
+    const savedCfg = await promotionService.getConfig();
+    const activeProdRows = await db.query<{ id: string }>('SELECT id FROM supplier_products WHERE is_available = TRUE');
+    const activeProdIds = activeProdRows.rows.map(r => r.id);
+
+    let mockCanPostMessages = true;
+    let mockBotIsAdmin = true;
+    let mockSendError: { ok: false; error_code: number; description: string } | null = null;
+    const events: Array<{ method: string; body: any }> = [];
+
+    telegramClient.setTransportOverride(async (method, body) => {
+      if (method === 'getMe') {
+        return { ok: true, result: { id: 999777, is_bot: true, username: 'XeroXd_Bot' } };
+      }
+      if (method === 'getChatMember') {
+        return {
+          ok: true,
+          result: {
+            status: mockBotIsAdmin ? 'administrator' : 'member',
+            can_post_messages: mockBotIsAdmin ? mockCanPostMessages : false,
+          },
+        };
+      }
+      if (method === 'getChat') {
+        return {
+          ok: true,
+          result: {
+            id: -100777111,
+            title: String(body.chat_id) === '@RestrictedPromoCh' ? 'Restricted Promo Ch' : 'Master Xero VIP Deals',
+          },
+        };
+      }
+      if (method === 'sendMessage' && String(body.chat_id).startsWith('@') && mockSendError) {
+        events.push({ method, body: JSON.parse(JSON.stringify(body)) });
+        return mockSendError;
+      }
+      events.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9879 } };
+    });
+
+    const fireAdminCb = async (cbData: string, updateId: number) => {
+      events.length = 0;
+      await telegramBotRouter.handleUpdate({
+        update_id: updateId,
+        callback_query: {
+          id: `cb_c17_${updateId}`,
+          from: { id: Number(adminId), is_bot: false, first_name: 'PromoOwner' },
+          data: cbData,
+          message: { message_id: 9875, chat: { id: Number(adminId), type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'Promo Hub' },
+        },
+      });
+      return events.find(e => e.method === 'editMessageText')?.body;
+    };
+
+    try {
+      // Clean promo state before test
+      await db.query('DELETE FROM promotion_posts');
+      await db.query('DELETE FROM promo_channels');
+      await promotionService.updateConfig({ enabled: false, intervalMinutes: 720, lastPostedAt: null, lastProductId: null }, 'SYSTEM');
+      await redis.del('auto_promo:channels').catch(() => {});
+
+      // A) Enabling with 0 channels -> shows ❌ No Channels Added + 📣 Send Test Promotion button
+      const noChannelView = await fireAdminCb('adm:promo_tog', 987101);
+      assert.ok(noChannelView, 'Must render readiness report on enable');
+      const noChannelText = String(noChannelView.text);
+      assert.ok(noChannelText.includes('Promotion Enabled'));
+      assert.ok(noChannelText.includes('❌ No Channels Added'), `Expected No Channels Added error, got: ${noChannelText}`);
+      assert.ok(noChannelText.includes('12 Hours'));
+      const testBtn = noChannelView.reply_markup?.inline_keyboard?.flat()?.find((b: any) => b.callback_data === 'adm:promo_test');
+      assert.ok(testBtn, '📣 Send Test Promotion button must be present');
+      assert.ok(String(testBtn.text).includes('Send Test Promotion'));
+
+      const testNoChan = await fireAdminCb('adm:promo_test', 987102);
+      assert.ok(String(testNoChan.text).includes('❌ No Channels Added'));
+
+      // B) Channel where bot is admin WITHOUT can_post_messages -> ❌ Missing Post Messages Permission
+      mockBotIsAdmin = true;
+      mockCanPostMessages = false;
+      const restrictedCh = await promotionService.addPromoChannel({ channelIdentifier: '@RestrictedPromoCh' }, adminId);
+      assert.strictEqual(restrictedCh.botIsAdmin, true);
+      assert.strictEqual(restrictedCh.canPostMessages, false);
+
+      // Disable then re-enable so adm:promo_tog inspects live permissions on enable
+      await fireAdminCb('adm:promo_tog', 987103); // Off
+      const missingPostView = await fireAdminCb('adm:promo_tog', 987104); // On
+      assert.ok(String(missingPostView.text).includes('❌ Missing Post Messages Permission'));
+
+      const testMissingPost = await fireAdminCb('adm:promo_test', 987105);
+      assert.ok(String(testMissingPost.text).includes('❌ Missing Post Messages Permission'));
+      assert.ok(String(testMissingPost.text).includes('RestrictedPromoCh'));
+
+      // C) Valid channel with Post Messages permission, but 0 active products -> ❌ No Products Found
+      await db.query('DELETE FROM promo_channels');
+      await redis.del('auto_promo:channels').catch(() => {});
+      mockBotIsAdmin = true;
+      mockCanPostMessages = true;
+      await promotionService.addPromoChannel({ channelIdentifier: '@ReadyPromoCh' }, adminId);
+
+      await db.query('UPDATE supplier_products SET is_available = FALSE WHERE is_available = TRUE');
+      await pricingService.invalidateCatalogCaches();
+
+      await fireAdminCb('adm:promo_tog', 987106); // Off
+      const noProductsView = await fireAdminCb('adm:promo_tog', 987107); // On
+      assert.ok(String(noProductsView.text).includes('❌ No Products Found'));
+      assert.ok(String(noProductsView.text).includes('Products:\n0') || String(noProductsView.text).includes('*Products:*\n0'));
+
+      // Restore active products (ensure at least one active product exists)
+      if (activeProdIds.length > 0) {
+        for (const pid of activeProdIds) {
+          await db.query('UPDATE supplier_products SET is_available = TRUE WHERE id = $1', [pid]);
+        }
+      } else {
+        await insertTestProduct({ id: 'c17_promo_prod', name: 'Canva Pro 1 Year', your_cost: 2.00, stock: 10 });
+      }
+      await pricingService.invalidateCatalogCaches();
+
+      // D) Fully ready -> READY status + 📣 Send Test Promotion sends immediately & preserves scheduled cooldown
+      await fireAdminCb('adm:promo_tog', 987108); // Off
+      const readyView = await fireAdminCb('adm:promo_tog', 987109); // On
+      const readyText = String(readyView.text);
+      assert.ok(readyText.includes('Promotion Enabled'));
+      assert.ok(readyText.includes('*Channels:*\n1'));
+      assert.ok(readyText.includes('*Verified:*\n1'));
+      assert.ok(readyText.includes('*Interval:*\n12 Hours'));
+      assert.ok(readyText.includes('*Next Promotion:*\nWithin 60s'));
+      assert.ok(readyText.includes('*Status:*\nREADY'));
+
+      const testSuccessView = await fireAdminCb('adm:promo_test', 987110);
+      const sentChannelMsg = events.find(e => e.method === 'sendMessage' && e.body.chat_id === '@ReadyPromoCh');
+      assert.ok(sentChannelMsg, 'Send Test Promotion must immediately post to first eligible channel');
+      assert.ok(String(sentChannelMsg!.body.text).includes('LIMITED AVAILABILITY'));
+      assert.ok(String(testSuccessView.text).includes('Test Promotion Sent Successfully'));
+      assert.ok(String(testSuccessView.text).includes('ReadyPromoCh'));
+      assert.ok(String(testSuccessView.text).includes('9879'));
+
+      // Ensure test promotion did NOT overwrite lastPostedAt scheduled window
+      const cfgAfterTest = await promotionService.getConfig();
+      assert.strictEqual(cfgAfterTest.lastPostedAt, null, 'Send Test Promotion must not mutate scheduled lastPostedAt');
+
+      const postRows = await db.query<any>('SELECT * FROM promotion_posts WHERE created_by = $1', [adminId]);
+      assert.ok(postRows.rows.some(r => r.status === 'POSTED' && Number(r.telegram_message_id) === 9879));
+
+      // E) Telegram API error on test promotion -> surfaces exact diagnostic
+      mockSendError = { ok: false, error_code: 403, description: 'Forbidden: bot was kicked from the channel chat' };
+      const testErrView = await fireAdminCb('adm:promo_test', 987111);
+      assert.ok(String(testErrView.text).includes('Failed to Send Test Promotion'));
+      assert.ok(String(testErrView.text).includes('bot was kicked from the channel chat'));
+      assert.ok(String(testErrView.text).includes('ReadyPromoCh'));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      for (const pid of activeProdIds) {
+        await db.query('UPDATE supplier_products SET is_available = TRUE WHERE id = $1', [pid]).catch(() => {});
+      }
+      await db.query("DELETE FROM supplier_products WHERE id = 'sp_c17_promo_prod'").catch(() => {});
+      await pricingService.invalidateCatalogCaches().catch(() => {});
+      await db.query('DELETE FROM promotion_posts').catch(() => {});
+      await db.query('DELETE FROM promo_channels').catch(() => {});
+      await promotionService.updateConfig(savedCfg, 'SYSTEM').catch(() => {});
+      await redis.del('auto_promo:channels').catch(() => {});
+    }
+  });
+
   // SUMMARY & STATS DYNAMIC COMPUTATION
   const total = testResults.length;
   const passed = testResults.filter(r => r.status === 'PASS').length;

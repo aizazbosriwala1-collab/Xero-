@@ -25,7 +25,7 @@ import {
 } from '../../services/binance.js';
 import { uiConfigService, UISection, UISettingRecord } from '../../services/uiConfig.js';
 import { supportService } from '../../services/support.js';
-import { promotionService } from '../../services/promotion.js';
+import { promotionService, PromotionReadinessReport } from '../../services/promotion.js';
 import { SupportedLanguage, getUserLanguage, t } from '../../services/i18n.js';
 import { ButtonBuilder } from '../buttonBuilder.js';
 import {
@@ -1368,11 +1368,40 @@ export class AdminHandler {
     if (data === 'adm:promo_tog') {
       const curr = await promotionService.getConfig();
       const updated = await promotionService.updateConfig({ enabled: !curr.enabled }, userId);
-      await this.renderAdminPromoHub(
-        chatId,
-        messageId,
-        updated.enabled ? '✅ Auto Promotion scheduler ENABLED.' : '⏸️ Auto Promotion scheduler PAUSED.'
-      );
+      const report = await promotionService.getReadinessReport({ refreshChannelChecks: true });
+      let notice: string;
+      if (!updated.enabled) {
+        notice = '⏸️ *Auto Promotion Paused.*';
+      } else if (report.status === 'READY') {
+        notice = '✅ *Auto Promotion Enabled — All checks passed!*';
+      } else {
+        notice =
+          `⚠️ *Auto Promotion Enabled — Action Required:*\n` +
+          report.issues.map(issue => `• ${this.escapeDiagMarkdown(issue)}`).join('\n');
+      }
+      await this.renderAdminPromoHub(chatId, messageId, notice, report);
+      return;
+    }
+
+    if (data === 'adm:promo_test') {
+      const res = await promotionService.sendTestPromotion(userId);
+      const diagLines = res.diagnostics.map(d => `• ${this.escapeDiagMarkdown(d)}`).join('\n');
+      let notice: string;
+      if (res.ok && res.channelUsed && res.productUsed) {
+        notice =
+          `📣 *Test Promotion Sent Successfully*\n\n` +
+          `*Channel Used:*\n${this.escapeDiagMarkdown(res.channelUsed.title)} (\`${this.escapeDiagMarkdown(res.channelUsed.channelIdentifier)}\`)\n\n` +
+          `*Product:*\n${this.escapeDiagMarkdown(res.productUsed.name)} ($${this.escapeDiagMarkdown(res.productUsed.rateUsd)})\n\n` +
+          `*Diagnostics:*\n${diagLines}`;
+      } else {
+        notice =
+          `*${this.escapeDiagMarkdown(res.failureHeadline || '❌ Test Promotion Failed')}*\n\n` +
+          (res.channelUsed
+            ? `*Channel Used:*\n${this.escapeDiagMarkdown(res.channelUsed.title)} (\`${this.escapeDiagMarkdown(res.channelUsed.channelIdentifier)}\`)\n\n`
+            : '') +
+          `*Diagnostics:*\n${diagLines}`;
+      }
+      await this.renderAdminPromoHub(chatId, messageId, notice);
       return;
     }
 
@@ -1381,7 +1410,7 @@ export class AdminHandler {
       await telegramClient.editMessageText(
         chatId,
         messageId,
-        `➕ *Add Promotion Channel*\n\nSend the Telegram channel \`@username\` or numeric chat ID (e.g. \`-1001234567890\`):\n\n_Note: Bot must be an Administrator in that channel._`,
+        `➕ *Add Promotion Channel*\n\nSend the Telegram channel \`@username\` or numeric chat ID (e.g. \`-1001234567890\`):\n\n_Note: Bot must be an Administrator with Post Messages permission enabled._`,
         {
           reply_markup: {
             inline_keyboard: [
@@ -1400,7 +1429,7 @@ export class AdminHandler {
       await telegramClient.editMessageText(
         chatId,
         messageId,
-        `⏱️ *Auto Promotion Interval*\n\nEnter the posting interval in minutes (minimum \`15\`, example: \`180\`):`,
+        `⏱️ *Auto Promotion Interval*\n\nEnter the posting interval in minutes (minimum \`15\`, example: \`180\` or \`720\` for 12 Hours):`,
         {
           reply_markup: {
             inline_keyboard: [
@@ -1417,10 +1446,15 @@ export class AdminHandler {
     if (data === 'adm:promo_now') {
       try {
         const sum = await promotionService.postPromotion({ adminId: userId });
+        const failedLines = sum.results
+          .filter(r => !r.ok)
+          .map(r => `• ${this.escapeDiagMarkdown(r.channelIdentifier)}: ${this.escapeDiagMarkdown(r.error || 'Failed')}`)
+          .join('\n');
         await this.renderAdminPromoHub(
           chatId,
           messageId,
-          `🚀 *Posted:* *${this.escapeDiagMarkdown(sum.productName)}* ($${sum.rateUsd}) → ${sum.posted}/${sum.attempted} channel(s)`
+          `🚀 *Posted:* *${this.escapeDiagMarkdown(sum.productName)}* ($${sum.rateUsd}) → ${sum.posted}/${sum.attempted} channel(s)` +
+            (failedLines ? `\n\n*Failed Channels:*\n${failedLines}` : '')
         );
       } catch (err: any) {
         await this.renderAdminPromoHub(chatId, messageId, `⚠️ ${this.escapeDiagMarkdown(err.message)}`);
@@ -1432,13 +1466,15 @@ export class AdminHandler {
       const chId = data.slice('adm:promo_ver:'.length);
       try {
         const ch = await promotionService.refreshChannelAdminStatus(chId, userId);
-        await this.renderAdminPromoHub(
-          chatId,
-          messageId,
-          ch.botIsAdmin
-            ? `✅ Verified bot is Administrator in *${this.escapeDiagMarkdown(ch.title)}*`
-            : `⚠️ Bot is NOT Administrator in *${this.escapeDiagMarkdown(ch.title)}* yet.`
-        );
+        let notice: string;
+        if (ch.botIsAdmin && ch.canPostMessages) {
+          notice = `✅ Verified bot is Administrator with Post Messages permission in *${this.escapeDiagMarkdown(ch.title)}*`;
+        } else if (ch.botIsAdmin && !ch.canPostMessages) {
+          notice = `❌ Missing Post Messages Permission in *${this.escapeDiagMarkdown(ch.title)}*. Enable "Post Messages" in Channel Administrators.`;
+        } else {
+          notice = `❌ Bot is NOT Administrator in *${this.escapeDiagMarkdown(ch.title)}* yet.`;
+        }
+        await this.renderAdminPromoHub(chatId, messageId, notice);
       } catch (err: any) {
         await this.renderAdminPromoHub(chatId, messageId, `⚠️ ${this.escapeDiagMarkdown(err.message)}`);
       }
@@ -3520,9 +3556,14 @@ export class AdminHandler {
       try {
         const ch = await promotionService.addPromoChannel({ channelIdentifier: text }, userId);
         await redis.clearFsmState(userId);
-        const note = ch.botIsAdmin
-          ? `✅ Channel *${this.escapeDiagMarkdown(ch.title)}* added & bot admin verified!`
-          : `⚠️ Channel *${this.escapeDiagMarkdown(ch.title)}* added, but bot is NOT confirmed Admin yet. Promote bot to Admin then tap Verify.`;
+        let note: string;
+        if (ch.botIsAdmin && ch.canPostMessages) {
+          note = `✅ Channel *${this.escapeDiagMarkdown(ch.title)}* added & Admin + Post Messages verified!`;
+        } else if (ch.botIsAdmin && !ch.canPostMessages) {
+          note = `⚠️ Channel *${this.escapeDiagMarkdown(ch.title)}* added, but *Missing Post Messages Permission*. Enable "Post Messages" in Channel Admin rights, then tap Verify.`;
+        } else {
+          note = `⚠️ Channel *${this.escapeDiagMarkdown(ch.title)}* added, but bot is NOT confirmed Admin yet. Promote bot to Admin then tap Verify.`;
+        }
         await this.renderAdminPromoHub(chatId, undefined, note);
       } catch (err: any) {
         await telegramClient.sendMessage(chatId, `⚠️ *INVALID CHANNEL*\n\n${err.message}\n\nPlease enter \`@ChannelUsername\` or numeric ID:`);
@@ -5187,49 +5228,78 @@ export class AdminHandler {
   private async renderAdminPromoHub(
     chatId: number,
     messageId: number | undefined,
-    notice?: string
+    notice?: string,
+    preloadedReport?: PromotionReadinessReport
   ): Promise<void> {
-    const [cfg, channels] = await Promise.all([
-      promotionService.getConfig(),
-      promotionService.listChannels(false),
-    ]);
+    const report = preloadedReport || (await promotionService.getReadinessReport({ refreshChannelChecks: false }));
+
+    const headerStatus = report.enabled ? '✅ Promotion Enabled' : '⏸️ Promotion Paused';
+    const statusText =
+      report.status === 'READY'
+        ? 'READY'
+        : report.issues.length > 0
+          ? report.issues.map(issue => this.escapeDiagMarkdown(issue)).join('\n')
+          : 'PAUSED';
 
     let text =
-      (notice ? `${notice}\n\n` : '') +
+      (notice ? `${notice}\n\n━━━━━━━━━━━━\n\n` : '') +
       `📣 *CHANNEL AUTO PROMOTION*\n\n` +
-      `• *Scheduler:* ${cfg.enabled ? '✅ ENABLED' : '⏸️ PAUSED'}\n` +
-      `• *Interval:* \`Every ${cfg.intervalMinutes} min\`\n` +
-      `• *Last Posted:* ${cfg.lastPostedAt ? `\`${cfg.lastPostedAt.slice(0, 16).replace('T', ' ')}Z\`` : '_Never_'}\n` +
-      `• *Connected Channels:* \`${channels.length}\`\n\n`;
+      `*${headerStatus}*\n\n` +
+      `*Channels:*\n${report.channelsCount}\n\n` +
+      `*Verified:*\n${report.verifiedChannelsCount}\n\n` +
+      `*Products:*\n${report.productsCount}\n\n` +
+      `*Interval:*\n${this.escapeDiagMarkdown(report.intervalLabel)}\n\n` +
+      `*Next Promotion:*\n${this.escapeDiagMarkdown(report.nextPromotionLabel)}\n\n` +
+      `*Status:*\n${statusText}\n\n`;
 
     const rows: any[][] = [
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({
-          text: cfg.enabled ? 'Pause Auto Promo' : 'Enable Auto Promo',
-          fallbackEmoji: cfg.enabled ? '⏸️' : '✅',
-          style: cfg.enabled ? 'danger' : 'success',
+          text: report.enabled ? 'Pause Auto Promo' : 'Enable Auto Promo',
+          fallbackEmoji: report.enabled ? '⏸️' : '✅',
+          style: report.enabled ? 'danger' : 'success',
           callbackData: 'adm:promo_tog',
           forceVisible: true,
         }),
         ButtonBuilder.buildButton({
+          text: 'Send Test Promotion',
+          fallbackEmoji: '📣',
+          style: 'primary',
+          callbackData: 'adm:promo_test',
+          forceVisible: true,
+        }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({
           text: 'Post Promo Now',
           fallbackEmoji: '🚀',
-          style: 'primary',
+          style: 'default',
           callbackData: 'adm:promo_now',
+          forceVisible: true,
+        }),
+        ButtonBuilder.buildButton({
+          text: 'Set Interval',
+          fallbackEmoji: '⏱️',
+          style: 'default',
+          callbackData: 'adm:promo_int',
           forceVisible: true,
         }),
       ]),
       ButtonBuilder.buildActionRow([
         ButtonBuilder.buildButton({ text: 'Add Channel', fallbackEmoji: '➕', style: 'success', callbackData: 'adm:promo_add', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Set Interval', fallbackEmoji: '⏱️', style: 'default', callbackData: 'adm:promo_int', forceVisible: true }),
       ]),
     ];
 
-    if (channels.length === 0) {
-      text += `_No promo channels added yet. Add a channel where the bot is Administrator._`;
+    if (report.channelDiagnostics.length === 0) {
+      text += `_No promo channels added yet. Add a channel where the bot is Administrator with Post Messages enabled._`;
     } else {
-      for (const ch of channels) {
-        const admBadge = ch.botIsAdmin ? '✅ Admin' : '⚠️ Not Admin';
+      text += `*Channel Diagnostics:*\n`;
+      for (const ch of report.channelDiagnostics) {
+        const admBadge = !ch.botIsAdmin
+          ? '❌ Not Admin'
+          : ch.canPostMessages
+            ? '✅ Admin + Post'
+            : '❌ Missing Post Messages';
         const actBadge = ch.isActive ? '🟢 Active' : '⏸️ Paused';
         text += `• *${this.escapeDiagMarkdown(ch.title)}* (\`${this.escapeDiagMarkdown(ch.channelIdentifier)}\`) — ${admBadge} • ${actBadge}\n`;
         rows.push(
