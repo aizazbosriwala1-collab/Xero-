@@ -197,6 +197,7 @@ export const REGISTERED_ADMIN_CALLBACKS = {
     'adm:sup_bal:',
     'adm:sup_ord:',
     'adm:sup_sync:',
+    'adm:sup_prod:',
     'adm:sup_tog:',
     'adm:sup_map_pg:',
     'adm:smp:',

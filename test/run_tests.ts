@@ -50,8 +50,9 @@ import { launchAuditService } from '../src/services/audit.js';
 import { perfTracker } from '../src/services/perfTracker.js';
 import { promotionService } from '../src/services/promotion.js';
 import { menuCache } from '../src/telegram/menuCache.js';
-import { supplierDriverRegistry } from '../src/services/supplierDrivers.js';
+import { supplierDriverRegistry, NyStoreDriver } from '../src/services/supplierDrivers.js';
 import { supplierEcosystemService } from '../src/services/supplierEcosystem.js';
+import { handleNyStoreWebhookHttp } from '../src/api/routes.js';
 import {
   getCustomerMainReplyKeyboard,
   getCustomerMainInlineKeyboard,
@@ -8395,11 +8396,23 @@ export async function runComprehensiveTests() {
     // B) Pluggable driver registry exposes unified ISupplierDriver capabilities
     const mainDriver = supplierDriverRegistry.getDriver('aitoolshop');
     const venteDriver = supplierDriverRegistry.getDriver('ventebot');
+    const nystoreDriver = supplierDriverRegistry.getDriver('nystore');
+    const cupponsDriver = supplierDriverRegistry.getDriver('cupponshub');
+    const zfourDriver = supplierDriverRegistry.getDriver('zfour');
+    const futureScaffoldDriver = supplierDriverRegistry.getDriver('future_generic');
     assert.strictEqual(mainDriver.isLiveImplemented, true);
-    assert.strictEqual(venteDriver.isLiveImplemented, false);
-    for (const methodName of ['healthCheck', 'balanceCheck', 'catalogSync', 'priceSync', 'stockCheck', 'purchase', 'orderRecovery', 'diagnostics']) {
+    assert.strictEqual(venteDriver.isLiveImplemented, true);
+    assert.strictEqual(nystoreDriver.isLiveImplemented, true);
+    assert.strictEqual(cupponsDriver.isLiveImplemented, true);
+    assert.strictEqual(zfourDriver.isLiveImplemented, true);
+    assert.strictEqual(futureScaffoldDriver.isLiveImplemented, false);
+    for (const methodName of ['healthCheck', 'balanceCheck', 'catalogSync', 'priceSync', 'stockCheck', 'quote', 'purchase', 'orderRecovery', 'diagnostics']) {
       assert.strictEqual(typeof (mainDriver as any)[methodName], 'function', `Driver missing method: ${methodName}`);
-      assert.strictEqual(typeof (venteDriver as any)[methodName], 'function', `Scaffold driver missing method: ${methodName}`);
+      assert.strictEqual(typeof (venteDriver as any)[methodName], 'function', `VenteBot driver missing method: ${methodName}`);
+      assert.strictEqual(typeof (nystoreDriver as any)[methodName], 'function', `NyStore driver missing method: ${methodName}`);
+      assert.strictEqual(typeof (cupponsDriver as any)[methodName], 'function', `CupponsHub driver missing method: ${methodName}`);
+      assert.strictEqual(typeof (zfourDriver as any)[methodName], 'function', `ZFour driver missing method: ${methodName}`);
+      assert.strictEqual(typeof (futureScaffoldDriver as any)[methodName], 'function', `Scaffold driver missing method: ${methodName}`);
     }
 
     const scaffoldDiag = await supplierService.runSupplierDriverDiagnostics('ventebot');
@@ -8956,6 +8969,1053 @@ export async function runComprehensiveTests() {
       await db.query('DELETE FROM local_orders WHERE id = ANY($1)', [ordIds]).catch(() => {});
       await db.query('DELETE FROM supplier_products WHERE id IN ($1, $2)', [prodA, prodB]).catch(() => {});
       await redis.del(`adm_prc_prod:${adminId}`).catch(() => {});
+    }
+  });
+
+  await it('Contract 20.1: VenteBot Integration — Balance, Catalog Mirror Sync, Quote, Full Ledger->Router->VenteBot Purchase & Zero Customer Leakage', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '988301';
+    await ensureAuditUser(custId, '40.0000');
+
+    const canonicalProdId = 'sp_c20_vb_master';
+    await db.query(
+      `INSERT INTO supplier_products (
+        id, supplier, supplier_product_id, original_name, original_description,
+        latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload
+      ) VALUES ($1, 'aitoolshop', 'remote_master_c20', 'C20 Cloud Pro Pass', 'Instant Pro Key', '1.0000', 10, FALSE, TRUE, 'account', '{}')
+      ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_stock = 10`,
+      [canonicalProdId]
+    );
+
+    const prevLive = config.safety.liveOrderingEnabled;
+    (config.safety as any).liveOrderingEnabled = true;
+
+    const seenAuthHeaders: string[] = [];
+    const seenUrls: string[] = [];
+    let deliveredOrderId: string | null = null;
+
+    try {
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'sync_enabled', true, adminId);
+
+      supplierService.setTestVentebotBaseUrl('https://mock-ventebot.example.local/v1');
+      supplierService.setTestVentebotApiKey('vb_live_secret_token_c20');
+      supplierService.setFetchOverride(async (url: string, init?: RequestInit) => {
+        seenUrls.push(url);
+        const h = new Headers(init?.headers as any);
+        seenAuthHeaders.push(h.get('Authorization') || '');
+
+        if (url.endsWith('/v1/balance')) {
+          return new Response(JSON.stringify({ balance: '142.7500', currency: 'USDT' }), { status: 200 });
+        }
+        if (url.endsWith('/v1/products')) {
+          return new Response(
+            JSON.stringify({
+              products: [
+                {
+                  id: 'vb_sku_pro_1',
+                  name: 'Cloud Pro Key (30D)',
+                  reseller_price: '1.0000',
+                  available_stock: 25,
+                  type: 'account',
+                  requires_email: false,
+                },
+                {
+                  id: 'vb_sku_vip_2',
+                  name: 'Design Studio Seat',
+                  reseller_price: '2.5000',
+                  available_stock: 8,
+                  type: 'invite',
+                  requires_email: true,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/v1/quote')) {
+          return new Response(
+            JSON.stringify({
+              product_id: 'vb_sku_pro_1',
+              quantity: 2,
+              unit_cost: '1.0000',
+              total_cost: '2.0000',
+              currency: 'USDT',
+              in_stock: true,
+              available_stock: 25,
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.endsWith('/v1/order')) {
+          const payload = JSON.parse(String(init?.body || '{}'));
+          assert.strictEqual(payload.product_id, 'vb_sku_pro_1');
+          assert.strictEqual(payload.quantity, 2);
+          return new Response(
+            JSON.stringify({
+              success: true,
+              status: 'completed',
+              order_ref: 'vb_ord_c20_99',
+              delivered_items: ['VB-KEY-ALPHA-001', 'VB-KEY-BETA-002'],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/v1/orders/lookup')) {
+          return new Response(JSON.stringify({ found: false, status: 'not_found' }), { status: 404 });
+        }
+        return new Response(JSON.stringify({ message: 'Not found' }), { status: 404 });
+      });
+
+      // 1) Balance Check + persistent update + Low Balance alert check
+      const balRes = await supplierService.checkSupplierBalanceViaDriver('ventebot');
+      assert.strictEqual(balRes.ok, true);
+      assert.strictEqual(balRes.balanceUsdt, '142.7500');
+      assert.strictEqual(balRes.currency, 'USDT');
+      assert.ok(seenAuthHeaders.some(a => a === 'Bearer vb_live_secret_token_c20'));
+
+      // 2) Catalog Sync -> Supplier Mirror (customer view NEVER exposes VenteBot)
+      const syncRes = await supplierService.syncSupplierViaDriver('ventebot');
+      assert.strictEqual(syncRes.ok, true);
+      assert.strictEqual(syncRes.totalCount, 2);
+
+      const mirrorRows = await db.query<any>(
+        'SELECT supplier_product_id, name, cost_usdt FROM supplier_catalog_mirror WHERE supplier_id = $1 ORDER BY supplier_product_id ASC',
+        ['ventebot']
+      );
+      assert.strictEqual(mirrorRows.rows.length, 2);
+      assert.strictEqual(mirrorRows.rows[0].supplier_product_id, 'vb_sku_pro_1');
+      assert.strictEqual(new Decimal(mirrorRows.rows[0].cost_usdt).toFixed(4), '1.0000');
+
+      // 3) Quote Check (live /quote API)
+      const quoteRes = await supplierService.quoteProductViaDriver('ventebot', 'vb_sku_pro_1', 2);
+      assert.strictEqual(quoteRes.ok, true);
+      assert.strictEqual(quoteRes.unitCostUsdt, '1.0000');
+      assert.strictEqual(quoteRes.totalCostUsdt, '2.0000');
+      assert.strictEqual(quoteRes.inStock, true);
+      assert.strictEqual(quoteRes.source, 'LIVE_QUOTE_API');
+
+      // 4) Assign Primary mapping to VenteBot and execute full Customer -> Wallet -> Ledger -> Router -> VenteBot -> Delivery flow
+      await supplierEcosystemService.ensureMasterProductAndPrimaryMapping({
+        productId: canonicalProdId,
+        canonicalName: 'C20 Cloud Pro Pass',
+        supplierId: 'ventebot',
+        supplierProductId: 'vb_sku_pro_1',
+      });
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: canonicalProdId, slotRank: 1, supplierId: 'ventebot', supplierProductId: 'vb_sku_pro_1' },
+        adminId
+      );
+      await pricingService.setFixedRetailPrice(canonicalProdId, '1.50', adminId);
+
+      const balBefore = (await walletService.getBalance(custId)).balance;
+      const checkoutRes = await orderService.checkout({
+        userId: custId,
+        productId: canonicalProdId,
+        quantity: 2,
+      });
+      deliveredOrderId = checkoutRes.orderId;
+
+      assert.strictEqual(checkoutRes.status, 'COMPLETED');
+      assert.strictEqual(checkoutRes.success, true);
+      assert.strictEqual(checkoutRes.totalCharged, '3.00');
+      assert.deepStrictEqual(checkoutRes.deliveredItems, ['VB-KEY-ALPHA-001', 'VB-KEY-BETA-002']);
+      assert.ok(!JSON.stringify(checkoutRes).toLowerCase().includes('ventebot'), 'Customer purchase output must never mention VenteBot');
+
+      // Verify immutable wallet debit & encrypted delivery + supplier_orders tracking
+      const balAfter = (await walletService.getBalance(custId)).balance;
+      assert.strictEqual(balBefore.minus(balAfter).toFixed(4), '3.0000');
+      const ledgerDebit = await db.queryRow<any>(
+        'SELECT entry_type, amount FROM ledger_entries WHERE operation_ref = $1',
+        [`PURCHASE_${checkoutRes.orderId}`]
+      );
+      assert.strictEqual(ledgerDebit?.entry_type, 'PURCHASE_DEBIT');
+      assert.strictEqual(new Decimal(ledgerDebit.amount).toFixed(4), '-3.0000');
+
+      const soRow = await db.queryRow<any>(
+        'SELECT fulfilled_supplier_id, supplier_order_ref, supplier_status FROM supplier_orders WHERE local_order_id = $1',
+        [checkoutRes.orderId]
+      );
+      assert.strictEqual(soRow?.fulfilled_supplier_id, 'ventebot');
+      assert.strictEqual(soRow?.supplier_order_ref, 'vb_ord_c20_99');
+
+      // 5) Diagnostics & Health Monitoring
+      const diag = await supplierService.runSupplierDriverDiagnostics('ventebot');
+      assert.strictEqual(diag.ok, true);
+      assert.strictEqual(diag.apiStatus, 'Healthy');
+      assert.ok(diag.checks.some(c => c.name === 'Balance API' && c.ok));
+      assert.ok(diag.checks.some(c => c.name === 'Catalog Sync API' && c.ok));
+      assert.ok(diag.checks.some(c => c.name === 'Quote Engine Check' && c.ok));
+      assert.ok(diag.checks.some(c => c.name === 'Order Recovery (GET /orders/lookup)' && c.ok));
+
+      const healthRes = await supplierService.runSupplierHealthCheck('ventebot');
+      assert.strictEqual(healthRes.ok, true);
+      assert.strictEqual(healthRes.apiStatus, 'Healthy');
+    } finally {
+      supplierService.resetTestState();
+      (config.safety as any).liveOrderingEnabled = prevLive;
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'sync_enabled', false, adminId).catch(() => {});
+      if (deliveredOrderId) {
+        await db.query('DELETE FROM delivered_items WHERE local_order_id = $1', [deliveredOrderId]).catch(() => {});
+        await db.query('DELETE FROM supplier_orders WHERE local_order_id = $1', [deliveredOrderId]).catch(() => {});
+        await db.query('DELETE FROM local_orders WHERE id = $1', [deliveredOrderId]).catch(() => {});
+      }
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [canonicalProdId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [canonicalProdId]).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_id = $1', ['ventebot']).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [canonicalProdId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [canonicalProdId]).catch(() => {});
+      await redis.del('supplier_ctrl:ventebot').catch(() => {});
+      await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
+    }
+  });
+
+  await it('Contract 20.2: VenteBot Recovery (GET /orders/lookup: completed, failed_no_charge, in_progress, uncertain) & Admin Tools (Balance, Products, Sync, Diagnostics, Enable/Disable)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const adminNum = Number(adminId);
+    const custId = '988302';
+    await ensureAuditUser(custId, '30.0000');
+
+    const prodId = 'sp_c20_vb_rec';
+    await db.query(
+      `INSERT INTO supplier_products (
+        id, supplier, supplier_product_id, original_name, original_description,
+        latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload
+      ) VALUES ($1, 'ventebot', 'vb_rec_sku_1', 'C20 Recovery Key', 'Key', '1.0000', 20, FALSE, TRUE, 'account', '{}')
+      ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_stock = 20`,
+      [prodId]
+    );
+    await pricingService.setFixedRetailPrice(prodId, '2.00', adminId);
+
+    const prevLive = config.safety.liveOrderingEnabled;
+    (config.safety as any).liveOrderingEnabled = true;
+    const createdOrderIds: string[] = [];
+
+    try {
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'sync_enabled', true, adminId);
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'ventebot', supplierProductId: 'vb_rec_sku_1' },
+        adminId
+      );
+
+      supplierService.setTestVentebotBaseUrl('https://mock-ventebot.example.local/v1');
+      supplierService.setTestVentebotApiKey('vb_rec_key_c20');
+
+      let nextLookupPayload: any = { status: 'uncertain' };
+      let postOrderCallCount = 0;
+
+      supplierService.setFetchOverride(async (url: string) => {
+        if (url.endsWith('/v1/order')) {
+          postOrderCallCount++;
+          // Simulate ambiguous timeout/502 leaving order UNCERTAIN on checkout
+          return new Response('Bad Gateway', { status: 502 });
+        }
+        if (url.includes('/v1/orders/lookup')) {
+          return new Response(JSON.stringify(nextLookupPayload), { status: 200 });
+        }
+        if (url.endsWith('/v1/balance')) {
+          return new Response(JSON.stringify({ balance: '88.50', currency: 'USDT' }), { status: 200 });
+        }
+        if (url.endsWith('/v1/products')) {
+          return new Response(
+            JSON.stringify({
+              products: [{ id: 'vb_rec_sku_1', name: 'C20 Recovery Key', your_cost: '1.0000', stock: 12 }],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      });
+
+      // Order 1: Checkout -> UNCERTAIN (502), then GET /orders/lookup tests: uncertain -> in_progress -> completed
+      const ord1 = await orderService.checkout({ userId: custId, productId: prodId, quantity: 1 });
+      createdOrderIds.push(ord1.orderId);
+      assert.strictEqual(ord1.status, 'UNCERTAIN');
+      assert.strictEqual(postOrderCallCount, 1);
+
+      const balAfterDebit1 = (await walletService.getBalance(custId)).balance;
+      assert.strictEqual(balAfterDebit1.toFixed(4), '28.0000');
+
+      // 1a) Lookup returns 'uncertain' -> remains UNCERTAIN, zero extra POST /order, zero refund
+      nextLookupPayload = { status: 'uncertain', idempotency_key: `SUPPLIER_ORD_${ord1.orderId}` };
+      const recUncertain = await orderService.reconcileUncertainOrder(ord1.orderId);
+      assert.strictEqual(recUncertain.status, 'UNCERTAIN');
+      assert.strictEqual(recUncertain.lookupMethod, 'GET_ORDERS_LOOKUP');
+      assert.strictEqual(postOrderCallCount, 1, 'Recovery must NEVER issue duplicate POST /order');
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(4), '28.0000');
+
+      // 1b) Lookup returns 'in_progress' -> remains UNCERTAIN safely without duplicate debit or refund
+      nextLookupPayload = { status: 'in_progress', order_ref: 'vb_ref_prog_1' };
+      const recInProg = await orderService.reconcileUncertainOrder(ord1.orderId);
+      assert.strictEqual(recInProg.status, 'UNCERTAIN');
+      assert.strictEqual(recInProg.lookupMethod, 'GET_ORDERS_LOOKUP');
+      assert.strictEqual(postOrderCallCount, 1);
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(4), '28.0000');
+
+      // 1c) Lookup returns 'completed' -> completes order, encrypts delivered_items, no second debit
+      nextLookupPayload = {
+        status: 'completed',
+        order_ref: 'vb_ref_prog_1',
+        delivered_items: ['VB-RECOVERED-SECRET-777'],
+      };
+      const recCompleted = await orderService.reconcileUncertainOrder(ord1.orderId);
+      assert.strictEqual(recCompleted.status, 'COMPLETED');
+      assert.strictEqual(recCompleted.newlyCompleted, true);
+      assert.deepStrictEqual(recCompleted.deliveredItems, ['VB-RECOVERED-SECRET-777']);
+      assert.strictEqual(postOrderCallCount, 1);
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(4), '28.0000');
+
+      const encRow = await db.queryRow<any>('SELECT content FROM delivered_items WHERE local_order_id = $1', [ord1.orderId]);
+      assert.ok(encRow?.content?.startsWith('v1:'), 'Recovered credentials must be encrypted with AES-256-GCM');
+      assert.strictEqual(encryptionService.decrypt(encRow.content), 'VB-RECOVERED-SECRET-777');
+
+      // Order 2: Checkout -> UNCERTAIN, then GET /orders/lookup returns 'failed_no_charge' -> atomic single refund
+      const ord2 = await orderService.checkout({ userId: custId, productId: prodId, quantity: 1 });
+      createdOrderIds.push(ord2.orderId);
+      assert.strictEqual(ord2.status, 'UNCERTAIN');
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(4), '26.0000');
+
+      nextLookupPayload = { status: 'failed_no_charge', order_ref: 'vb_ref_fail_2', message: 'Upstream rejected without charge' };
+      const recFail = await orderService.reconcileUncertainOrder(ord2.orderId);
+      assert.strictEqual(recFail.status, 'FAILED');
+      assert.strictEqual(recFail.lookupMethod, 'GET_ORDERS_LOOKUP');
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(4), '28.0000', 'failed_no_charge must refund once via ledger');
+
+      // Replay reconciliation on terminal FAILED must NOT refund twice
+      const recReplay = await orderService.reconcileUncertainOrder(ord2.orderId);
+      assert.strictEqual(recReplay.status, 'FAILED');
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(4), '28.0000', 'Terminal FAILED must never double-refund');
+
+      // Admin Tools verification for VenteBot: Detail, Balance, Sync, Mirrored Products, Diagnostics, Disable, Enable
+      const sent: Array<{ method: string; body: any }> = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        sent.push({ method, body });
+        return { ok: true, result: { message_id: 9920 } };
+      });
+      const fireAdm = async (cbData: string) => {
+        assert.ok(Buffer.byteLength(cbData, 'utf8') <= 64, `Callback exceeds 64B: ${cbData}`);
+        assert.strictEqual(isRegisteredCallbackRoute(cbData), true, `Unregistered callback: ${cbData}`);
+        sent.length = 0;
+        await adminHandler.handleCallback({
+          id: 'cb_c20_' + Math.random().toString(36).slice(2, 6),
+          from: { id: adminNum, is_bot: false, first_name: 'Admin' },
+          data: cbData,
+          message: { message_id: 9920, date: Math.floor(Date.now() / 1000), chat: { id: adminNum, type: 'private' } },
+        } as any);
+        return sent.find(m => m.method === 'editMessageText' || m.method === 'sendMessage')?.body;
+      };
+
+      const vbDetail = await fireAdm('adm:sup_v:ventebot');
+      assert.ok(String(vbDetail?.text || '').includes('VENTEBOT'));
+
+      const vbBal = await fireAdm('adm:sup_bal:ventebot');
+      assert.ok(String(vbBal?.text || '').includes('88.5000 USDT'));
+
+      const vbSync = await fireAdm('adm:sup_sync:ventebot');
+      assert.ok(String(vbSync?.text || '').includes('Mirrored 1 items'));
+
+      const vbProds = await fireAdm('adm:sup_prod:ventebot:1');
+      assert.ok(String(vbProds?.text || '').includes('C20 Recovery Key'));
+
+      const vbDiag = await fireAdm('adm:sup_drv_d:ventebot');
+      assert.ok(String(vbDiag?.text || '').includes('Driver Diagnostics (ventebot)'));
+      assert.ok(String(vbDiag?.text || '').includes('Order Recovery (GET /orders/lookup)'));
+
+      const vbOrd = await fireAdm('adm:sup_ord:ventebot');
+      assert.ok(String(vbOrd?.text || '').includes('Recent Supplier Orders'));
+
+      const vbDisable = await fireAdm('adm:sup_tog:en:ventebot');
+      assert.ok(String(vbDisable?.text || '').includes('Disabled'));
+      const vbEnable = await fireAdm('adm:sup_tog:en:ventebot');
+      assert.ok(String(vbEnable?.text || '').includes('Enabled'));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      supplierService.resetTestState();
+      (config.safety as any).liveOrderingEnabled = prevLive;
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'sync_enabled', false, adminId).catch(() => {});
+      if (createdOrderIds.length > 0) {
+        await db.query('DELETE FROM delivered_items WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM supplier_orders WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM local_orders WHERE id = ANY($1)', [createdOrderIds]).catch(() => {});
+      }
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_id = $1', ['ventebot']).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+      await redis.del('supplier_ctrl:ventebot').catch(() => {});
+      await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
+    }
+  });
+
+  // =========================================================================
+  // 33. SUPPLIER EXPANSION & ACTIVATION PHASE (CONTRACT 21)
+  // =========================================================================
+  currentCategory = 'Supplier Expansion & Activation (Contract 21)';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 21.1: VenteBot Full Activation E2E Chain (API Key -> Balance -> Sync -> Quote -> Wallet Debit -> Ledger -> Router -> Delivery -> Order History -> Profit Analytics -> Recovery -> Health)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '988401';
+    await ensureAuditUser(custId, '40.0000');
+
+    const prodId = 'sp_c21_vb_e2e';
+    await db.query(
+      `INSERT INTO supplier_products (
+        id, supplier, supplier_product_id, original_name, original_description,
+        latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload
+      ) VALUES ($1, 'ventebot', 'vb_e2e_sku', 'C21 Cloud Enterprise Suite', 'E2E suite', '2.0000', 25, FALSE, TRUE, 'account', '{}')
+      ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_cost = '2.0000', latest_stock = 25`,
+      [prodId]
+    );
+    await pricingService.setFixedRetailPrice(prodId, '5.00', adminId);
+
+    const prevLive = config.safety.liveOrderingEnabled;
+    (config.safety as any).liveOrderingEnabled = true;
+    const createdOrderIds: string[] = [];
+
+    try {
+      // 1) Honest unconfigured diagnostic check before credentials bound (when VENTEBOT_* unset)
+      if (!config.suppliers.ventebot.apiKey || config.suppliers.ventebot.baseUrl.includes('.example')) {
+        const offlineDiag = await supplierService.runSupplierDriverDiagnostics('ventebot');
+        assert.strictEqual(offlineDiag.ok, false);
+        assert.strictEqual(offlineDiag.apiStatus, 'Offline');
+      }
+
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'sync_enabled', true, adminId);
+
+      supplierService.setTestVentebotBaseUrl('https://mock-ventebot.e2e.local/v1');
+      supplierService.setTestVentebotApiKey('vb_c21_valid_key');
+
+      // Verify invalid key triggers deterministic INVALID_API_KEY error cleanly
+      supplierService.setFetchOverride(async (url: string, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        if (headers.get('Authorization') !== 'Bearer vb_c21_valid_key') {
+          return new Response(JSON.stringify({ success: false, error_code: 'INVALID_API_KEY', message: 'Invalid Bearer token' }), { status: 401 });
+        }
+        if (url.endsWith('/v1/balance')) {
+          return new Response(JSON.stringify({ balance_usdt: '15.0000', currency: 'USDT' }), { status: 200 });
+        }
+        if (url.endsWith('/v1/products')) {
+          return new Response(JSON.stringify({ products: [{ id: 'vb_e2e_sku', name: 'C21 Cloud Enterprise Suite', your_cost: '2.0000', stock: 25 }] }), { status: 200 });
+        }
+        if (url.includes('/v1/quote')) {
+          return new Response(JSON.stringify({ product_id: 'vb_e2e_sku', unit_cost: '2.0000', total_cost: '4.0000', available_stock: 25, in_stock: true }), { status: 200 });
+        }
+        if (url.endsWith('/v1/order')) {
+          return new Response(JSON.stringify({
+            success: true,
+            status: 'completed',
+            order_ref: 'vb_e2e_ord_101',
+            delivered_items: ['VB-E2E-ACC-1', 'VB-E2E-ACC-2'],
+          }), { status: 200 });
+        }
+        if (url.includes('/v1/orders/lookup')) {
+          if (url.includes('__diag_nonexistent_probe__')) {
+            return new Response(JSON.stringify({ found: false, status: 'not_found' }), { status: 404 });
+          }
+          return new Response(JSON.stringify({
+            status: 'completed',
+            order_ref: 'vb_e2e_rec_202',
+            delivered_items: ['VB-E2E-RECOVERED'],
+          }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      });
+
+      // Balance + Low Balance Alert (< 20 USDT threshold triggers alert)
+      const bal = await supplierService.checkSupplierBalanceViaDriver('ventebot');
+      assert.strictEqual(bal.ok, true);
+      assert.strictEqual(bal.balanceUsdt, '15.0000');
+
+      const sync = await supplierService.syncSupplierViaDriver('ventebot');
+      assert.strictEqual(sync.ok, true);
+      assert.strictEqual(sync.totalCount, 1);
+
+      const quote = await supplierService.quoteProductViaDriver('ventebot', 'vb_e2e_sku', 2);
+      assert.strictEqual(quote.ok, true);
+      assert.strictEqual(quote.totalCostUsdt, '4.0000');
+
+      await supplierEcosystemService.ensureMasterProductAndPrimaryMapping({
+        productId: prodId,
+        canonicalName: 'C21 Cloud Enterprise Suite',
+        supplierId: 'ventebot',
+        supplierProductId: 'vb_e2e_sku',
+      });
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'ventebot', supplierProductId: 'vb_e2e_sku' },
+        adminId
+      );
+
+      // Snapshot analytics before checkout
+      const analyticsBefore = await pricingService.getProfitAnalytics();
+      const balBefore = (await walletService.getBalance(custId)).balance;
+
+      // Full E2E Purchase: Customer -> Wallet Debit -> Ledger -> Router -> VenteBot -> Encrypted Delivery
+      const checkoutRes = await orderService.checkout({
+        userId: custId,
+        productId: prodId,
+        quantity: 2,
+      });
+      createdOrderIds.push(checkoutRes.orderId);
+      assert.strictEqual(checkoutRes.status, 'COMPLETED');
+      assert.strictEqual(checkoutRes.totalCharged, '10.00');
+      assert.deepStrictEqual(checkoutRes.deliveredItems, ['VB-E2E-ACC-1', 'VB-E2E-ACC-2']);
+
+      // Wallet & Ledger check
+      const balAfter = (await walletService.getBalance(custId)).balance;
+      assert.strictEqual(balBefore.minus(balAfter).toFixed(4), '10.0000');
+      const ledgerRow = await db.queryRow<any>(
+        'SELECT entry_type, amount FROM ledger_entries WHERE operation_ref = $1',
+        [`PURCHASE_${checkoutRes.orderId}`]
+      );
+      assert.strictEqual(ledgerRow?.entry_type, 'PURCHASE_DEBIT');
+      assert.strictEqual(new Decimal(ledgerRow.amount).toFixed(4), '-10.0000');
+
+      // Order History check (must decrypt items and NEVER expose VenteBot to customer)
+      const history = await orderService.getCustomerOrders(custId, 5);
+      const histItem = history.find(h => h.id === checkoutRes.orderId);
+      assert.ok(histItem, 'Completed order must appear in Customer Order History');
+      assert.strictEqual(histItem!.status, 'COMPLETED');
+      assert.deepStrictEqual(histItem!.deliveredItems, ['VB-E2E-ACC-1', 'VB-E2E-ACC-2']);
+      assert.ok(!JSON.stringify(histItem).toLowerCase().includes('ventebot'), 'Customer order history must never leak supplier');
+
+      // Analytics & Profit Tracking check (10.00 revenue - 4.00 supplier cost = +6.00 profit)
+      const analyticsAfter = await pricingService.getProfitAnalytics();
+      const revDelta = new Decimal(analyticsAfter.todayRevenue).minus(new Decimal(analyticsBefore.todayRevenue));
+      const profDelta = new Decimal(analyticsAfter.todayProfit).minus(new Decimal(analyticsBefore.todayProfit));
+      assert.strictEqual(revDelta.toFixed(2), '10.00', 'Today revenue must increase by 10.00');
+      assert.strictEqual(profDelta.toFixed(2), '6.00', 'Today profit must increase by 6.00');
+
+      // Diagnostics + Health + Dashboard Summary check (including low-balance flag at 15 < 20 USDT)
+      const [diag, health, summaries] = await Promise.all([
+        supplierService.runSupplierDriverDiagnostics('ventebot'),
+        supplierService.runSupplierHealthCheck('ventebot'),
+        supplierEcosystemService.getSupplierDashboardSummaries(),
+      ]);
+      assert.strictEqual(diag.ok, true);
+      assert.strictEqual(health.ok, true);
+      assert.strictEqual(health.apiStatus, 'Healthy');
+      const vbSummary = summaries.find(s => s.id === 'ventebot');
+      assert.ok(vbSummary);
+      assert.strictEqual(vbSummary!.isLowBalance, true, '15 USDT < 20 USDT threshold must flag low balance');
+      assert.strictEqual(vbSummary!.apiStatus, 'Healthy');
+    } finally {
+      supplierService.resetTestState();
+      (config.safety as any).liveOrderingEnabled = prevLive;
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'sync_enabled', false, adminId).catch(() => {});
+      if (createdOrderIds.length > 0) {
+        await db.query('DELETE FROM delivered_items WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM supplier_orders WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM local_orders WHERE id = ANY($1)', [createdOrderIds]).catch(() => {});
+      }
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_id = $1', ['ventebot']).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+      await redis.del('supplier_ctrl:ventebot').catch(() => {});
+      await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
+    }
+  });
+
+  await it('Contract 21.2: NyStore Integration & 10-Point Activation (Balance, Catalog Sync, Quote, Purchase, Proof Files, Webhook Auth + Idempotency, Recovery, Health, Diagnostics, Failover)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '988402';
+    await ensureAuditUser(custId, '40.0000');
+
+    const prodId = 'sp_c21_nystore';
+    await db.query(
+      `INSERT INTO supplier_products (
+        id, supplier, supplier_product_id, original_name, original_description,
+        latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload
+      ) VALUES ($1, 'aitoolshop', 'ny_primary_fallback', 'C21 Design Pro License', 'NyStore Pro', '3.0000', 10, FALSE, TRUE, 'account', '{}')
+      ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_cost = '3.0000', latest_stock = 10`,
+      [prodId]
+    );
+    await pricingService.setFixedRetailPrice(prodId, '6.00', adminId);
+
+    const prevLive = config.safety.liveOrderingEnabled;
+    (config.safety as any).liveOrderingEnabled = true;
+    const createdOrderIds: string[] = [];
+    const webhookSecret = 'ny_webhook_hmac_secret_c21';
+
+    try {
+      await supplierService.setSupplierFlag('aitoolshop', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('nystore', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('nystore', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('nystore', 'ordering_enabled', true, adminId);
+      await supplierService.setSupplierFlag('nystore', 'sync_enabled', true, adminId);
+
+      supplierService.setTestApiKey('mock_primary_key_c21');
+      supplierService.setTestNyStoreConfig({
+        baseUrl: 'https://mock-nystore.local/v1',
+        apiKey: 'ny_api_secret_c21',
+        webhookSecret,
+      });
+
+      let nystorePurchaseCount = 0;
+      supplierService.setFetchOverride(async (url: string) => {
+        if (url.includes('mock-nystore.local/v1/balance')) {
+          return new Response(JSON.stringify({ balance_usdt: '18.2500', currency: 'USDT' }), { status: 200 });
+        }
+        if (url.includes('mock-nystore.local/v1/products')) {
+          return new Response(JSON.stringify({
+            products: [
+              { id: 'ny_sku_design_1', name: 'C21 Design Pro License', your_cost: '3.0000', stock: 15 },
+            ],
+          }), { status: 200 });
+        }
+        if (url.includes('mock-nystore.local/v1/quote')) {
+          return new Response(JSON.stringify({
+            product_id: 'ny_sku_design_1',
+            unit_cost: '3.0000',
+            total_cost: '3.0000',
+            available_stock: 15,
+            in_stock: true,
+          }), { status: 200 });
+        }
+        if (url.includes('mock-nystore.local/v1/order') && !url.includes('/orders/')) {
+          nystorePurchaseCount++;
+          if (nystorePurchaseCount === 1) {
+            return new Response(JSON.stringify({
+              success: true,
+              status: 'completed',
+              order_ref: 'ny_ord_1001',
+              delivered_items: ['NY-CREDENTIAL-KEY-1'],
+              proof_files: [{ filename: 'activation.png', url: 'https://proof.cdn.local/activation_1001.png' }],
+            }), { status: 200 });
+          }
+          // Second order returns async in_progress -> reconciled by webhook!
+          return new Response(JSON.stringify({
+            success: true,
+            status: 'in_progress',
+            order_ref: 'ny_ord_webhook_2002',
+          }), { status: 200 });
+        }
+        if (url.includes('mock-nystore.local/v1/orders/lookup')) {
+          if (url.includes('__diag_nonexistent_probe__')) {
+            return new Response(JSON.stringify({ found: false, status: 'not_found' }), { status: 404 });
+          }
+          return new Response(JSON.stringify({
+            status: 'completed',
+            order_ref: 'ny_ord_rec_1',
+            delivered_items: ['NY-REC-KEY'],
+            proof_files: ['https://proof.cdn.local/rec_proof.pdf'],
+          }), { status: 200 });
+        }
+        // Simulate Primary AiToolShop OUT_OF_STOCK to verify failover to Backup 1 = NyStore!
+        return new Response(JSON.stringify({ success: false, error_code: 'OUT_OF_STOCK', message: 'Primary depleted' }), { status: 400 });
+      });
+
+      // 1) Balance, Catalog Sync, Quote, Low Balance alert check
+      const bal = await supplierService.checkSupplierBalanceViaDriver('nystore');
+      assert.strictEqual(bal.ok, true);
+      assert.strictEqual(bal.balanceUsdt, '18.2500');
+
+      const sync = await supplierService.syncSupplierViaDriver('nystore');
+      assert.strictEqual(sync.ok, true);
+      assert.strictEqual(sync.totalCount, 1);
+
+      const quote = await supplierService.quoteProductViaDriver('nystore', 'ny_sku_design_1', 1);
+      assert.strictEqual(quote.ok, true);
+      assert.strictEqual(quote.unitCostUsdt, '3.0000');
+
+      // 2) Failover routing: Primary AiToolShop OUT_OF_STOCK -> Backup 1 (NyStore) delivers credentials + proof_files!
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'aitoolshop', supplierProductId: 'ny_primary_fallback' },
+        adminId
+      );
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 2, supplierId: 'nystore', supplierProductId: 'ny_sku_design_1' },
+        adminId
+      );
+
+      const failoverOrder = await orderService.checkout({ userId: custId, productId: prodId, quantity: 1 });
+      createdOrderIds.push(failoverOrder.orderId);
+      assert.strictEqual(failoverOrder.status, 'COMPLETED');
+      assert.ok(failoverOrder.deliveredItems.includes('NY-CREDENTIAL-KEY-1'));
+      assert.ok(
+        failoverOrder.deliveredItems.some(i => i.includes('Proof: activation.png: https://proof.cdn.local/activation_1001.png')),
+        'NyStore proof file must be normalized into encrypted delivered items'
+      );
+
+      const soRow = await db.queryRow<any>(
+        'SELECT fulfilled_supplier_id, response_payload FROM supplier_orders WHERE local_order_id = $1',
+        [failoverOrder.orderId]
+      );
+      assert.strictEqual(soRow?.fulfilled_supplier_id, 'nystore');
+      assert.ok(!String(soRow?.response_payload || '').includes('activation_1001.png'), 'Raw proof URLs must be redacted from supplier_orders.response_payload');
+
+      const encRows = await db.query<any>('SELECT content FROM delivered_items WHERE local_order_id = $1', [failoverOrder.orderId]);
+      assert.strictEqual(encRows.rows.length, 2);
+      assert.ok(encRows.rows.every(r => r.content.startsWith('v1:')));
+
+      // 3) Webhook flow: place second order (pending_invite via in_progress), reject unauthorized 401, then complete via HMAC webhook
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'nystore', supplierProductId: 'ny_sku_design_1' },
+        adminId
+      );
+      const asyncOrder = await orderService.checkout({ userId: custId, productId: prodId, quantity: 1 });
+      createdOrderIds.push(asyncOrder.orderId);
+      assert.strictEqual(asyncOrder.status, 'PENDING_INVITE');
+
+      const webhookBody = {
+        event: 'order.completed',
+        status: 'completed',
+        order_ref: 'ny_ord_webhook_2002',
+        delivered_items: ['NY-WEBHOOK-KEY-99'],
+        proof_files: ['https://proof.cdn.local/webhook_receipt_2002.png'],
+      };
+      const rawBody = JSON.stringify(webhookBody);
+      const validSig = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody, 'utf8').digest('hex');
+
+      const unauthRes = await handleNyStoreWebhookHttp({
+        rawBody,
+        body: webhookBody,
+        signatureHeader: 'sha256=deadbeef',
+      });
+      assert.strictEqual(unauthRes.statusCode, 401, 'Invalid webhook signature must return 401');
+
+      const webhookOk = await handleNyStoreWebhookHttp({
+        rawBody,
+        body: webhookBody,
+        signatureHeader: validSig,
+      });
+      assert.strictEqual(webhookOk.statusCode, 200);
+      assert.strictEqual(webhookOk.payload.applied, true);
+      assert.strictEqual(webhookOk.payload.status, 'COMPLETED');
+      assert.ok(webhookOk.payload.deliveredItems.includes('NY-WEBHOOK-KEY-99'));
+      assert.ok(webhookOk.payload.deliveredItems.some((d: string) => d.includes('webhook_receipt_2002.png')));
+
+      // Idempotent replay of exact same webhook must not duplicate items or debit wallet
+      const balBeforeReplay = (await walletService.getBalance(custId)).balance;
+      const webhookReplay = await handleNyStoreWebhookHttp({
+        rawBody,
+        body: webhookBody,
+        signatureHeader: validSig,
+      });
+      assert.strictEqual(webhookReplay.statusCode, 200);
+      assert.strictEqual(webhookReplay.payload.applied, false);
+      assert.strictEqual(webhookReplay.payload.status, 'COMPLETED');
+      assert.strictEqual((await walletService.getBalance(custId)).balance.toFixed(4), balBeforeReplay.toFixed(4));
+
+      // 4) Order Recovery + Health + Diagnostics (including Webhook & Proof checks)
+      const ctxCheck = await supplierService.runSupplierHealthCheck('nystore');
+      assert.strictEqual(ctxCheck.ok, true);
+      const diag = await supplierService.runSupplierDriverDiagnostics('nystore');
+      assert.strictEqual(diag.ok, true);
+      assert.ok(diag.checks.some(c => c.name === 'Webhook Endpoint Support' && c.ok));
+      assert.ok(diag.checks.some(c => c.name === 'Proof Files Normalization' && c.ok));
+
+      const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+      const nySum = summaries.find(s => s.id === 'nystore');
+      assert.ok(nySum);
+      assert.strictEqual(nySum!.isLowBalance, true, '18.25 < 20 USDT threshold must alert low balance');
+    } finally {
+      supplierService.resetTestState();
+      (config.safety as any).liveOrderingEnabled = prevLive;
+      await supplierService.setSupplierFlag('nystore', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('nystore', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('nystore', 'ordering_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('nystore', 'sync_enabled', false, adminId).catch(() => {});
+      if (createdOrderIds.length > 0) {
+        await db.query('DELETE FROM delivered_items WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM supplier_orders WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM local_orders WHERE id = ANY($1)', [createdOrderIds]).catch(() => {});
+      }
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_id = $1', ['nystore']).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+      await redis.del('supplier_ctrl:nystore').catch(() => {});
+      await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
+    }
+  });
+
+  await it('Contract 21.3: Cuppon\'sHub Integration & 10-Point Activation (Balance, Products, Live Inventory, Quote, Purchase, Recovery, Health, Diagnostics, Failover)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '988403';
+    await ensureAuditUser(custId, '40.0000');
+
+    const prodId = 'sp_c21_cuppons';
+    await db.query(
+      `INSERT INTO supplier_products (
+        id, supplier, supplier_product_id, original_name, original_description,
+        latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload
+      ) VALUES ($1, 'cupponshub', 'ch_sku_voucher_1', 'C21 Store Gift Voucher', 'Digital voucher', '4.0000', 12, FALSE, TRUE, 'account', '{}')
+      ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_cost = '4.0000', latest_stock = 12`,
+      [prodId]
+    );
+    await pricingService.setFixedRetailPrice(prodId, '7.50', adminId);
+
+    const prevLive = config.safety.liveOrderingEnabled;
+    (config.safety as any).liveOrderingEnabled = true;
+    const createdOrderIds: string[] = [];
+
+    try {
+      await supplierService.setSupplierFlag('cupponshub', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('cupponshub', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('cupponshub', 'ordering_enabled', true, adminId);
+      await supplierService.setSupplierFlag('cupponshub', 'sync_enabled', true, adminId);
+
+      supplierService.setTestCupponsHubConfig({
+        baseUrl: 'https://mock-cupponshub.local/v1',
+        apiKey: 'ch_api_key_c21',
+      });
+
+      let failFirstPostOrder = true;
+      supplierService.setFetchOverride(async (url: string) => {
+        if (url.includes('mock-cupponshub.local/v1/balance')) {
+          return new Response(JSON.stringify({ balance_usdt: '125.0000', currency: 'USDT' }), { status: 200 });
+        }
+        if (url.includes('mock-cupponshub.local/v1/products')) {
+          return new Response(JSON.stringify({
+            products: [{ id: 'ch_sku_voucher_1', name: 'C21 Store Gift Voucher', your_cost: '4.0000', available_quantity: 12 }],
+          }), { status: 200 });
+        }
+        if (url.includes('mock-cupponshub.local/v1/inventory/ch_sku_voucher_1')) {
+          return new Response(JSON.stringify({ product_id: 'ch_sku_voucher_1', available_quantity: 12, in_stock: true }), { status: 200 });
+        }
+        if (url.includes('mock-cupponshub.local/v1/quote')) {
+          return new Response(JSON.stringify({ product_id: 'ch_sku_voucher_1', unit_cost: '4.0000', available_stock: 12, in_stock: true }), { status: 200 });
+        }
+        if (url.includes('mock-cupponshub.local/v1/order') && !url.includes('/orders/')) {
+          if (failFirstPostOrder) {
+            failFirstPostOrder = false;
+            return new Response('Gateway Timeout', { status: 504 });
+          }
+          return new Response(JSON.stringify({
+            success: true,
+            status: 'completed',
+            order_ref: 'ch_ord_777',
+            delivered_items: ['VOUCHER-CH-777-XYZ'],
+          }), { status: 200 });
+        }
+        if (url.includes('mock-cupponshub.local/v1/orders/lookup')) {
+          if (url.includes('__diag_nonexistent_probe__')) {
+            return new Response(JSON.stringify({ found: false, status: 'not_found' }), { status: 404 });
+          }
+          return new Response(JSON.stringify({
+            status: 'completed',
+            order_ref: 'ch_ord_recovered_504',
+            delivered_items: ['VOUCHER-CH-REC-504'],
+          }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      });
+
+      // 1) Balance, Catalog Sync, Live Inventory, Quote
+      const bal = await supplierService.checkSupplierBalanceViaDriver('cupponshub');
+      assert.strictEqual(bal.ok, true);
+      assert.strictEqual(bal.balanceUsdt, '125.0000');
+
+      const sync = await supplierService.syncSupplierViaDriver('cupponshub');
+      assert.strictEqual(sync.ok, true);
+      assert.strictEqual(sync.totalCount, 1);
+
+      const chDriver = supplierDriverRegistry.getDriver('cupponshub');
+      const stockRes = await chDriver.stockCheck({
+        supplierId: 'cupponshub',
+        supplierName: "Cuppon'sHub",
+        baseUrl: 'https://mock-cupponshub.local/v1',
+        apiKey: 'ch_api_key_c21',
+        fetchFn: (url, init) => (supplierService as any).performFetch(url, init),
+      }, 'ch_sku_voucher_1');
+      assert.strictEqual(stockRes.ok, true);
+      assert.strictEqual(stockRes.inStock, true);
+      assert.strictEqual(stockRes.stock, 12);
+
+      const quote = await supplierService.quoteProductViaDriver('cupponshub', 'ch_sku_voucher_1', 1);
+      assert.strictEqual(quote.ok, true);
+      assert.strictEqual(quote.unitCostUsdt, '4.0000');
+
+      // 2) Mapping + Order 504 -> UNCERTAIN -> Recovery completes cleanly
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'cupponshub', supplierProductId: 'ch_sku_voucher_1' },
+        adminId
+      );
+
+      const uncertainOrd = await orderService.checkout({ userId: custId, productId: prodId, quantity: 1 });
+      createdOrderIds.push(uncertainOrd.orderId);
+      assert.strictEqual(uncertainOrd.status, 'UNCERTAIN');
+
+      const rec = await orderService.reconcileUncertainOrder(uncertainOrd.orderId);
+      assert.strictEqual(rec.status, 'COMPLETED');
+      assert.deepStrictEqual(rec.deliveredItems, ['VOUCHER-CH-REC-504']);
+
+      // 3) Diagnostics (includes Inventory API Check) & Health
+      const [diag, health] = await Promise.all([
+        supplierService.runSupplierDriverDiagnostics('cupponshub'),
+        supplierService.runSupplierHealthCheck('cupponshub'),
+      ]);
+      assert.strictEqual(diag.ok, true);
+      assert.strictEqual(health.ok, true);
+      assert.ok(diag.checks.some(c => c.name === 'Inventory API Check' && c.ok));
+    } finally {
+      supplierService.resetTestState();
+      (config.safety as any).liveOrderingEnabled = prevLive;
+      await supplierService.setSupplierFlag('cupponshub', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('cupponshub', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('cupponshub', 'ordering_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('cupponshub', 'sync_enabled', false, adminId).catch(() => {});
+      if (createdOrderIds.length > 0) {
+        await db.query('DELETE FROM delivered_items WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM supplier_orders WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM local_orders WHERE id = ANY($1)', [createdOrderIds]).catch(() => {});
+      }
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_id = $1', ['cupponshub']).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+      await redis.del('supplier_ctrl:cupponshub').catch(() => {});
+      await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
+    }
+  });
+
+  await it('Contract 21.4: ZFour Integration & 10-Point Activation (Balance, Products, Quote, Order, Order Tracking Recovery, Health, Diagnostics, Failover, Analytics)', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '988404';
+    await ensureAuditUser(custId, '40.0000');
+
+    const prodId = 'sp_c21_zfour';
+    await db.query(
+      `INSERT INTO supplier_products (
+        id, supplier, supplier_product_id, original_name, original_description,
+        latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload
+      ) VALUES ($1, 'zfour', 'zf_sku_1', 'C21 Stream Access', 'ZFour Pass', '2.5000', 30, FALSE, TRUE, 'account', '{}')
+      ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_cost = '2.5000', latest_stock = 30`,
+      [prodId]
+    );
+    await pricingService.setFixedRetailPrice(prodId, '5.50', adminId);
+
+    const prevLive = config.safety.liveOrderingEnabled;
+    (config.safety as any).liveOrderingEnabled = true;
+    const createdOrderIds: string[] = [];
+
+    try {
+      await supplierService.setSupplierFlag('zfour', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('zfour', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('zfour', 'ordering_enabled', true, adminId);
+      await supplierService.setSupplierFlag('zfour', 'sync_enabled', true, adminId);
+
+      supplierService.setTestZFourConfig({
+        baseUrl: 'https://mock-zfour.local/v1',
+        apiKey: 'zf_api_key_c21',
+      });
+
+      let trackStage = 0;
+      supplierService.setFetchOverride(async (url: string) => {
+        if (url.includes('mock-zfour.local/v1/balance')) {
+          return new Response(JSON.stringify({ balance_usdt: '65.0000', currency: 'USDT' }), { status: 200 });
+        }
+        if (url.includes('mock-zfour.local/v1/products')) {
+          return new Response(JSON.stringify({
+            products: [{ id: 'zf_sku_1', name: 'C21 Stream Access', your_cost: '2.5000', stock: 30 }],
+          }), { status: 200 });
+        }
+        if (url.includes('mock-zfour.local/v1/quote')) {
+          return new Response(JSON.stringify({ product_id: 'zf_sku_1', unit_cost: '2.5000', available_stock: 30, in_stock: true }), { status: 200 });
+        }
+        if (url.includes('mock-zfour.local/v1/order') && !url.includes('/orders')) {
+          return new Response(JSON.stringify({
+            success: true,
+            status: 'in_progress',
+            order_ref: 'zf_track_ord_88',
+          }), { status: 200 });
+        }
+        if (url.includes('mock-zfour.local/v1/orders/lookup')) {
+          // Force fallback to /orders/:ref/track to test ZFour tracking endpoint
+          return new Response(JSON.stringify({ found: false, status: 'not_found' }), { status: 404 });
+        }
+        if (url.includes('mock-zfour.local/v1/orders/zf_track_ord_88/track')) {
+          trackStage++;
+          if (trackStage === 1) {
+            return new Response(JSON.stringify({ tracking_status: 'tracked', order_ref: 'zf_track_ord_88' }), { status: 200 });
+          }
+          return new Response(JSON.stringify({
+            tracking_status: 'completed',
+            order_ref: 'zf_track_ord_88',
+            delivered_items: ['ZFOUR-TRACKED-PASS-88'],
+          }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      });
+
+      const [bal, sync, quote] = await Promise.all([
+        supplierService.checkSupplierBalanceViaDriver('zfour'),
+        supplierService.syncSupplierViaDriver('zfour'),
+        supplierService.quoteProductViaDriver('zfour', 'zf_sku_1', 1),
+      ]);
+      assert.strictEqual(bal.ok, true);
+      assert.strictEqual(bal.balanceUsdt, '65.0000');
+      assert.strictEqual(sync.ok, true);
+      assert.strictEqual(quote.ok, true);
+      assert.strictEqual(quote.unitCostUsdt, '2.5000');
+
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'zfour', supplierProductId: 'zf_sku_1' },
+        adminId
+      );
+
+      // Order -> in_progress -> Order Tracking (/orders/:ref/track) tracked -> completed
+      const ord = await orderService.checkout({ userId: custId, productId: prodId, quantity: 1 });
+      createdOrderIds.push(ord.orderId);
+      assert.strictEqual(ord.status, 'PENDING_INVITE');
+
+      const trackPending = await orderService.reconcileUncertainOrder(ord.orderId);
+      assert.strictEqual(trackPending.status, 'PENDING_INVITE');
+      assert.strictEqual(trackPending.lookupMethod, 'GET_ORDER_BY_REF');
+
+      const trackDone = await orderService.reconcileUncertainOrder(ord.orderId);
+      assert.strictEqual(trackDone.status, 'COMPLETED');
+      assert.deepStrictEqual(trackDone.deliveredItems, ['ZFOUR-TRACKED-PASS-88']);
+
+      const [diag, health] = await Promise.all([
+        supplierService.runSupplierDriverDiagnostics('zfour'),
+        supplierService.runSupplierHealthCheck('zfour'),
+      ]);
+      assert.strictEqual(diag.ok, true);
+      assert.strictEqual(health.ok, true);
+      assert.ok(diag.checks.some(c => c.name.includes('Order Tracking') && c.ok));
+    } finally {
+      supplierService.resetTestState();
+      (config.safety as any).liveOrderingEnabled = prevLive;
+      await supplierService.setSupplierFlag('zfour', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('zfour', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('zfour', 'ordering_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('zfour', 'sync_enabled', false, adminId).catch(() => {});
+      if (createdOrderIds.length > 0) {
+        await db.query('DELETE FROM delivered_items WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM supplier_orders WHERE local_order_id = ANY($1)', [createdOrderIds]).catch(() => {});
+        await db.query('DELETE FROM local_orders WHERE id = ANY($1)', [createdOrderIds]).catch(() => {});
+      }
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_id = $1', ['zfour']).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+      await redis.del('supplier_ctrl:zfour').catch(() => {});
+      await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
     }
   });
 

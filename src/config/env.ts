@@ -3,6 +3,17 @@ dotenv.config();
 
 export const OFFICIAL_AITOOLSHOP_DOC_BASE_URL = 'https://bot.aitoolifystudio.io/api/reseller/v1';
 export const DEFAULT_AITOOLSHOP_BASE_URL = 'https://aitoolshop.aitoolifystudio.io/api/reseller/v1';
+export const DEFAULT_VENTEBOT_BASE_URL = 'https://api.ventebot.example/v1';
+export const DEFAULT_NYSTORE_BASE_URL = 'https://api.nystore.example/v1';
+export const DEFAULT_CUPPONSHUB_BASE_URL = 'https://api.cupponshub.example/v1';
+export const DEFAULT_ZFOUR_BASE_URL = 'https://api.zfour.example/v1';
+
+export interface ExternalSupplierEnvConfig {
+  baseUrl: string;
+  baseUrlSource: 'ENV_OVERRIDE' | 'CODE_DEFAULT';
+  apiKey?: string;
+  webhookSecret?: string;
+}
 
 export interface AppConfig {
   nodeEnv: string;
@@ -21,6 +32,12 @@ export interface AppConfig {
     baseUrlSource: 'ENV_OVERRIDE' | 'CODE_DEFAULT';
     officialDocBaseUrl: string;
     apiKey?: string;
+  };
+  suppliers: {
+    ventebot: ExternalSupplierEnvConfig;
+    nystore: ExternalSupplierEnvConfig;
+    cupponshub: ExternalSupplierEnvConfig;
+    zfour: ExternalSupplierEnvConfig;
   };
   binance: {
     enabled: boolean;
@@ -81,6 +98,21 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   const explicitSupplierBaseUrl = typeof env.AITOOLSHOP_BASE_URL === 'string' ? env.AITOOLSHOP_BASE_URL.trim() : '';
   const resolvedSupplierBaseUrl = (explicitSupplierBaseUrl || DEFAULT_AITOOLSHOP_BASE_URL).replace(/\/+$/, '');
+  const parseExtSupplier = (urlKey: string, keyName: string, defaultUrl: string, secretKey?: string): ExternalSupplierEnvConfig => {
+    const rawUrl = typeof env[urlKey] === 'string' ? env[urlKey]!.trim() : '';
+    const resolvedUrl = (rawUrl || defaultUrl).replace(/\/+$/, '');
+    const rawApiKey = typeof env[keyName] === 'string' && env[keyName]!.trim().length > 0 ? env[keyName]!.trim() : undefined;
+    const rawSecret =
+      secretKey && typeof env[secretKey] === 'string' && env[secretKey]!.trim().length > 0
+        ? env[secretKey]!.trim()
+        : undefined;
+    return {
+      baseUrl: resolvedUrl,
+      baseUrlSource: rawUrl ? 'ENV_OVERRIDE' : 'CODE_DEFAULT',
+      apiKey: rawApiKey,
+      ...(secretKey ? { webhookSecret: rawSecret } : {}),
+    };
+  };
 
   return {
     nodeEnv: env.NODE_ENV || 'development',
@@ -99,6 +131,12 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       baseUrlSource: explicitSupplierBaseUrl ? 'ENV_OVERRIDE' : 'CODE_DEFAULT',
       officialDocBaseUrl: OFFICIAL_AITOOLSHOP_DOC_BASE_URL,
       apiKey: env.AITOOLSHOP_RESELLER_API_KEY,
+    },
+    suppliers: {
+      ventebot: parseExtSupplier('VENTEBOT_BASE_URL', 'VENTEBOT_API_KEY', DEFAULT_VENTEBOT_BASE_URL),
+      nystore: parseExtSupplier('NYSTORE_BASE_URL', 'NYSTORE_API_KEY', DEFAULT_NYSTORE_BASE_URL, 'NYSTORE_WEBHOOK_SECRET'),
+      cupponshub: parseExtSupplier('CUPPONSHUB_BASE_URL', 'CUPPONSHUB_API_KEY', DEFAULT_CUPPONSHUB_BASE_URL),
+      zfour: parseExtSupplier('ZFOUR_BASE_URL', 'ZFOUR_API_KEY', DEFAULT_ZFOUR_BASE_URL),
     },
     binance: {
       enabled: env.BINANCE_PAY_ENABLED === 'true',
@@ -152,6 +190,29 @@ export function getSanitizedConfig(): Record<string, unknown> {
       baseUrlSource: config.supplier.baseUrlSource,
       officialDocBaseUrl: config.supplier.officialDocBaseUrl,
       apiKeyConfigured: Boolean(config.supplier.apiKey),
+    },
+    suppliers: {
+      ventebot: {
+        baseUrl: config.suppliers.ventebot.baseUrl,
+        baseUrlSource: config.suppliers.ventebot.baseUrlSource,
+        apiKeyConfigured: Boolean(config.suppliers.ventebot.apiKey),
+      },
+      nystore: {
+        baseUrl: config.suppliers.nystore.baseUrl,
+        baseUrlSource: config.suppliers.nystore.baseUrlSource,
+        apiKeyConfigured: Boolean(config.suppliers.nystore.apiKey),
+        webhookSecretConfigured: Boolean(config.suppliers.nystore.webhookSecret),
+      },
+      cupponshub: {
+        baseUrl: config.suppliers.cupponshub.baseUrl,
+        baseUrlSource: config.suppliers.cupponshub.baseUrlSource,
+        apiKeyConfigured: Boolean(config.suppliers.cupponshub.apiKey),
+      },
+      zfour: {
+        baseUrl: config.suppliers.zfour.baseUrl,
+        baseUrlSource: config.suppliers.zfour.baseUrlSource,
+        apiKeyConfigured: Boolean(config.suppliers.zfour.apiKey),
+      },
     },
     binance: {
       enabled: config.binance.enabled,

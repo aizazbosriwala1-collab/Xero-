@@ -10,6 +10,7 @@ import {
   DriverContext,
   DriverDiagnosticsResult,
   DriverHealthResult,
+  DriverQuoteResult,
 } from './supplierDrivers.js';
 import { supplierEcosystemService } from './supplierEcosystem.js';
 
@@ -60,6 +61,7 @@ export interface SupplierOrderResponse {
   fulfilled_supplier_id?: string;
   status: 'completed' | 'pending_invite' | 'pending' | 'failed' | 'replayed';
   delivered_items?: string[];
+  proof_files?: string[];
   message?: string;
   error_code?: string;
   raw?: any;
@@ -90,11 +92,12 @@ export interface SupplierOrderLookupResult {
   ok: boolean;
   found: boolean;
   httpStatus: number;
-  lookupMethod: 'GET_ORDER_BY_REF' | 'GET_ORDERS_BY_KEY' | 'NONE';
+  lookupMethod: 'GET_ORDER_BY_REF' | 'GET_ORDERS_BY_KEY' | 'GET_ORDERS_LOOKUP' | 'NONE';
   status: SupplierOrderLookupStatus;
   order_ref?: string;
   idempotency_key?: string;
   delivered_items: string[];
+  proof_files?: string[];
   error_code?: string;
   message?: string;
   raw?: any;
@@ -174,11 +177,35 @@ export function maskSupplierRef(ref?: string | null): string {
 export class SupplierService {
   private baseUrl: string;
   private apiKey?: string;
+  private externalBaseUrls: Record<string, string> = {};
+  private externalBaseUrlOverridden: Record<string, boolean> = {};
+  private externalApiKeys: Record<string, string | undefined> = {};
+  private externalWebhookSecrets: Record<string, string | undefined> = {};
   private fetchOverride: ((url: string, init?: RequestInit) => Promise<Response>) | null = null;
 
   constructor() {
     this.baseUrl = config.supplier.baseUrl.replace(/\/+$/, '');
     this.apiKey = config.supplier.apiKey;
+    this.initExternalDefaults();
+  }
+
+  private initExternalDefaults() {
+    this.externalBaseUrls = {
+      ventebot: config.suppliers.ventebot.baseUrl.replace(/\/+$/, ''),
+      nystore: config.suppliers.nystore.baseUrl.replace(/\/+$/, ''),
+      cupponshub: config.suppliers.cupponshub.baseUrl.replace(/\/+$/, ''),
+      zfour: config.suppliers.zfour.baseUrl.replace(/\/+$/, ''),
+    };
+    this.externalBaseUrlOverridden = {};
+    this.externalApiKeys = {
+      ventebot: config.suppliers.ventebot.apiKey,
+      nystore: config.suppliers.nystore.apiKey,
+      cupponshub: config.suppliers.cupponshub.apiKey,
+      zfour: config.suppliers.zfour.apiKey,
+    };
+    this.externalWebhookSecrets = {
+      nystore: config.suppliers.nystore.webhookSecret,
+    };
   }
 
   public setFetchOverride(fn: ((url: string, init?: RequestInit) => Promise<Response>) | null) {
@@ -193,10 +220,58 @@ export class SupplierService {
     this.baseUrl = (baseUrl || config.supplier.baseUrl).replace(/\/+$/, '');
   }
 
+  public setTestExternalSupplierConfig(
+    supplierId: 'ventebot' | 'nystore' | 'cupponshub' | 'zfour',
+    opts: { baseUrl?: string; apiKey?: string; webhookSecret?: string }
+  ) {
+    const id = supplierId.toLowerCase();
+    if ('baseUrl' in opts) {
+      if (opts.baseUrl) {
+        this.externalBaseUrls[id] = opts.baseUrl.replace(/\/+$/, '');
+        this.externalBaseUrlOverridden[id] = true;
+      } else {
+        const defUrl = config.suppliers[supplierId]?.baseUrl || '';
+        this.externalBaseUrls[id] = defUrl.replace(/\/+$/, '');
+        this.externalBaseUrlOverridden[id] = false;
+      }
+    }
+    if ('apiKey' in opts) {
+      this.externalApiKeys[id] = opts.apiKey;
+    }
+    if ('webhookSecret' in opts) {
+      this.externalWebhookSecrets[id] = opts.webhookSecret;
+    }
+  }
+
+  public setTestVentebotApiKey(apiKey?: string) {
+    this.setTestExternalSupplierConfig('ventebot', { apiKey });
+  }
+
+  public setTestVentebotBaseUrl(baseUrl?: string) {
+    this.setTestExternalSupplierConfig('ventebot', { baseUrl });
+  }
+
+  public setTestNyStoreConfig(opts: { baseUrl?: string; apiKey?: string; webhookSecret?: string }) {
+    this.setTestExternalSupplierConfig('nystore', opts);
+  }
+
+  public setTestCupponsHubConfig(opts: { baseUrl?: string; apiKey?: string }) {
+    this.setTestExternalSupplierConfig('cupponshub', opts);
+  }
+
+  public setTestZFourConfig(opts: { baseUrl?: string; apiKey?: string }) {
+    this.setTestExternalSupplierConfig('zfour', opts);
+  }
+
+  public getSupplierWebhookSecret(supplierId: string): string | undefined {
+    return this.externalWebhookSecrets[supplierId.toLowerCase()];
+  }
+
   public resetTestState() {
     this.fetchOverride = null;
     this.apiKey = config.supplier.apiKey;
     this.baseUrl = config.supplier.baseUrl.replace(/\/+$/, '');
+    this.initExternalDefaults();
   }
 
   /**
@@ -394,6 +469,43 @@ export class SupplierService {
     return await this.getSupplierControl(supplierId);
   }
 
+  private isPlaceholderUrl(url?: string | null): boolean {
+    const clean = String(url || '').trim().toLowerCase();
+    return !clean || clean.includes('.example') || clean.includes('.invalid');
+  }
+
+  private resolveEffectiveBaseUrl(supplierId: string, dbBaseUrl?: string): string {
+    const cleanId = supplierId.toLowerCase();
+    if (cleanId === 'aitoolshop') {
+      return this.baseUrl.replace(/\/+$/, '');
+    }
+    const extUrl = this.externalBaseUrls[cleanId];
+    if (extUrl !== undefined) {
+      if (this.externalBaseUrlOverridden[cleanId] && extUrl) {
+        return extUrl.replace(/\/+$/, '');
+      }
+      if (dbBaseUrl && !this.isPlaceholderUrl(dbBaseUrl)) {
+        return dbBaseUrl.replace(/\/+$/, '');
+      }
+      if (extUrl && !this.isPlaceholderUrl(extUrl)) {
+        return extUrl.replace(/\/+$/, '');
+      }
+      return (dbBaseUrl || extUrl || '').replace(/\/+$/, '');
+    }
+    return String(dbBaseUrl || '').replace(/\/+$/, '');
+  }
+
+  private resolveSupplierApiKey(supplierId: string): string | undefined {
+    const cleanId = supplierId.toLowerCase();
+    if (cleanId === 'aitoolshop') {
+      return this.apiKey;
+    }
+    if (Object.prototype.hasOwnProperty.call(this.externalApiKeys, cleanId)) {
+      return this.externalApiKeys[cleanId] || (this.fetchOverride ? this.apiKey : undefined);
+    }
+    return undefined;
+  }
+
   private async buildDriverContext(supplierId: string): Promise<{
     driverKey: string;
     ctx: DriverContext;
@@ -401,7 +513,17 @@ export class SupplierService {
     const row = await db.queryRow<any>('SELECT * FROM suppliers WHERE id = $1', [supplierId]);
     const ctrl = await this.getSupplierControl(supplierId);
     const driverKey = String(row?.driver_key || (supplierId === 'aitoolshop' ? 'aitoolshop' : supplierId));
-    const effectiveBase = (supplierId === 'aitoolshop' ? this.baseUrl : ctrl.baseUrl || this.baseUrl).replace(/\/+$/, '');
+    const effectiveBase = this.resolveEffectiveBaseUrl(supplierId, row?.base_url ?? ctrl.baseUrl);
+    const trackedOverride = this.fetchOverride
+      ? async (url: string, init?: RequestInit) => {
+          const startedAt = Date.now();
+          try {
+            return await this.fetchOverride!(url, init);
+          } finally {
+            perfTracker.recordSupplier(Date.now() - startedAt);
+          }
+        }
+      : undefined;
 
     return {
       driverKey,
@@ -409,13 +531,14 @@ export class SupplierService {
         supplierId: ctrl.id,
         supplierName: ctrl.name,
         baseUrl: effectiveBase,
-        apiKey: supplierId === 'aitoolshop' ? this.apiKey : undefined,
-        fetchFn: this.fetchOverride || undefined,
+        apiKey: this.resolveSupplierApiKey(supplierId),
+        webhookSecret: this.externalWebhookSecrets[supplierId.toLowerCase()],
+        fetchFn: trackedOverride,
         delegates: {
           getBalanceDetailed: () => this.getBalanceDetailed(),
           fetchLiveProductsDetailed: () => this.fetchLiveProductsDetailed(),
           placeOrderDirect: (payload, endpointBase) => this.dispatchOrderToEndpoint(payload, endpointBase, ctrl.id),
-          lookupOrderReadOnly: params => this.lookupOrderReadOnly(params),
+          lookupOrderReadOnly: params => this.lookupAiToolShopOrderReadOnly(params),
           runReadOnlyDiagnostic: ref => this.runReadOnlyDiagnostic(ref),
         },
       },
@@ -534,6 +657,47 @@ export class SupplierService {
       updatedCount: 0,
       totalCount: mirrored.mirroredCount,
       message: `Mirrored ${mirrored.mirroredCount} items from ${ctrl.name}.`,
+    };
+  }
+
+  public async quoteProductViaDriver(
+    supplierId: string,
+    supplierProductId: string | number,
+    quantity = 1
+  ): Promise<DriverQuoteResult> {
+    const { driverKey, ctx } = await this.buildDriverContext(supplierId);
+    const driver = supplierDriverRegistry.getDriver(driverKey);
+    return await driver.quote(ctx, { supplierProductId, quantity });
+  }
+
+  public async listSupplierOrdersReadOnly(supplierId: string, limit = 10): Promise<SupplierListOrdersResult> {
+    if (supplierId === 'aitoolshop') {
+      return await this.listOrdersReadOnly();
+    }
+    const res = await db.query<any>(
+      `SELECT so.supplier_order_ref, so.idempotency_key, so.supplier_status, so.created_at,
+              lo.id as local_order_id, lo.product_id, lo.quantity, lo.total_price, lo.status as local_status
+       FROM supplier_orders so
+       LEFT JOIN local_orders lo ON lo.id = so.local_order_id
+       WHERE so.fulfilled_supplier_id = $1
+       ORDER BY so.created_at DESC
+       LIMIT $2`,
+      [supplierId, limit]
+    );
+    return {
+      ok: true,
+      httpStatus: 200,
+      orders: res.rows.map(r => ({
+        order_ref: r.supplier_order_ref || r.local_order_id,
+        id: r.local_order_id,
+        idempotency_key: r.idempotency_key,
+        status: r.local_status || r.supplier_status || 'UNKNOWN',
+        product_id: r.product_id,
+        quantity: r.quantity !== undefined ? Number(r.quantity) : undefined,
+        total_cost: r.total_price !== undefined ? String(r.total_price) : undefined,
+        delivered_items: [],
+        created_at: r.created_at,
+      })),
     };
   }
 
@@ -1038,11 +1202,43 @@ export class SupplierService {
   }
 
   /**
-   * Read-only reconciliation lookup combining GET /order/:ref and GET /orders.
-   * Searches by permanent supplier_order_ref first, then stored idempotency_key.
+   * Read-only reconciliation lookup dispatching by target supplier driver:
+   * - For AiToolShop: combines GET /order/:ref and GET /orders
+   * - For VenteBot / external drivers: invokes driver.orderRecovery (GET /orders/lookup)
    * NEVER triggers POST /order.
    */
   public async lookupOrderReadOnly(params: {
+    supplierOrderRef?: string | null;
+    idempotencyKey?: string | null;
+    supplierId?: string | null;
+  }): Promise<SupplierOrderLookupResult> {
+    const targetSupplierId = String(params.supplierId || 'aitoolshop').trim();
+    if (targetSupplierId && targetSupplierId !== 'aitoolshop') {
+      const started = Date.now();
+      const { driverKey, ctx } = await this.buildDriverContext(targetSupplierId);
+      const driver = supplierDriverRegistry.getDriver(driverKey);
+      const lookupRes = await driver.orderRecovery(ctx, {
+        supplierOrderRef: params.supplierOrderRef,
+        idempotencyKey: params.idempotencyKey,
+      });
+      await supplierEcosystemService.recordHealthLog({
+        supplierId: targetSupplierId,
+        operation: 'ORDER_RECOVERY',
+        success: lookupRes.ok,
+        latencyMs: Date.now() - started,
+        errorCode: lookupRes.ok ? undefined : lookupRes.error_code,
+        errorMessage: lookupRes.ok ? undefined : lookupRes.message,
+      }).catch(() => {});
+      return lookupRes;
+    }
+
+    return await this.lookupAiToolShopOrderReadOnly({
+      supplierOrderRef: params.supplierOrderRef,
+      idempotencyKey: params.idempotencyKey,
+    });
+  }
+
+  private async lookupAiToolShopOrderReadOnly(params: {
     supplierOrderRef?: string | null;
     idempotencyKey?: string | null;
   }): Promise<SupplierOrderLookupResult> {
@@ -1598,15 +1794,6 @@ export class SupplierService {
       };
     }
 
-    if (!this.apiKey) {
-      return {
-        success: false,
-        status: 'failed',
-        error_code: 'INVALID_API_KEY',
-        message: 'Supplier reseller API key is not configured.',
-      };
-    }
-
     const usedExplicitMapping = Boolean(options?.mappedCandidates && options.mappedCandidates.length > 0);
 
     let executionTargets: Array<{
@@ -1619,7 +1806,7 @@ export class SupplierService {
     if (options?.mappedCandidates && options.mappedCandidates.length > 0) {
       executionTargets = options.mappedCandidates.map(c => ({
         id: c.supplierId,
-        baseUrl: (c.supplierId === 'aitoolshop' ? this.baseUrl : c.baseUrl || this.baseUrl).replace(/\/+$/, ''),
+        baseUrl: this.resolveEffectiveBaseUrl(c.supplierId, c.baseUrl),
         supplierProductId: c.supplierProductId,
         driverKey: c.driverKey || c.supplierId,
       }));
@@ -1635,14 +1822,14 @@ export class SupplierService {
         ];
         executionTargets = orderedTargets.map(t => ({
           id: t.id,
-          baseUrl: (t.id === 'aitoolshop' ? this.baseUrl : t.baseUrl || this.baseUrl).replace(/\/+$/, ''),
+          baseUrl: this.resolveEffectiveBaseUrl(t.id, t.baseUrl),
           supplierProductId: payload.product_id,
           driverKey: t.id,
         }));
       } else if (activeCandidates.length > 0) {
         executionTargets = activeCandidates.map(t => ({
           id: t.id,
-          baseUrl: (t.id === 'aitoolshop' ? this.baseUrl : t.baseUrl || this.baseUrl).replace(/\/+$/, ''),
+          baseUrl: this.resolveEffectiveBaseUrl(t.id, t.baseUrl),
           supplierProductId: payload.product_id,
           driverKey: t.id,
         }));
@@ -1678,6 +1865,7 @@ export class SupplierService {
       'PRODUCT_UNAVAILABLE',
       'API_ERROR',
       'SUPPLIER_REJECTED',
+      'FAILED_NO_CHARGE',
     ]);
 
     for (let idx = 0; idx < executionTargets.length; idx++) {
@@ -1688,8 +1876,14 @@ export class SupplierService {
         product_id: target.supplierProductId,
       };
 
+      const { driverKey, ctx } = await this.buildDriverContext(target.id);
+      if (target.baseUrl) {
+        ctx.baseUrl = target.baseUrl;
+      }
+      const driver = supplierDriverRegistry.getDriver(target.driverKey || driverKey);
+
       const attemptStart = Date.now();
-      const singleRes = await this.dispatchOrderToEndpoint(targetPayload, target.baseUrl, target.id);
+      const singleRes = await driver.purchase(ctx, targetPayload);
       const latencyMs = Date.now() - attemptStart;
       singleRes.fulfilled_supplier_id = target.id;
 
@@ -1744,6 +1938,15 @@ export class SupplierService {
     endpointBase: string,
     supplierId: string
   ): Promise<SupplierOrderResponse> {
+    if (supplierId === 'aitoolshop' && !this.apiKey) {
+      return {
+        success: false,
+        status: 'failed',
+        error_code: 'INVALID_API_KEY',
+        message: 'Supplier reseller API key is not configured.',
+      };
+    }
+
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);

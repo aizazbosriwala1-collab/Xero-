@@ -441,6 +441,7 @@ export class AdminHandler {
       const lookup = await supplierService.lookupOrderReadOnly({
         supplierOrderRef: detail.supplierOrderRef,
         idempotencyKey: detail.idempotencyKey,
+        supplierId: detail.fulfilledSupplierId,
       });
 
       await this.recordOrderAuditLog(userId, 'ADMIN_ORDER_SUPPLIER_LOOKUP', orderId, {
@@ -459,9 +460,11 @@ export class AdminHandler {
 
       const resolvedRef = lookup.order_ref || detail.supplierOrderRef || 'NONE';
       const credCount = lookup.delivered_items?.length || 0;
+      const endpointLabel = detail.fulfilledSupplierId === 'ventebot' ? 'GET /orders/lookup' : 'GET /order/{ref}';
       const text =
         `🔎 *SUPPLIER ORDER LOOKUP (READ-ONLY)*\n\n` +
         `• Local Order ID: \`${detail.id}\`\n` +
+        `• Supplier: \`${detail.fulfilledSupplierId}\`\n` +
         `• Supplier Order Ref: \`${this.escapeDiagMarkdown(String(resolvedRef))}\`\n` +
         `• Current Local Status: *${detail.status}*\n\n` +
         `📡 *Supplier API Response:*\n` +
@@ -471,7 +474,7 @@ export class AdminHandler {
         `• Normalized Status: *${lookup.status.toUpperCase()}*\n` +
         `• Credentials Available: *${credCount > 0 ? `YES (${credCount})` : 'NO'}*\n` +
         `• Diagnostic Message: ${this.escapeDiagMarkdown(lookup.message || 'OK')}\n\n` +
-        `_Strictly read-only (GET /order/{ref}). No local state, balance, or order was modified._`;
+        `_Strictly read-only (${endpointLabel}). No local state, balance, or order was modified._`;
 
       await telegramClient.editMessageText(chatId, messageId, text, {
         reply_markup: {
@@ -1941,6 +1944,7 @@ export class AdminHandler {
       data.startsWith('adm:sup_bal:') ||
       data.startsWith('adm:sup_ord:') ||
       data.startsWith('adm:sup_sync:') ||
+      data.startsWith('adm:sup_prod:') ||
       data.startsWith('adm:sup_tog:')
     ) {
       if (data === 'adm:sup') {
@@ -2147,16 +2151,24 @@ export class AdminHandler {
 
       if (data.startsWith('adm:sup_ord:')) {
         const supId = data.slice('adm:sup_ord:'.length);
-        const list = await supplierService.listOrdersReadOnly();
+        const list = await supplierService.listSupplierOrdersReadOnly(supId);
         let notice = list.ok
           ? `📦 *Recent Supplier Orders (${list.orders.length}):*\n` +
             list.orders
               .slice(0, 5)
               .map(o => `• \`${maskSupplierRef(o.order_ref || o.id)}\` — *${o.status || 'UNKNOWN'}*`)
               .join('\n')
-          : `⚠️ GET /orders failed: ${this.escapeDiagMarkdown(list.error || 'ERROR')}`;
-        if (list.ok && list.orders.length === 0) notice = 'ℹ️ No orders returned by supplier GET /orders.';
+          : `⚠️ Orders lookup failed: ${this.escapeDiagMarkdown(list.error || 'ERROR')}`;
+        if (list.ok && list.orders.length === 0) notice = 'ℹ️ No orders recorded for this supplier yet.';
         await this.renderAdminSupplierDetail(chatId, messageId, supId, notice);
+        return;
+      }
+
+      if (data.startsWith('adm:sup_prod:')) {
+        const rest = data.slice('adm:sup_prod:'.length);
+        const [supId, pgStr] = rest.split(':');
+        const page = parseInt(pgStr || '1', 10) || 1;
+        await this.renderAdminSupplierProducts(chatId, messageId, supId, page);
         return;
       }
 
@@ -5509,12 +5521,19 @@ export class AdminHandler {
         ]),
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: 'Sync Catalogue', fallbackEmoji: '🔄', style: 'primary', callbackData: `adm:sup_sync:${s.id}`, forceVisible: true }),
-          ButtonBuilder.buildButton({ text: 'Orders (Read-Only)', fallbackEmoji: '📦', style: 'default', callbackData: `adm:sup_ord:${s.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Mirrored Products', fallbackEmoji: '🛍️', style: 'primary', callbackData: `adm:sup_prod:${s.id}:1`, forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Orders (Read-Only)', fallbackEmoji: '📦', style: 'default', callbackData: `adm:sup_ord:${s.id}`, forceVisible: true }),
           ButtonBuilder.buildButton({ text: 'Driver Diagnostics', fallbackEmoji: '🧪', style: 'primary', callbackData: `adm:sup_drv_d:${s.id}`, forceVisible: true }),
-          ButtonBuilder.buildButton({ text: 'Legacy Diag', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:sup_diag', forceVisible: true }),
         ]),
+        ...(s.id === 'aitoolshop'
+          ? [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Legacy Read-Only Diag', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:sup_diag', forceVisible: true }),
+              ]),
+            ]
+          : []),
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: s.isEnabled ? 'Disable Supplier' : 'Enable Supplier', style: s.isEnabled ? 'danger' : 'success', callbackData: `adm:sup_tog:en:${s.id}`, forceVisible: true }),
           ButtonBuilder.buildButton({ text: s.routingEnabled ? 'Routing: ON' : 'Routing: OFF', style: s.routingEnabled ? 'success' : 'danger', callbackData: `adm:sup_tog:rt:${s.id}`, forceVisible: true }),
@@ -5530,6 +5549,89 @@ export class AdminHandler {
       ],
     };
 
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierProducts(
+    chatId: number,
+    messageId: number | undefined,
+    supplierId: string,
+    page = 1
+  ): Promise<void> {
+    const pageSize = 8;
+    const ctrl = await supplierService.getSupplierControl(supplierId);
+    const [countRow, mirRes] = await Promise.all([
+      db.queryRow<{ c: string }>(
+        'SELECT COUNT(*) as c FROM supplier_catalog_mirror WHERE supplier_id = $1',
+        [supplierId]
+      ),
+      db.query<any>(
+        `SELECT supplier_product_id, name, cost_usdt, stock, is_unlimited, is_available, last_synced_at
+         FROM supplier_catalog_mirror
+         WHERE supplier_id = $1
+         ORDER BY is_available DESC, name ASC
+         LIMIT $2 OFFSET $3`,
+        [supplierId, pageSize, (Math.max(1, page) - 1) * pageSize]
+      ),
+    ]);
+
+    const total = parseInt(countRow?.c || '0', 10);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const curPage = Math.min(Math.max(1, page), totalPages);
+
+    let text =
+      `🛍️ *MIRRORED PRODUCTS: ${this.escapeDiagMarkdown(ctrl.name.toUpperCase())}*\n` +
+      `Page ${curPage}/${totalPages} • Total Mirrored: \`${total}\`\n` +
+      `_Internal mirror only — customers never see supplier names._\n\n`;
+
+    if (mirRes.rows.length === 0) {
+      text += `_No mirrored products yet. Tap Sync Catalogue to pull live items into Supplier Mirror._`;
+    } else {
+      for (const item of mirRes.rows) {
+        const stockLabel = item.is_unlimited ? '∞' : String(item.stock ?? 0);
+        const avail = item.is_available ? '🟢' : '🔴';
+        text += `${avail} *${this.escapeDiagMarkdown(item.name)}* (\`${item.supplier_product_id}\`)\n  Cost: \`${new Decimal(item.cost_usdt || 0).toFixed(2)} USDT\` | Stock: \`${stockLabel}\`\n`;
+      }
+    }
+
+    const rows: any[][] = [];
+    if (totalPages > 1) {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: '⬅️ Prev',
+            style: 'default',
+            callbackData: curPage > 1 ? `adm:sup_prod:${supplierId}:${curPage - 1}` : 'noop',
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: `${curPage}/${totalPages}`,
+            style: 'default',
+            callbackData: 'noop',
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: 'Next ➡️',
+            style: 'default',
+            callbackData: curPage < totalPages ? `adm:sup_prod:${supplierId}:${curPage + 1}` : 'noop',
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Sync Catalogue', fallbackEmoji: '🔄', style: 'primary', callbackData: `adm:sup_sync:${supplierId}`, forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Back to Supplier', fallbackEmoji: '⬅️', style: 'default', callbackData: `adm:sup_v:${supplierId}`, forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
     if (messageId) {
       await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
     } else {

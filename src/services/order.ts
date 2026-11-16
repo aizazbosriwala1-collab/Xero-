@@ -4,6 +4,7 @@ import { db } from '../db/index.js';
 import { pricingService } from './pricing.js';
 import { walletService } from './wallet.js';
 import { supplierService } from './supplier.js';
+import { NyStoreDriver } from './supplierDrivers.js';
 import { supplierEcosystemService } from './supplierEcosystem.js';
 import { referralService } from './referral.js';
 import { encryptionService } from './encryption.js';
@@ -48,6 +49,22 @@ const SENSITIVE_SUPPLIER_FIELDS = new Set([
   'access',
   'invite_link',
   'invitelink',
+  'proof_files',
+  'prooffiles',
+  'proof_urls',
+  'proofurls',
+  'proof_url',
+  'proofurl',
+  'proofs',
+  'proof',
+  'receipt_url',
+  'receipturl',
+  'evidence_urls',
+  'evidenceurls',
+  'evidence_url',
+  'evidenceurl',
+  'attachments',
+  'files',
 ]);
 
 function redactSupplierValue(val: unknown, depth = 0): unknown {
@@ -491,24 +508,24 @@ export class OrderService {
       };
     }
 
-    // Uncertain outcome: mark UNCERTAIN, record supplier_order_ref if returned, do NOT issue duplicate order or premature refund
+    // Uncertain outcome: mark UNCERTAIN, record fulfilled_supplier_id + idempotency_key + order_ref if returned,
+    // do NOT issue duplicate order or premature refund
     await db.withTransaction(async (client) => {
       await client.query(
         "UPDATE local_orders SET status = 'UNCERTAIN', error_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         [supplierRes.message || 'Ambiguous outcome', orderId]
       );
-      if (supplierRes.order_ref) {
-        await client.query(
-          `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-           VALUES ($1, $2, $3, $4, 'UNCERTAIN', $5)
-           ON CONFLICT (local_order_id) DO UPDATE
-           SET supplier_order_ref = COALESCE(supplier_orders.supplier_order_ref, EXCLUDED.supplier_order_ref),
-               supplier_status = 'UNCERTAIN',
-               response_payload = EXCLUDED.response_payload,
-               updated_at = CURRENT_TIMESTAMP`,
-          [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref, idempotencyKey, sanitizedRawPayload]
-        );
-      }
+      await client.query(
+        `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+         VALUES ($1, $2, $3, $4, 'UNCERTAIN', $5, $6)
+         ON CONFLICT (local_order_id) DO UPDATE
+         SET supplier_order_ref = COALESCE(supplier_orders.supplier_order_ref, EXCLUDED.supplier_order_ref),
+             supplier_status = 'UNCERTAIN',
+             response_payload = EXCLUDED.response_payload,
+             fulfilled_supplier_id = COALESCE(EXCLUDED.fulfilled_supplier_id, supplier_orders.fulfilled_supplier_id),
+             updated_at = CURRENT_TIMESTAMP`,
+        [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref || null, idempotencyKey, sanitizedRawPayload, fulfilledSupplierId]
+      );
     });
     return {
       success: false,
@@ -559,7 +576,7 @@ export class OrderService {
       }
 
       const preSupplierOrder = await db.queryRow<any>(
-        'SELECT supplier_order_ref, idempotency_key FROM supplier_orders WHERE local_order_id = $1',
+        'SELECT supplier_order_ref, idempotency_key, fulfilled_supplier_id FROM supplier_orders WHERE local_order_id = $1',
         [orderId]
       );
       const idempotencyKey: string = preSupplierOrder?.idempotency_key || precheck.idempotency_key;
@@ -624,11 +641,14 @@ export class OrderService {
         'SELECT * FROM supplier_products WHERE id = $1',
         [precheck.product_id]
       );
+      const targetSupplierId: string =
+        preSupplierOrder?.fulfilled_supplier_id || product?.supplier || 'aitoolshop';
 
-      // Read-only supplier reconciliation (GET /order/:ref then GET /orders) — NEVER POST /order
+      // Read-only supplier reconciliation via target supplier driver — NEVER POST /order
       const lookup = await supplierService.lookupOrderReadOnly({
         supplierOrderRef,
         idempotencyKey,
+        supplierId: targetSupplierId,
       });
 
       const sanitizedRawPayload = sanitizeSupplierPayload(lookup.raw);
@@ -734,14 +754,15 @@ export class OrderService {
             [orderId]
           );
           await client.query(
-            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-             VALUES ($1, $2, $3, $4, 'COMPLETED', $5)
+            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+             VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6)
              ON CONFLICT (local_order_id) DO UPDATE
              SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
                  supplier_status = 'COMPLETED',
                  response_payload = EXCLUDED.response_payload,
+                 fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
                  updated_at = CURRENT_TIMESTAMP`,
-            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload]
+            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload, targetSupplierId]
           );
 
           const existingDelivered = await client.query<{ content: string }>(
@@ -833,14 +854,15 @@ export class OrderService {
             [failureReason, orderId]
           );
           await client.query(
-            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-             VALUES ($1, $2, $3, $4, 'FAILED', $5)
+            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+             VALUES ($1, $2, $3, $4, 'FAILED', $5, $6)
              ON CONFLICT (local_order_id) DO UPDATE
              SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
                  supplier_status = 'FAILED',
                  response_payload = EXCLUDED.response_payload,
+                 fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
                  updated_at = CURRENT_TIMESTAMP`,
-            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload]
+            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload, targetSupplierId]
           );
 
           await walletService.executeMutation({
@@ -1014,6 +1036,300 @@ export class OrderService {
   }
 
   /**
+   * Idempotent inbound supplier webhook handler (used by NyStore webhooks).
+   * Reconciles PENDING / PENDING_INVITE / UNCERTAIN orders safely under checkout lock:
+   * - Never double-debits wallet
+   * - Never double-refunds terminal FAILED / REFUNDED orders
+   * - Stores credentials & normalized proof files encrypted with AES-256-GCM
+   */
+  public async processSupplierWebhook(params: {
+    supplierId: string;
+    payload: any;
+  }): Promise<{
+    ok: boolean;
+    found: boolean;
+    applied: boolean;
+    orderId?: string;
+    status?: OrderDetails['status'];
+    deliveredItems?: string[];
+    proofFiles?: string[];
+    message: string;
+  }> {
+    const parsed = NyStoreDriver.parseWebhookPayload(params.payload);
+    if (!parsed.orderRef && !parsed.idempotencyKey) {
+      return {
+        ok: false,
+        found: false,
+        applied: false,
+        message: 'Webhook payload missing order_ref and idempotency_key.',
+      };
+    }
+
+    let orderRow: any = null;
+    if (parsed.orderRef) {
+      orderRow = await db.queryRow<any>(
+        `SELECT lo.id, lo.idempotency_key
+         FROM supplier_orders so
+         JOIN local_orders lo ON lo.id = so.local_order_id
+         WHERE so.supplier_order_ref = $1
+         ORDER BY so.created_at DESC
+         LIMIT 1`,
+        [parsed.orderRef]
+      );
+    }
+    if (!orderRow && parsed.idempotencyKey) {
+      orderRow = await db.queryRow<any>(
+        `SELECT id, idempotency_key FROM local_orders WHERE idempotency_key = $1 LIMIT 1`,
+        [parsed.idempotencyKey]
+      );
+    }
+
+    if (!orderRow) {
+      return {
+        ok: true,
+        found: false,
+        applied: false,
+        message: 'No matching local order found for webhook reference.',
+      };
+    }
+
+    const orderId = String(orderRow.id);
+    const idempotencyKey = String(orderRow.idempotency_key || parsed.idempotencyKey || `SUPPLIER_ORD_${orderId}`);
+    const sanitizedRawPayload = sanitizeSupplierPayload(params.payload);
+
+    await supplierEcosystemService.recordHealthLog({
+      supplierId: params.supplierId,
+      operation: 'ORDER_RECOVERY',
+      success: parsed.status !== 'failed',
+      latencyMs: 1,
+      errorCode: parsed.errorCode,
+      errorMessage: parsed.status === 'failed' ? parsed.message : undefined,
+      localOrderId: orderId,
+    }).catch(() => {});
+
+    return await this.serializeCheckout(`reconcile:${orderId}`, async () => {
+      let qualificationPending = false;
+      let qualificationUserId = '';
+      let qualificationAmount = new Decimal(0);
+
+      const outcome = await db.withTransaction(async (client) => {
+        const localOrder = await client.queryRow<any>(
+          'SELECT * FROM local_orders WHERE id = $1 FOR UPDATE',
+          [orderId]
+        );
+        if (!localOrder) {
+          return {
+            ok: false,
+            found: false,
+            applied: false,
+            message: `Order ${orderId} disappeared during webhook lock.`,
+          };
+        }
+
+        if (localOrder.status === 'COMPLETED') {
+          const existing = await client.query<{ content: string }>(
+            'SELECT content FROM delivered_items WHERE local_order_id = $1',
+            [orderId]
+          );
+          const deliveredItems = existing.rows.map(r => {
+            try {
+              return encryptionService.decrypt(r.content);
+            } catch {
+              return '[ENCRYPTED_DATA]';
+            }
+          });
+          return {
+            ok: true,
+            found: true,
+            applied: false,
+            orderId,
+            status: 'COMPLETED' as const,
+            deliveredItems,
+            proofFiles: parsed.proofFiles,
+            message: 'Order already completed (idempotent webhook replay ignored).',
+          };
+        }
+
+        if (localOrder.status === 'FAILED' || localOrder.status === 'REFUNDED') {
+          return {
+            ok: true,
+            found: true,
+            applied: false,
+            orderId,
+            status: localOrder.status as OrderDetails['status'],
+            message: 'Order already in terminal failure/refunded state (idempotent webhook ignored).',
+          };
+        }
+
+        const resolvedRef = parsed.orderRef || null;
+
+        if (parsed.status === 'completed') {
+          const product = await client.queryRow<any>(
+            'SELECT requires_email FROM supplier_products WHERE id = $1',
+            [localOrder.product_id]
+          );
+          const requiresEmail = Boolean(product?.requires_email);
+          const missingDeliveryEvidence =
+            (!requiresEmail && parsed.deliveredItems.length === 0) ||
+            (parsed.deliveredItems.length === 0 && !resolvedRef);
+
+          if (missingDeliveryEvidence) {
+            await client.query(
+              "UPDATE local_orders SET status = 'UNCERTAIN', error_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+              ['Webhook reported completed without delivery evidence; kept UNCERTAIN.', orderId]
+            );
+            return {
+              ok: true,
+              found: true,
+              applied: false,
+              orderId,
+              status: 'UNCERTAIN' as const,
+              message: 'Webhook missing delivery evidence; kept under review.',
+            };
+          }
+
+          await client.query(
+            "UPDATE local_orders SET status = 'COMPLETED', error_message = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            [orderId]
+          );
+          await client.query(
+            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+             VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6)
+             ON CONFLICT (local_order_id) DO UPDATE
+             SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
+                 supplier_status = 'COMPLETED',
+                 response_payload = EXCLUDED.response_payload,
+                 fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
+                 updated_at = CURRENT_TIMESTAMP`,
+            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload, params.supplierId]
+          );
+
+          const existingDelivered = await client.query<{ content: string }>(
+            'SELECT content FROM delivered_items WHERE local_order_id = $1',
+            [orderId]
+          );
+
+          let finalDelivered: string[] = [];
+          if (existingDelivered.rows.length === 0) {
+            for (const item of parsed.deliveredItems) {
+              const encrypted = encryptionService.encrypt(item);
+              await client.query(
+                `INSERT INTO delivered_items (id, local_order_id, user_id, content, item_type)
+                 VALUES ($1, $2, $3, $4, 'credentials')`,
+                [`del_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`, orderId, localOrder.user_id, encrypted]
+              );
+            }
+            finalDelivered = parsed.deliveredItems;
+          } else {
+            finalDelivered = existingDelivered.rows.map(r => {
+              try {
+                return encryptionService.decrypt(r.content);
+              } catch {
+                return '[ENCRYPTED_DATA]';
+              }
+            });
+          }
+
+          qualificationPending = true;
+          qualificationUserId = localOrder.user_id;
+          qualificationAmount = new Decimal(localOrder.total_price || 0);
+
+          return {
+            ok: true,
+            found: true,
+            applied: true,
+            orderId,
+            status: 'COMPLETED' as const,
+            deliveredItems: finalDelivered,
+            proofFiles: parsed.proofFiles,
+            message: 'Order completed via supplier webhook and delivery encrypted cleanly.',
+          };
+        }
+
+        if (parsed.status === 'failed') {
+          const failMsg = parsed.message || 'Supplier webhook confirmed failure';
+          await client.query(
+            "UPDATE local_orders SET status = 'FAILED', error_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+            [failMsg, orderId]
+          );
+          await client.query(
+            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+             VALUES ($1, $2, $3, $4, 'FAILED', $5, $6)
+             ON CONFLICT (local_order_id) DO UPDATE
+             SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
+                 supplier_status = 'FAILED',
+                 response_payload = EXCLUDED.response_payload,
+                 fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
+                 updated_at = CURRENT_TIMESTAMP`,
+            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload, params.supplierId]
+          );
+
+          await walletService.executeMutation({
+            userId: localOrder.user_id,
+            amount: new Decimal(localOrder.total_price || 0),
+            operationRef: `REFUND_${orderId}`,
+            idempotencyKey: `REFUND_${orderId}`,
+            entryType: 'REFUND',
+            reason: `Webhook refund: supplier confirmed order failure (${parsed.errorCode || 'WEBHOOK_FAILED'})`,
+            source: 'SUPPLIER_WEBHOOK',
+            actor: 'SYSTEM',
+            metadata: {
+              orderId,
+              supplierId: params.supplierId,
+              supplierOrderRef: resolvedRef,
+              errorCode: parsed.errorCode || 'WEBHOOK_FAILED',
+            },
+            client,
+          });
+
+          return {
+            ok: true,
+            found: true,
+            applied: true,
+            orderId,
+            status: 'FAILED' as const,
+            message: 'Supplier webhook confirmed failure; wallet refunded once.',
+          };
+        }
+
+        if (parsed.status === 'pending_invite') {
+          await client.query(
+            "UPDATE local_orders SET status = 'PENDING_INVITE', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            [orderId]
+          );
+          return {
+            ok: true,
+            found: true,
+            applied: true,
+            orderId,
+            status: 'PENDING_INVITE' as const,
+            message: 'Order marked PENDING_INVITE via supplier webhook.',
+          };
+        }
+
+        await client.query(
+          "UPDATE local_orders SET status = 'UNCERTAIN', error_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+          [parsed.message || 'Webhook reported in-progress/uncertain state', orderId]
+        );
+        return {
+          ok: true,
+          found: true,
+          applied: false,
+          orderId,
+          status: 'UNCERTAIN' as const,
+          message: 'Webhook state non-terminal; order kept under review without premature refund.',
+        };
+      });
+
+      if (qualificationPending && qualificationUserId) {
+        await referralService.processOrderQualification(qualificationUserId, orderId, qualificationAmount);
+      }
+
+      return outcome;
+    });
+  }
+
+  /**
    * Admin order list prioritizing UNCERTAIN orders so operators can open and reconcile them cleanly.
    */
   public async listAdminOrders(limit = 8, uncertainOnly = false): Promise<Array<{
@@ -1069,6 +1385,7 @@ export class OrderService {
     idempotencyKey: string;
     supplierOrderRef: string | null;
     supplierStatus: string | null;
+    fulfilledSupplierId: string;
     deliveredCount: number;
     createdAt: string;
     updatedAt: string;
@@ -1081,6 +1398,7 @@ export class OrderService {
                 u.first_name as "customerFirstName",
                 lo.product_id as "productId",
                 sp.original_name as "productName",
+                sp.supplier as "productSupplier",
                 lo.quantity,
                 lo.total_price as "totalPrice",
                 lo.status,
@@ -1088,6 +1406,7 @@ export class OrderService {
                 COALESCE(so.idempotency_key, lo.idempotency_key) as "idempotencyKey",
                 so.supplier_order_ref as "supplierOrderRef",
                 so.supplier_status as "supplierStatus",
+                so.fulfilled_supplier_id as "fulfilledSupplierId",
                 lo.created_at as "createdAt",
                 lo.updated_at as "updatedAt"
          FROM local_orders lo
@@ -1119,6 +1438,7 @@ export class OrderService {
       idempotencyKey: row.idempotencyKey,
       supplierOrderRef: row.supplierOrderRef || null,
       supplierStatus: row.supplierStatus || null,
+      fulfilledSupplierId: row.fulfilledSupplierId || row.productSupplier || 'aitoolshop',
       deliveredCount: parseInt(delCountRes?.c || '0', 10),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,

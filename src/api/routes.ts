@@ -4,6 +4,8 @@ import { config, getSanitizedConfig } from '../config/env.js';
 import { telegramBotRouter } from '../telegram/bot.js';
 import { pricingService } from '../services/pricing.js';
 import { supplierService } from '../services/supplier.js';
+import { NyStoreDriver } from '../services/supplierDrivers.js';
+import { orderService } from '../services/order.js';
 import { manualPaymentService } from '../services/manualPayment.js';
 import { binanceService } from '../services/binance.js';
 import { walletService } from '../services/wallet.js';
@@ -62,6 +64,67 @@ apiRouter.post('/api/telegram/webhook', async (req: Request, res: Response) => {
     logger.error('Webhook error', { error: err.message });
     // Always return 200 to Telegram to prevent retry storms on bad payloads
     res.status(200).json({ ok: true, error: err.message });
+  }
+});
+
+/**
+ * Shared NyStore webhook verification & reconciliation handler.
+ */
+export async function handleNyStoreWebhookHttp(params: {
+  rawBody: string;
+  body: any;
+  signatureHeader?: string;
+  secretHeader?: string;
+}): Promise<{ statusCode: number; payload: Record<string, any> }> {
+  const expectedSecret = supplierService.getSupplierWebhookSecret('nystore') || config.suppliers.nystore.webhookSecret;
+  const authorized = NyStoreDriver.verifyWebhookSignature({
+    rawBody: params.rawBody,
+    signatureHeader: params.signatureHeader,
+    secretHeader: params.secretHeader,
+    expectedSecret,
+  });
+
+  if (!authorized) {
+    return {
+      statusCode: 401,
+      payload: { ok: false, error: 'Unauthorized NyStore webhook signature' },
+    };
+  }
+
+  const outcome = await orderService.processSupplierWebhook({
+    supplierId: 'nystore',
+    payload: params.body,
+  });
+
+  return {
+    statusCode: 200,
+    payload: outcome,
+  };
+}
+
+// NyStore Supplier Webhook Endpoint
+apiRouter.post('/api/webhooks/nystore', async (req: Request, res: Response) => {
+  try {
+    const rawBody = typeof (req as any).rawBody === 'string' ? (req as any).rawBody : JSON.stringify(req.body || {});
+    const signatureHeader =
+      (req.headers['x-nystore-signature'] as string | undefined) ||
+      (req.headers['x-signature'] as string | undefined);
+    const secretHeader =
+      (req.headers['x-webhook-secret'] as string | undefined) ||
+      (typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ')
+        ? req.headers.authorization.slice(7).trim()
+        : undefined);
+
+    const out = await handleNyStoreWebhookHttp({
+      rawBody,
+      body: req.body,
+      signatureHeader,
+      secretHeader,
+    });
+    res.status(out.statusCode).json(out.payload);
+  } catch (err: any) {
+    logger.error('NyStore webhook processing error', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
