@@ -6,6 +6,7 @@ import { pricingService } from '../../services/pricing.js';
 import { manualPaymentService } from '../../services/manualPayment.js';
 import { binanceService, BinanceVerificationResult, maskIdentifier } from '../../services/binance.js';
 import { orderService } from '../../services/order.js';
+import { supplierEcosystemService } from '../../services/supplierEcosystem.js';
 import { referralService } from '../../services/referral.js';
 import { giveawayService } from '../../services/giveaway.js';
 import { channelService } from '../../services/channel.js';
@@ -669,15 +670,22 @@ export class CustomerHandler {
       const [, productId, qtyStr] = data.split(':');
       const qty = Math.max(1, parseInt(qtyStr || '1', 10));
 
-      const [product, priceInfo, walletBal, navState] = await Promise.all([
+      const [product, priceInfo, walletBal, navState, fulfillment] = await Promise.all([
         db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]),
         pricingService.calculatePrice(productId).catch(() => null),
         walletService.getBalance(userId),
         navigationService.getState(userId),
+        supplierEcosystemService.getFulfillmentChain(productId).catch(() => null),
       ]);
 
-      if (!product || !product.is_available || !priceInfo) {
-        await this.renderMenu(chatId, messageId, userId, '⚠️ This product is currently unavailable.', getBackHomeKeyboard('m:prod', lang));
+      if (!product || !product.is_available || !priceInfo || fulfillment?.blockedByDisabledSupplier) {
+        await this.renderMenu(
+          chatId,
+          messageId,
+          userId,
+          '⚠️ Product temporarily unavailable.\nPlease try again later.',
+          getBackHomeKeyboard('m:prod', lang)
+        );
         return;
       }
 
@@ -2144,8 +2152,8 @@ export class CustomerHandler {
       this.getAdjacentProducts(productId, catId, 6),
     ]);
 
-    if (!product) {
-      const notFoundMsg = '⚠️ Product is no longer available in the catalogue.';
+    if (!product || !product.isAvailable || product.hasActiveSupplier === false) {
+      const notFoundMsg = '⚠️ Product temporarily unavailable.\nPlease try again later.';
       if (messageId) {
         await telegramClient.editMessageText(chatId, messageId, notFoundMsg, {
           reply_markup: getBackHomeKeyboard(`cat:${catId}:${page}`, lang),

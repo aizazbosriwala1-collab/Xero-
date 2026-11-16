@@ -5,6 +5,13 @@ import { redis } from './redis.js';
 import { perfTracker } from './perfTracker.js';
 import { pricingService } from './pricing.js';
 import { createLogger } from './logger.js';
+import {
+  supplierDriverRegistry,
+  DriverContext,
+  DriverDiagnosticsResult,
+  DriverHealthResult,
+} from './supplierDrivers.js';
+import { supplierEcosystemService } from './supplierEcosystem.js';
 
 const logger = createLogger('SupplierService');
 
@@ -50,6 +57,7 @@ export interface SupplierOrderPayload {
 export interface SupplierOrderResponse {
   success: boolean;
   order_ref?: string;
+  fulfilled_supplier_id?: string;
   status: 'completed' | 'pending_invite' | 'pending' | 'failed' | 'replayed';
   delivered_items?: string[];
   message?: string;
@@ -288,6 +296,7 @@ export class SupplierService {
     await Promise.all([
       redis.del(`supplier_ctrl:${id}`).catch(() => {}),
       redis.del('supplier_ctrl:list').catch(() => {}),
+      supplierEcosystemService.invalidateAvailabilityCache().catch(() => {}),
     ]);
     logger.info('Failover supplier registered', { supplierId: id, priority, adminId });
     return await this.getSupplierControl(id);
@@ -307,9 +316,9 @@ export class SupplierService {
   ): Promise<void> {
     await db.query(
       `UPDATE suppliers
-       SET is_enabled = FALSE, routing_enabled = FALSE, updated_at = CURRENT_TIMESTAMP
+       SET is_enabled = FALSE, routing_enabled = FALSE, api_status = 'Failed', last_error = $2, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
-      [supplierId]
+      [supplierId, reason.slice(0, 500)]
     );
     await db.query(
       `INSERT INTO admin_audit_logs (id, admin_id, action, target_entity, target_id, details)
@@ -324,6 +333,7 @@ export class SupplierService {
     await Promise.all([
       redis.del(`supplier_ctrl:${supplierId}`).catch(() => {}),
       redis.del('supplier_ctrl:list').catch(() => {}),
+      supplierEcosystemService.invalidateAvailabilityCache().catch(() => {}),
     ]);
     logger.warn('Supplier disabled due to failure; traffic will route to next active supplier', {
       supplierId,
@@ -351,12 +361,16 @@ export class SupplierService {
       await db.query(
         `INSERT INTO suppliers (id, name, base_url, is_enabled, routing_enabled, ordering_enabled, sync_enabled, created_at, updated_at)
          VALUES ($1, $2, $3, TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-        [supplierId, 'AiToolShop Reseller', this.baseUrl]
+        [supplierId, 'Main Supplier (AiToolShop)', this.baseUrl]
       );
     }
 
     await db.query(
-      `UPDATE suppliers SET ${col} = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      `UPDATE suppliers
+       SET ${col} = $1,
+           ${col === 'is_enabled' ? `api_status = ${value ? `'Healthy'` : `'Offline'`},` : ''}
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
       [Boolean(value), supplierId]
     );
 
@@ -374,9 +388,167 @@ export class SupplierService {
     await Promise.all([
       redis.del(`supplier_ctrl:${supplierId}`).catch(() => {}),
       redis.del('supplier_ctrl:list').catch(() => {}),
+      supplierEcosystemService.invalidateAvailabilityCache().catch(() => {}),
     ]);
     logger.info('Supplier control flag updated', { supplierId, field: col, value: Boolean(value), adminId });
     return await this.getSupplierControl(supplierId);
+  }
+
+  private async buildDriverContext(supplierId: string): Promise<{
+    driverKey: string;
+    ctx: DriverContext;
+  }> {
+    const row = await db.queryRow<any>('SELECT * FROM suppliers WHERE id = $1', [supplierId]);
+    const ctrl = await this.getSupplierControl(supplierId);
+    const driverKey = String(row?.driver_key || (supplierId === 'aitoolshop' ? 'aitoolshop' : supplierId));
+    const effectiveBase = (supplierId === 'aitoolshop' ? this.baseUrl : ctrl.baseUrl || this.baseUrl).replace(/\/+$/, '');
+
+    return {
+      driverKey,
+      ctx: {
+        supplierId: ctrl.id,
+        supplierName: ctrl.name,
+        baseUrl: effectiveBase,
+        apiKey: supplierId === 'aitoolshop' ? this.apiKey : undefined,
+        fetchFn: this.fetchOverride || undefined,
+        delegates: {
+          getBalanceDetailed: () => this.getBalanceDetailed(),
+          fetchLiveProductsDetailed: () => this.fetchLiveProductsDetailed(),
+          placeOrderDirect: (payload, endpointBase) => this.dispatchOrderToEndpoint(payload, endpointBase, ctrl.id),
+          lookupOrderReadOnly: params => this.lookupOrderReadOnly(params),
+          runReadOnlyDiagnostic: ref => this.runReadOnlyDiagnostic(ref),
+        },
+      },
+    };
+  }
+
+  public async runSupplierHealthCheck(supplierId: string): Promise<DriverHealthResult> {
+    const { driverKey, ctx } = await this.buildDriverContext(supplierId);
+    const driver = supplierDriverRegistry.getDriver(driverKey);
+    const res = await driver.healthCheck(ctx);
+    await supplierEcosystemService.recordHealthLog({
+      supplierId,
+      operation: 'HEALTH_CHECK',
+      success: res.ok,
+      latencyMs: res.latencyMs,
+      errorMessage: res.ok ? undefined : res.message,
+    });
+    return res;
+  }
+
+  public async checkSupplierBalanceViaDriver(supplierId: string): Promise<{
+    ok: boolean;
+    balanceUsdt?: string;
+    currency: string;
+    error?: string;
+    integrated: boolean;
+  }> {
+    const { driverKey, ctx } = await this.buildDriverContext(supplierId);
+    const driver = supplierDriverRegistry.getDriver(driverKey);
+    const res = await driver.balanceCheck(ctx);
+    if (res.ok && res.balanceUsdt !== undefined) {
+      await db.query(
+        `UPDATE suppliers
+         SET last_balance_usdt = $1, last_balance_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2`,
+        [new Decimal(res.balanceUsdt).toFixed(4), supplierId]
+      ).catch(() => {});
+    }
+    await supplierEcosystemService.recordHealthLog({
+      supplierId,
+      operation: 'BALANCE_CHECK',
+      success: res.ok,
+      latencyMs: res.latencyMs,
+      errorMessage: res.error,
+    });
+    return {
+      ok: res.ok,
+      balanceUsdt: res.balanceUsdt,
+      currency: res.currency,
+      error: res.error,
+      integrated: res.integrated,
+    };
+  }
+
+  public async syncSupplierViaDriver(supplierId: string): Promise<{
+    ok: boolean;
+    importedCount: number;
+    updatedCount: number;
+    totalCount: number;
+    message: string;
+  }> {
+    if (supplierId === 'aitoolshop') {
+      const res = await this.syncCatalogue();
+      return {
+        ok: true,
+        ...res,
+        message: `Synced ${res.totalCount} items (${res.importedCount} new, ${res.updatedCount} updated).`,
+      };
+    }
+
+    const ctrl = await this.getSupplierControl(supplierId);
+    if (!ctrl.isEnabled || !ctrl.syncEnabled) {
+      return {
+        ok: false,
+        importedCount: 0,
+        updatedCount: 0,
+        totalCount: 0,
+        message: 'Supplier sync is paused/disabled in Supplier Center.',
+      };
+    }
+
+    const { driverKey, ctx } = await this.buildDriverContext(supplierId);
+    const driver = supplierDriverRegistry.getDriver(driverKey);
+    const cat = await driver.catalogSync(ctx);
+
+    await supplierEcosystemService.recordHealthLog({
+      supplierId,
+      operation: 'CATALOG_SYNC',
+      success: cat.ok,
+      latencyMs: cat.latencyMs,
+      errorMessage: cat.error,
+    });
+
+    if (!cat.ok) {
+      return {
+        ok: false,
+        importedCount: 0,
+        updatedCount: 0,
+        totalCount: 0,
+        message: cat.error || 'Sync failed',
+      };
+    }
+
+    const mirrored = await supplierEcosystemService.mirrorSupplierProducts(supplierId, cat.products);
+    await db.query(
+      `UPDATE suppliers SET last_sync_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [supplierId]
+    ).catch(() => {});
+    await Promise.all([
+      redis.del(`supplier_ctrl:${supplierId}`).catch(() => {}),
+      redis.del('supplier_ctrl:list').catch(() => {}),
+    ]);
+    return {
+      ok: true,
+      importedCount: mirrored.mirroredCount,
+      updatedCount: 0,
+      totalCount: mirrored.mirroredCount,
+      message: `Mirrored ${mirrored.mirroredCount} items from ${ctrl.name}.`,
+    };
+  }
+
+  public async runSupplierDriverDiagnostics(supplierId: string): Promise<DriverDiagnosticsResult> {
+    const { driverKey, ctx } = await this.buildDriverContext(supplierId);
+    const driver = supplierDriverRegistry.getDriver(driverKey);
+    const res = await driver.diagnostics(ctx);
+    await supplierEcosystemService.recordHealthLog({
+      supplierId,
+      operation: 'DIAGNOSTICS',
+      success: res.ok,
+      latencyMs: res.latencyMs,
+      errorMessage: res.ok ? undefined : res.checks.filter(c => !c.ok).map(c => c.detail).join('; '),
+    });
+    return res;
   }
 
   private async performFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -1119,6 +1291,7 @@ export class SupplierService {
       throw new Error('Supplier synchronization is disabled in Supplier Control Center.');
     }
 
+    const syncStartedAt = Date.now();
     logger.info('Starting catalogue synchronization with AiToolShop Reseller API...');
     const rawProducts = await this.fetchLiveProducts();
 
@@ -1149,6 +1322,7 @@ export class SupplierService {
       );
 
       let localDbId: string;
+      let detectedCatId: string | undefined;
 
       if (!existing) {
         localDbId = `sp_${supplierProductId}`;
@@ -1176,6 +1350,7 @@ export class SupplierService {
 
         // Auto-assign category based on name/keywords
         const categoryId = this.detectCategory(originalName, originalDescription);
+        detectedCatId = categoryId;
 
         // Create default override preserving admin controls
         await db.query(`
@@ -1220,7 +1395,18 @@ export class SupplierService {
         ]);
         updatedCount++;
       }
+
+      await supplierEcosystemService.ensureMasterProductAndPrimaryMapping({
+        productId: localDbId,
+        canonicalName: originalName,
+        description: originalDescription,
+        categoryId: detectedCatId,
+        supplierId: 'aitoolshop',
+        supplierProductId,
+      }).catch(() => {});
     }
+
+    await supplierEcosystemService.mirrorSupplierProducts('aitoolshop', rawProducts).catch(() => {});
 
     // Mark products absent from the supplier response as unavailable instead of deleting history!
     if (syncedSupplierIds.size > 0) {
@@ -1237,10 +1423,16 @@ export class SupplierService {
     await db.query(
       `UPDATE suppliers SET last_sync_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = 'aitoolshop'`
     ).catch(() => {});
+    await supplierEcosystemService.recordHealthLog({
+      supplierId: 'aitoolshop',
+      operation: 'CATALOG_SYNC',
+      success: true,
+      latencyMs: Date.now() - syncStartedAt,
+    }).catch(() => {});
     await Promise.all([
       redis.del('supplier_ctrl:aitoolshop').catch(() => {}),
       redis.del('supplier_ctrl:list').catch(() => {}),
-      pricingService.invalidateCatalogCaches(),
+      supplierEcosystemService.invalidateAvailabilityCache(),
     ]);
 
     logger.info('Catalogue sync finished', { importedCount, updatedCount, totalCount });
@@ -1379,7 +1571,17 @@ export class SupplierService {
    */
   public async placeOrder(
     payload: SupplierOrderPayload,
-    options?: { preferredSupplierId?: string; autoDisableOnFailure?: boolean }
+    options?: {
+      preferredSupplierId?: string;
+      autoDisableOnFailure?: boolean;
+      mappedCandidates?: Array<{
+        supplierId: string;
+        supplierProductId: string;
+        baseUrl?: string;
+        driverKey?: string;
+      }>;
+      localOrderId?: string;
+    }
   ): Promise<SupplierOrderResponse> {
     // CRITICAL SAFETY CHECK: LIVE_ORDERING_ENABLED=false MUST block real POST /order
     if (!config.safety.liveOrderingEnabled) {
@@ -1405,24 +1607,53 @@ export class SupplierService {
       };
     }
 
-    const preferredId = options?.preferredSupplierId || 'aitoolshop';
-    const primaryCtrl = await this.getSupplierControl(preferredId);
-    const activeCandidates = await this.getActiveRoutingSuppliers();
+    const usedExplicitMapping = Boolean(options?.mappedCandidates && options.mappedCandidates.length > 0);
 
-    let orderedTargets: SupplierControlRecord[] = [];
-    if (primaryCtrl.isEnabled && primaryCtrl.orderingEnabled && primaryCtrl.routingEnabled) {
-      orderedTargets = [
-        primaryCtrl,
-        ...activeCandidates.filter(s => s.id !== primaryCtrl.id),
-      ];
-    } else if (activeCandidates.length > 0) {
-      // Primary supplier is disabled; automatically route traffic to next enabled supplier
-      orderedTargets = activeCandidates;
-      logger.info('Primary supplier disabled; routing order to active failover supplier', {
-        disabledSupplier: preferredId,
-        routedTo: orderedTargets[0].id,
-      });
+    let executionTargets: Array<{
+      id: string;
+      baseUrl: string;
+      supplierProductId: string | number;
+      driverKey: string;
+    }> = [];
+
+    if (options?.mappedCandidates && options.mappedCandidates.length > 0) {
+      executionTargets = options.mappedCandidates.map(c => ({
+        id: c.supplierId,
+        baseUrl: (c.supplierId === 'aitoolshop' ? this.baseUrl : c.baseUrl || this.baseUrl).replace(/\/+$/, ''),
+        supplierProductId: c.supplierProductId,
+        driverKey: c.driverKey || c.supplierId,
+      }));
     } else {
+      const preferredId = options?.preferredSupplierId || 'aitoolshop';
+      const primaryCtrl = await this.getSupplierControl(preferredId);
+      const activeCandidates = await this.getActiveRoutingSuppliers();
+
+      if (primaryCtrl.isEnabled && primaryCtrl.orderingEnabled && primaryCtrl.routingEnabled) {
+        const orderedTargets = [
+          primaryCtrl,
+          ...activeCandidates.filter(s => s.id !== primaryCtrl.id),
+        ];
+        executionTargets = orderedTargets.map(t => ({
+          id: t.id,
+          baseUrl: (t.id === 'aitoolshop' ? this.baseUrl : t.baseUrl || this.baseUrl).replace(/\/+$/, ''),
+          supplierProductId: payload.product_id,
+          driverKey: t.id,
+        }));
+      } else if (activeCandidates.length > 0) {
+        executionTargets = activeCandidates.map(t => ({
+          id: t.id,
+          baseUrl: (t.id === 'aitoolshop' ? this.baseUrl : t.baseUrl || this.baseUrl).replace(/\/+$/, ''),
+          supplierProductId: payload.product_id,
+          driverKey: t.id,
+        }));
+        logger.info('Primary supplier disabled; routing order to active failover supplier', {
+          disabledSupplier: preferredId,
+          routedTo: executionTargets[0].id,
+        });
+      }
+    }
+
+    if (executionTargets.length === 0) {
       return {
         success: false,
         status: 'failed',
@@ -1431,36 +1662,68 @@ export class SupplierService {
       };
     }
 
-    const FAILOVER_ELIGIBLE_ERRORS = new Set([
+    const ACCOUNT_DISABLE_ERRORS = new Set([
       'INSUFFICIENT_BALANCE',
       'INVALID_API_KEY',
       'SUPPLIER_DISABLED',
       'SUPPLIER_UNAVAILABLE',
     ]);
 
-    for (let idx = 0; idx < orderedTargets.length; idx++) {
-      const target = orderedTargets[idx];
-      const hasBackup = idx + 1 < orderedTargets.length;
-      const endpointBase = (target.id === 'aitoolshop' ? this.baseUrl : target.baseUrl || this.baseUrl).replace(/\/+$/, '');
-      const singleRes = await this.dispatchOrderToEndpoint(payload, endpointBase, target.id);
+    const FAILOVER_ELIGIBLE_ERRORS = new Set([
+      'INSUFFICIENT_BALANCE',
+      'INVALID_API_KEY',
+      'SUPPLIER_DISABLED',
+      'SUPPLIER_UNAVAILABLE',
+      'OUT_OF_STOCK',
+      'PRODUCT_UNAVAILABLE',
+      'API_ERROR',
+      'SUPPLIER_REJECTED',
+    ]);
+
+    for (let idx = 0; idx < executionTargets.length; idx++) {
+      const target = executionTargets[idx];
+      const hasBackup = idx + 1 < executionTargets.length;
+      const targetPayload: SupplierOrderPayload = {
+        ...payload,
+        product_id: target.supplierProductId,
+      };
+
+      const attemptStart = Date.now();
+      const singleRes = await this.dispatchOrderToEndpoint(targetPayload, target.baseUrl, target.id);
+      const latencyMs = Date.now() - attemptStart;
+      singleRes.fulfilled_supplier_id = target.id;
+
+      await supplierEcosystemService.recordHealthLog({
+        supplierId: target.id,
+        operation: 'PURCHASE',
+        success: singleRes.success,
+        latencyMs,
+        errorCode: singleRes.error_code,
+        errorMessage: singleRes.message,
+        localOrderId: options?.localOrderId,
+      }).catch(() => {});
+
+      const errCode = singleRes.error_code || '';
+      const isTimeoutFailoverEligible =
+        usedExplicitMapping && (errCode === 'UNCERTAIN_TIMEOUT' || errCode.startsWith('UNCERTAIN_HTTP_'));
 
       const isPreFulfillmentFailure =
         !singleRes.success &&
         singleRes.status === 'failed' &&
-        Boolean(singleRes.error_code && FAILOVER_ELIGIBLE_ERRORS.has(singleRes.error_code)) &&
-        !singleRes.order_ref;
+        !singleRes.order_ref &&
+        (FAILOVER_ELIGIBLE_ERRORS.has(errCode) || isTimeoutFailoverEligible);
 
       if (isPreFulfillmentFailure && hasBackup) {
-        if (options?.autoDisableOnFailure !== false) {
+        if (options?.autoDisableOnFailure !== false && ACCOUNT_DISABLE_ERRORS.has(errCode)) {
           await this.disableSupplierOnFailure(
             target.id,
-            `Pre-fulfillment failover trigger (${singleRes.error_code})`
+            `Pre-fulfillment failover trigger (${errCode})`
           );
         }
         logger.warn('Supplier failed pre-fulfillment; routing traffic to next supplier', {
           failedSupplier: target.id,
-          nextSupplier: orderedTargets[idx + 1].id,
-          errorCode: singleRes.error_code,
+          nextSupplier: executionTargets[idx + 1].id,
+          errorCode: errCode,
         });
         continue;
       }

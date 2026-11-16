@@ -4,6 +4,7 @@ import { db } from '../db/index.js';
 import { pricingService } from './pricing.js';
 import { walletService } from './wallet.js';
 import { supplierService } from './supplier.js';
+import { supplierEcosystemService } from './supplierEcosystem.js';
 import { referralService } from './referral.js';
 import { encryptionService } from './encryption.js';
 import { createLogger } from './logger.js';
@@ -287,6 +288,11 @@ export class OrderService {
       };
     }
 
+    const fulfillmentChain = await supplierEcosystemService.getFulfillmentChain(product.id);
+    if (fulfillmentChain.blockedByDisabledSupplier) {
+      throw new Error('⚠ Product temporarily unavailable.\nPlease try again later.');
+    }
+
     const supplierUnitCost = priceSnapshot.supplierCost;
     const totalCharge = unitPrice.times(qty);
     const totalCost = supplierUnitCost.times(qty);
@@ -340,7 +346,10 @@ export class OrderService {
       });
     });
 
-    // 7. Call Supplier Reseller API (with automatic failover if disabled/failed pre-fulfillment)
+    // 7. Call Supplier Reseller API (with mapped Primary -> Backup 1..3 failover & automatic failover routing)
+    const mappedCandidates =
+      fulfillmentChain.explicitMappingCount > 0 ? fulfillmentChain.eligibleTargets : undefined;
+
     const supplierRes = await supplierService.placeOrder(
       {
         product_id: product.supplier_product_id,
@@ -348,8 +357,17 @@ export class OrderService {
         customer_email: request.customerEmail,
         idempotency_key: idempotencyKey,
       },
-      { preferredSupplierId: product.supplier || 'aitoolshop' }
+      {
+        preferredSupplierId: product.supplier || 'aitoolshop',
+        mappedCandidates,
+        localOrderId: orderId,
+      }
     );
+    const fulfilledSupplierId =
+      supplierRes.fulfilled_supplier_id ||
+      mappedCandidates?.[0]?.supplierId ||
+      product.supplier ||
+      'aitoolshop';
 
     const delivered = supplierRes.delivered_items || [];
     const sanitizedRawPayload = sanitizeSupplierPayload(supplierRes.raw);
@@ -372,15 +390,15 @@ export class OrderService {
             [msg, orderId]
           );
           await client.query(`
-            INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-            VALUES ($1, $2, $3, $4, 'UNCERTAIN_MISSING_DELIVERY', $5)
-          `, [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref || null, idempotencyKey, sanitizedRawPayload]);
+            INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+            VALUES ($1, $2, $3, $4, 'UNCERTAIN_MISSING_DELIVERY', $5, $6)
+          `, [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref || null, idempotencyKey, sanitizedRawPayload, fulfilledSupplierId]);
         });
         return {
           success: false,
           orderId,
           status: 'UNCERTAIN',
-          message: 'Supplier did not include delivery credentials. Marked for reconciliation without premature refund.',
+          message: 'Your order is awaiting verification and delivery confirmation. Please check My Orders shortly.',
           deliveredItems: [],
           totalCharged: totalCharge.toFixed(2),
         };
@@ -389,9 +407,9 @@ export class OrderService {
       await db.withTransaction(async (client) => {
         await client.query("UPDATE local_orders SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [orderId]);
         await client.query(`
-          INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-          VALUES ($1, $2, $3, $4, 'COMPLETED', $5)
-        `, [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref || null, idempotencyKey, sanitizedRawPayload]);
+          INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+          VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6)
+        `, [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref || null, idempotencyKey, sanitizedRawPayload, fulfilledSupplierId]);
 
         for (const item of delivered) {
           const encryptedContent = encryptionService.encrypt(item);
@@ -423,9 +441,9 @@ export class OrderService {
       await db.withTransaction(async (client) => {
         await client.query("UPDATE local_orders SET status = 'PENDING_INVITE', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [orderId]);
         await client.query(`
-          INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-          VALUES ($1, $2, $3, $4, $5, $6)
-        `, [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref || null, idempotencyKey, supplierRes.status, sanitizedRawPayload]);
+          INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `, [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, supplierRes.order_ref || null, idempotencyKey, supplierRes.status, sanitizedRawPayload, fulfilledSupplierId]);
       });
 
       await referralService.processOrderQualification(request.userId, orderId, totalCharge);
@@ -434,7 +452,7 @@ export class OrderService {
         success: true,
         orderId,
         status: 'PENDING_INVITE',
-        message: 'Order placed with supplier! Your access/invite is being processed and will be delivered shortly.',
+        message: 'Order placed! Your access/invite is being processed and will be delivered shortly.',
         deliveredItems: [],
         totalCharged: totalCharge.toFixed(2),
       };
@@ -455,7 +473,7 @@ export class OrderService {
           operationRef: `REFUND_${orderId}`,
           idempotencyKey: `REFUND_${orderId}`,
           entryType: 'REFUND',
-          reason: `Automatic refund: supplier order rejected (${supplierRes.error_code})`,
+          reason: `Automatic refund: order could not be fulfilled`,
           source: 'SUPPLIER_REJECTION',
           actor: 'SYSTEM',
           metadata: { orderId, errorCode: supplierRes.error_code },
@@ -467,7 +485,7 @@ export class OrderService {
         success: false,
         orderId,
         status: 'FAILED',
-        message: `Order could not be fulfilled (${supplierRes.message}). Your wallet has been refunded ${totalCharge.toFixed(2)} USDT automatically.`,
+        message: `⚠ Product temporarily unavailable.\nPlease try again later.\n\nYour wallet has been refunded ${totalCharge.toFixed(2)} USDT automatically.`,
         deliveredItems: [],
         totalCharged: '0.00',
       };
@@ -477,7 +495,7 @@ export class OrderService {
     await db.withTransaction(async (client) => {
       await client.query(
         "UPDATE local_orders SET status = 'UNCERTAIN', error_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-        [supplierRes.message || 'Ambiguous supplier outcome', orderId]
+        [supplierRes.message || 'Ambiguous outcome', orderId]
       );
       if (supplierRes.order_ref) {
         await client.query(

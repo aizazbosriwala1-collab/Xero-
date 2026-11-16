@@ -50,6 +50,8 @@ import { launchAuditService } from '../src/services/audit.js';
 import { perfTracker } from '../src/services/perfTracker.js';
 import { promotionService } from '../src/services/promotion.js';
 import { menuCache } from '../src/telegram/menuCache.js';
+import { supplierDriverRegistry } from '../src/services/supplierDrivers.js';
+import { supplierEcosystemService } from '../src/services/supplierEcosystem.js';
 import {
   getCustomerMainReplyKeyboard,
   getCustomerMainInlineKeyboard,
@@ -70,6 +72,10 @@ import {
   getLanguageKeyboard,
   getStaleMenuKeyboard,
   getAdminMainMenuKeyboard,
+  getAdminOverviewKeyboard,
+  getAdminStoreSectionKeyboard,
+  getAdminGrowthSectionKeyboard,
+  getAdminSupplierCenterKeyboard,
   getAdminUiCenterKeyboard,
   getAdminUiSectionKeyboard,
   getAdminUiItemEditorKeyboard,
@@ -2295,6 +2301,10 @@ export async function runComprehensiveTests() {
       getStaleMenuKeyboard('en'),
       getRequiredChannelsGateKeyboard([{ id: 'ch_audit_1', title: 'Xero News', inviteUrl: 'https://t.me/xeronews' }], 'en'),
       getAdminMainMenuKeyboard('en'),
+      getAdminOverviewKeyboard(),
+      getAdminStoreSectionKeyboard(),
+      getAdminGrowthSectionKeyboard(),
+      getAdminSupplierCenterKeyboard(),
       getAdminUiCenterKeyboard(),
       getAdminUiSectionKeyboard('main_menu', sampleSettings.slice(0, 4), 1, 2, 'en'),
       getAdminUiItemEditorKeyboard(sampleSettings[0]),
@@ -7670,11 +7680,21 @@ export async function runComprehensiveTests() {
         assert.ok(Buffer.byteLength(cb, 'utf8') <= 64);
       }
 
-      // 5. Admin Panel powers remain 100% intact
+      // 5. Admin Panel powers remain 100% intact across simplified 6-section Control Center
       const adminKb = getAdminMainMenuKeyboard('en');
-      const admCbs = adminKb.inline_keyboard.flat().map((b: any) => b.callback_data);
+      const mainAdmCbs = adminKb.inline_keyboard.flat().map((b: any) => b.callback_data);
+      for (const secCb of ['adm:dash', 'adm:sup', 'adm:sec:store', 'adm:sec:growth', 'adm:tkt', 'adm:set']) {
+        assert.ok(mainAdmCbs.includes(secCb), `Simplified Control Center missing section: ${secCb}`);
+      }
+      const allAdmCbs = [
+        ...mainAdmCbs,
+        ...getAdminOverviewKeyboard().inline_keyboard.flat().map((b: any) => b.callback_data),
+        ...getAdminStoreSectionKeyboard().inline_keyboard.flat().map((b: any) => b.callback_data),
+        ...getAdminGrowthSectionKeyboard().inline_keyboard.flat().map((b: any) => b.callback_data),
+        ...getAdminSupplierCenterKeyboard().inline_keyboard.flat().map((b: any) => b.callback_data),
+      ];
       for (const reqAdm of ['adm:dash', 'adm:ord', 'adm:wal', 'adm:dep', 'adm:prod:1', 'adm:gw', 'adm:ref', 'adm:ann', 'adm:sup', 'adm:diag']) {
-        assert.ok(admCbs.includes(reqAdm), `Admin control missing: ${reqAdm}`);
+        assert.ok(allAdmCbs.includes(reqAdm), `Admin control missing: ${reqAdm}`);
       }
       assert.ok(adminId > 0);
     } finally {
@@ -8348,6 +8368,594 @@ export async function runComprehensiveTests() {
       await db.query('DELETE FROM promo_channels').catch(() => {});
       await promotionService.updateConfig(savedCfg, 'SYSTEM').catch(() => {});
       await redis.del('auto_promo:channels').catch(() => {});
+    }
+  });
+
+  // =========================================================================
+  // 30. SUPPLIER MIRROR, MULTI-SUPPLIER ROUTING & SIMPLIFIED ADMIN CENTER (CONTRACT 18)
+  // =========================================================================
+  currentCategory = 'Supplier Mirror & Ecosystem (Contract 18)';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 18.1: 5 Supplier Candidates, Driver Interface, Mirror Sync, Product Mapping Failover & Zero Customer Leakage', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = '988101';
+    await ensureAuditUser(custId, '25.0000');
+
+    // A) All 5 supplier candidates must be seeded cleanly with future candidates disabled by default
+    const suppliers = await supplierService.listSuppliers();
+    for (const reqId of ['aitoolshop', 'ventebot', 'nystore', 'cupponshub', 'zfour']) {
+      const s = suppliers.find(x => x.id === reqId);
+      assert.ok(s, `Seeded supplier missing: ${reqId}`);
+      if (reqId !== 'aitoolshop') {
+        assert.strictEqual(s!.isEnabled, false, `Future supplier ${reqId} must default to disabled`);
+      }
+    }
+
+    // B) Pluggable driver registry exposes unified ISupplierDriver capabilities
+    const mainDriver = supplierDriverRegistry.getDriver('aitoolshop');
+    const venteDriver = supplierDriverRegistry.getDriver('ventebot');
+    assert.strictEqual(mainDriver.isLiveImplemented, true);
+    assert.strictEqual(venteDriver.isLiveImplemented, false);
+    for (const methodName of ['healthCheck', 'balanceCheck', 'catalogSync', 'priceSync', 'stockCheck', 'purchase', 'orderRecovery', 'diagnostics']) {
+      assert.strictEqual(typeof (mainDriver as any)[methodName], 'function', `Driver missing method: ${methodName}`);
+      assert.strictEqual(typeof (venteDriver as any)[methodName], 'function', `Scaffold driver missing method: ${methodName}`);
+    }
+
+    const scaffoldDiag = await supplierService.runSupplierDriverDiagnostics('ventebot');
+    assert.strictEqual(scaffoldDiag.ok, false);
+    assert.ok(scaffoldDiag.checks.some(c => c.name === 'Integration Readiness'));
+
+    // C) Insert canonical test product and mirror it + test disabling exclusive supplier vs multi-supplier failover
+    const prodId = 'sp_c18_multi';
+    await db.query(
+      `INSERT INTO supplier_products (id, supplier, supplier_product_id, original_name, original_description, latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload)
+       VALUES ($1, 'aitoolshop', 'remote_c18_1', 'C18 Enterprise Pass', 'Canonical digital access', '1.0000', 25, FALSE, TRUE, 'account', '{}')
+       ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_stock = 25`,
+      [prodId]
+    );
+    await supplierEcosystemService.mirrorSupplierProducts('aitoolshop', [
+      { id: 'remote_c18_1', name: 'C18 Enterprise Pass', your_cost: 1.0, stock: 25, type: 'account' },
+    ]);
+    await supplierEcosystemService.ensureMasterProductAndPrimaryMapping({
+      productId: prodId,
+      canonicalName: 'C18 Enterprise Pass',
+      supplierId: 'aitoolshop',
+      supplierProductId: 'remote_c18_1',
+    });
+
+    const prevLive = config.safety.liveOrderingEnabled;
+    (config.safety as any).liveOrderingEnabled = true;
+    supplierService.setTestApiKey('mock_c18_reseller_key');
+
+    const custSent: Array<{ method: string; body: any }> = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      custSent.push({ method, body });
+      return { ok: true, result: { message_id: 9881 } };
+    });
+
+    try {
+      // D) Disable exclusive Primary supplier -> product hidden from catalog, direct buy shows safe unavailable notice, zero wallet debit
+      await supplierService.setSupplierFlag('aitoolshop', 'is_enabled', false, adminId);
+      const [hiddenCatalog, hiddenIds] = await Promise.all([
+        pricingService.getCatalog({ includeHidden: false, search: 'C18 Enterprise Pass' }),
+        pricingService.getOrderedCatalogIds('all'),
+      ]);
+      assert.ok(!hiddenCatalog.items.some(p => p.id === prodId), 'Disabled-exclusive product must be hidden from customer catalog');
+      assert.ok(!hiddenIds.includes(prodId), 'Disabled-exclusive product must be excluded from ordered catalog IDs');
+
+      const chainDisabled = await supplierEcosystemService.getFulfillmentChain(prodId);
+      assert.strictEqual(chainDisabled.blockedByDisabledSupplier, true);
+
+      const balBeforeBlocked = (await walletService.getBalance(custId)).available;
+      await assert.rejects(
+        () => orderService.checkout({ userId: custId, productId: prodId, quantity: 1 }),
+        (err: any) => {
+          assert.ok(String(err.message).includes('Product temporarily unavailable'), `Unexpected error: ${err.message}`);
+          assert.ok(!String(err.message).toLowerCase().includes('aitoolshop'), 'Customer error must NEVER leak supplier name');
+          return true;
+        }
+      );
+      const balAfterBlocked = (await walletService.getBalance(custId)).available;
+      assert.strictEqual(balAfterBlocked.toFixed(4), balBeforeBlocked.toFixed(4), 'Blocked checkout must not debit wallet');
+
+      // Direct customer click on buy: returns safe message without crashing
+      await customerHandler.handleCallback({
+        id: 'cb_c18_buy_blocked',
+        from: { id: Number(custId), is_bot: false, first_name: 'Buyer' },
+        data: `buy:${prodId}`,
+        message: { message_id: 9882, date: Math.floor(Date.now() / 1000), chat: { id: Number(custId), type: 'private' } },
+      } as any);
+      assert.ok(
+        custSent.some(m => String(m.body.text || '').includes('Product temporarily unavailable')),
+        'Direct buy callback must show safe unavailable message'
+      );
+
+      // E) Assign Backup 1 (ventebot) & enable ventebot while Primary (aitoolshop) remains disabled -> product becomes available and routes to ventebot!
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', true, adminId);
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 2, supplierId: 'ventebot', supplierProductId: 'vb_remote_88' },
+        adminId
+      );
+
+      const [failoverCatalog, failoverIds] = await Promise.all([
+        pricingService.getCatalog({ includeHidden: false, search: 'C18 Enterprise Pass' }),
+        pricingService.getOrderedCatalogIds('all'),
+      ]);
+      assert.ok(failoverCatalog.items.some(p => p.id === prodId), 'Product with enabled Backup 1 must stay visible when Primary is disabled');
+      assert.ok(failoverIds.includes(prodId), 'Product with enabled Backup 1 must stay in ordered catalog IDs when Primary is disabled');
+
+      // Re-enable aitoolshop and simulate runtime Primary pre-fulfillment OUT_OF_STOCK -> automatic failover to Backup 1 (ventebot)
+      await supplierService.setSupplierFlag('aitoolshop', 'is_enabled', true, adminId);
+      await db.query(`UPDATE suppliers SET base_url = 'https://mock-ventebot.local/api' WHERE id = 'ventebot'`);
+      await redis.del('supplier_ctrl:ventebot');
+
+      const calledUrls: string[] = [];
+      supplierService.setFetchOverride(async (url: string, init?: RequestInit) => {
+        calledUrls.push(url);
+        if (url.includes('mock-ventebot.local/api/order')) {
+          const bodyObj = JSON.parse(String(init?.body || '{}'));
+          assert.strictEqual(bodyObj.product_id, 'vb_remote_88', 'Failover order must map to Backup 1 supplierProductId');
+          return new Response(
+            JSON.stringify({
+              success: true,
+              status: 'completed',
+              order_ref: 'vb_ref_1001',
+              delivered_items: ['c18_backup_key_xyz'],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error_code: 'OUT_OF_STOCK',
+            message: 'Primary out of stock',
+          }),
+          { status: 400 }
+        );
+      });
+
+      const orderRes = await orderService.checkout({ userId: custId, productId: prodId, quantity: 1 });
+      assert.strictEqual(orderRes.status, 'COMPLETED');
+      assert.ok(calledUrls.some(u => u.includes('/order')), 'Primary must be tried first');
+      assert.ok(calledUrls.some(u => u.includes('mock-ventebot.local/api/order')), 'Backup 1 must be invoked on Primary OUT_OF_STOCK');
+
+      const supOrderRow = await db.queryRow<any>(
+        'SELECT fulfilled_supplier_id, supplier_order_ref FROM supplier_orders WHERE local_order_id = $1',
+        [orderRes.orderId]
+      );
+      assert.strictEqual(supOrderRow?.fulfilled_supplier_id, 'ventebot', 'supplier_orders must record the winning backup supplier');
+
+      // Ensure customer order text never leaks supplier branding
+      assert.ok(!JSON.stringify(orderRes).toLowerCase().includes('ventebot'));
+      assert.ok(!JSON.stringify(orderRes).toLowerCase().includes('aitoolshop'));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      supplierService.resetTestState();
+      (config.safety as any).liveOrderingEnabled = prevLive;
+      await supplierService.setSupplierFlag('aitoolshop', 'is_enabled', true, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'ordering_enabled', false, adminId).catch(() => {});
+      await db.query(`UPDATE suppliers SET base_url = '' WHERE id = 'ventebot'`).catch(() => {});
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_product_id = $1', ['remote_c18_1']).catch(() => {});
+      await db.query('DELETE FROM supplier_orders WHERE local_order_id IN (SELECT id FROM local_orders WHERE product_id = $1)', [prodId]).catch(() => {});
+      await db.query('DELETE FROM local_orders WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+      await redis.del('supplier_ctrl:ventebot').catch(() => {});
+      await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
+    }
+  });
+
+  await it('Contract 18.2: Supplier Health & Low Balance Thresholds, Simplified Admin Control Center & Supplier Center UI', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const adminNum = Number(adminId);
+    const prodId = 'sp_c18_ui_map';
+
+    await db.query(
+      `INSERT INTO supplier_products (id, supplier, supplier_product_id, original_name, original_description, latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload)
+       VALUES ($1, 'aitoolshop', 'remote_c18_ui', 'C18 Mapped Bundle', 'Desc', '2.0000', 10, FALSE, TRUE, 'account', '{}')
+       ON CONFLICT (id) DO NOTHING`,
+      [prodId]
+    );
+    await db.query(
+      `UPDATE suppliers SET last_balance_usdt = '12.5000', low_balance_threshold = '20.0000' WHERE id = 'aitoolshop'`
+    );
+    await supplierEcosystemService.recordHealthLog({
+      supplierId: 'aitoolshop',
+      operation: 'HEALTH_CHECK',
+      success: true,
+      latencyMs: 145,
+    });
+
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    const mainSum = summaries.find(s => s.id === 'aitoolshop');
+    assert.ok(mainSum, 'AiToolShop summary missing');
+    assert.strictEqual(mainSum!.isLowBalance, true, '12.50 USDT < 20.00 USDT threshold must trigger low-balance alert');
+    assert.ok(Number(mainSum!.successRatePct) > 0);
+    assert.strictEqual(mainSum!.apiStatus, 'Healthy');
+
+    // Update threshold to 10 USDT -> clears low balance alert
+    await supplierEcosystemService.setLowBalanceThreshold('aitoolshop', 10, adminId);
+    const updatedSum = (await supplierEcosystemService.getSupplierDashboardSummaries()).find(s => s.id === 'aitoolshop');
+    assert.strictEqual(updatedSum!.isLowBalance, false, '12.50 USDT >= 10.00 USDT threshold must clear alert');
+
+    // Verify all new callbacks registered & <= 64 bytes
+    const newCbs = [
+      'adm:sec:store',
+      'adm:sec:growth',
+      'adm:sup_ov',
+      'adm:sup_list',
+      'adm:sup_sync_hub',
+      'adm:sup_sync_all',
+      'adm:sup_bals',
+      'adm:sup_bals_r',
+      'adm:sup_map',
+      'adm:sup_hlth',
+      'adm:sup_diag_hub',
+      'adm:sup_map_pg:1',
+      `adm:smp:${prodId}`,
+      'adm:sms:2',
+      'adm:smpk:2:ventebot',
+      'adm:smclr:2',
+      'adm:smcid:2:nystore',
+      'adm:sup_drv_d:aitoolshop',
+      'adm:sup_thr:aitoolshop',
+    ];
+    for (const cb of newCbs) {
+      assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered Supplier Center callback: ${cb}`);
+      assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `Callback exceeds 64 bytes: ${cb}`);
+    }
+
+    const adminSent: Array<{ method: string; body: any }> = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      adminSent.push({ method, body });
+      return { ok: true, result: { message_id: 9889 } };
+    });
+
+    const fireAdm = async (cbData: string) => {
+      adminSent.length = 0;
+      await adminHandler.handleCallback({
+        id: 'cb_c18_' + Math.random().toString(36).slice(2, 6),
+        from: { id: adminNum, is_bot: false, first_name: 'Admin' },
+        data: cbData,
+        message: { message_id: 9889, date: Math.floor(Date.now() / 1000), chat: { id: adminNum, type: 'private' } },
+      } as any);
+      return adminSent.find(m => m.method === 'editMessageText' || m.method === 'sendMessage')?.body;
+    };
+
+    try {
+      const storeHub = await fireAdm('adm:sec:store');
+      assert.ok(String(storeHub?.text || '').includes('STORE MANAGEMENT'));
+
+      const growthHub = await fireAdm('adm:sec:growth');
+      assert.ok(String(growthHub?.text || '').includes('GROWTH & PROMOTIONS'));
+
+      const supCenter = await fireAdm('adm:sup');
+      assert.ok(String(supCenter?.text || '').includes('SUPPLIER CENTER'));
+
+      const supOv = await fireAdm('adm:sup_ov');
+      assert.ok(String(supOv?.text || '').includes('SUPPLIER OVERVIEW'));
+      assert.ok(String(supOv?.text || '').includes('VenteBot'));
+
+      const supBals = await fireAdm('adm:sup_bals');
+      assert.ok(String(supBals?.text || '').includes('SUPPLIER BALANCES'));
+
+      const supHlth = await fireAdm('adm:sup_hlth');
+      assert.ok(String(supHlth?.text || '').includes('SUPPLIER HEALTH'));
+
+      // Assign Backup 1 via UI callbacks using Redis context
+      await fireAdm(`adm:smp:${prodId}`);
+      const slotEdit = await fireAdm('adm:sms:2');
+      assert.ok(String(slotEdit?.text || '').includes('BACKUP 1'));
+      const slotPicked = await fireAdm('adm:smpk:2:ventebot');
+      assert.ok(String(slotPicked?.text || '').includes('VenteBot'));
+
+      // Support inbox renders Ticket Analytics header
+      const tktView = await fireAdm('adm:tkt');
+      assert.ok(String(tktView?.text || '').includes('Open:'), 'Support inbox must show Ticket Analytics summary');
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await supplierEcosystemService.setLowBalanceThreshold('aitoolshop', 20, adminId).catch(() => {});
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query("DELETE FROM supplier_health_logs WHERE error_message IS NULL AND operation = 'HEALTH_CHECK' AND latency_ms = 145").catch(() => {});
+      await redis.del(`adm_map_ctx:${adminId}`).catch(() => {});
+    }
+  });
+
+  // =========================================================================
+  // 31. PRICING ENGINE, SUPPLIER ECOSYSTEM & CONTROL CENTER (CONTRACT 19)
+  // =========================================================================
+  currentCategory = 'Pricing Center & Profit Analytics (Contract 19)';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Contract 19.1: Pricing Hierarchy (Product > Supplier > Global Fixed/%) & Customer Isolation', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const custId = 99101;
+    await ensureAuditUser(String(custId), '10.0000');
+
+    const prodId = 'sp_c19_pricing';
+    const prevGlobal = await pricingService.getGlobalPricingSettings();
+
+    await db.query(
+      `INSERT INTO supplier_products (id, supplier, supplier_product_id, original_name, original_description, latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload)
+       VALUES ($1, 'aitoolshop', 'rem_c19_p1', 'C19 Pro Membership', 'Access Pass', '1.0000', 25, FALSE, TRUE, 'account', '{}')
+       ON CONFLICT (id) DO NOTHING`,
+      [prodId]
+    );
+    await db.query(
+      `INSERT INTO product_overrides (product_id, category_id, is_hidden, updated_at)
+       VALUES ($1, 'cat_ai-tools', FALSE, CURRENT_TIMESTAMP)
+       ON CONFLICT (product_id) DO NOTHING`,
+      [prodId]
+    );
+
+    const sent: any[] = [];
+    telegramClient.setTransportOverride(async (method, body) => {
+      sent.push({ method, body: JSON.parse(JSON.stringify(body)) });
+      return { ok: true, result: { message_id: 9911 } };
+    });
+
+    try {
+      // 1. Global FIXED mode (+0.05 on 1.00 = 1.05) & PERCENT mode (+20% on 1.00 = 1.20)
+      await pricingService.setGlobalPricingRule({ markupType: 'FIXED', defaultFixedMarkup: '0.05', defaultPercentMarkup: '0.20' }, adminId);
+      let p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'GLOBAL_DEFAULT');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '1.05');
+
+      await pricingService.setGlobalPricingRule({ markupType: 'PERCENT', defaultPercentMarkup: '0.20' }, adminId);
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'GLOBAL_DEFAULT');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '1.20');
+
+      // 2. Supplier Override takes precedence over Global Pricing
+      await pricingService.setSupplierPricingOverride('ventebot', 'PERCENT', '0.15', adminId);
+      await pricingService.setSupplierPricingOverride('nystore', 'PERCENT', '0.20', adminId);
+      await pricingService.setSupplierPricingOverride('zfour', 'FIXED', '0.10', adminId);
+
+      // Map product Primary -> VenteBot (+15% => 1.15)
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', true, adminId);
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'ventebot', supplierProductId: 'vb_c19' },
+        adminId
+      );
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'SUPPLIER_PERCENT_MARKUP');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '1.15');
+
+      // Map product Primary -> NyStore (+20% => 1.20)
+      await supplierService.setSupplierFlag('nystore', 'is_enabled', true, adminId);
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'nystore', supplierProductId: 'ny_c19' },
+        adminId
+      );
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'SUPPLIER_PERCENT_MARKUP');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '1.20');
+
+      // Map product Primary -> ZFour (+0.10 Fixed => 1.10)
+      await supplierService.setSupplierFlag('zfour', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('zfour', 'routing_enabled', true, adminId);
+      await supplierService.setSupplierFlag('zfour', 'ordering_enabled', true, adminId);
+      await supplierEcosystemService.assignMappingSlot(
+        { masterProductId: prodId, slotRank: 1, supplierId: 'zfour', supplierProductId: 'zf_c19' },
+        adminId
+      );
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'SUPPLIER_FIXED_MARKUP');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '1.10');
+
+      // 3. Product Override ALWAYS beats Supplier Override & Global Pricing
+      await db.query("UPDATE supplier_products SET latest_cost = '0.4500' WHERE id = $1", [prodId]);
+      await pricingService.setFixedMarkup(prodId, '0.05', adminId); // 0.45 + 0.05 = 0.50
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'PRODUCT_FIXED_MARKUP');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '0.50');
+
+      await pricingService.setPercentMarkup(prodId, '0.40', adminId); // 0.45 * 1.40 = 0.63
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'PRODUCT_PERCENT_MARKUP');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '0.63');
+
+      await pricingService.setFixedRetailPrice(prodId, '0.99', adminId);
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'FIXED_RETAIL');
+      assert.strictEqual(p.customerUnitPrice.toFixed(2), '0.99');
+
+      // 4. Customer UI must never display supplier cost or supplier names
+      sent.length = 0;
+      await customerHandler.handleCallback({
+        id: 'cb_c19_cust_prod',
+        from: { id: custId, is_bot: false, first_name: 'Buyer' },
+        data: `p:${prodId}:all:1`,
+        message: { message_id: 9911, date: Math.floor(Date.now() / 1000), chat: { id: custId, type: 'private' } },
+      } as any);
+      const custMsgText = sent.map(m => String(m.body?.text || '')).join(' ').toLowerCase();
+      assert.ok(custMsgText.includes('0.99 usdt'), 'Customer view must display final retail price');
+      assert.ok(!custMsgText.includes('0.45'), 'Customer view must NEVER leak supplier cost');
+      assert.ok(!custMsgText.includes('zfour') && !custMsgText.includes('ventebot') && !custMsgText.includes('nystore'), 'Customer view must NEVER leak supplier names');
+
+      // Clear overrides -> falls back to Supplier -> Global
+      await pricingService.resetPricing(prodId, adminId);
+      await pricingService.clearSupplierPricingOverride('zfour', adminId);
+      p = await pricingService.calculatePrice(prodId);
+      assert.strictEqual(p.ruleApplied, 'GLOBAL_DEFAULT');
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await pricingService.setGlobalPricingRule(
+        {
+          markupType: prevGlobal.markupType || 'AUTO',
+          defaultFixedMarkup: prevGlobal.defaultFixedMarkup || '0.05',
+          defaultPercentMarkup: prevGlobal.defaultPercentMarkup || '0.15',
+        },
+        adminId
+      ).catch(() => {});
+      await pricingService.clearSupplierPricingOverride('ventebot', adminId).catch(() => {});
+      await pricingService.clearSupplierPricingOverride('nystore', adminId).catch(() => {});
+      await pricingService.clearSupplierPricingOverride('zfour', adminId).catch(() => {});
+      await supplierService.setSupplierFlag('ventebot', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('nystore', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('zfour', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('zfour', 'routing_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('zfour', 'ordering_enabled', false, adminId).catch(() => {});
+      await db.query('DELETE FROM product_supplier_mappings WHERE master_product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM master_products WHERE id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+    }
+  });
+
+  await it('Contract 19.2: Profit Analytics (Daily/Monthly/Leaders) & Admin Pricing Center UI Flows', 'mock_integration', async () => {
+    const adminId = String(config.telegram.adminIds[0]);
+    const adminNum = Number(adminId);
+    const prodA = 'sp_c19_pa';
+    const prodB = 'sp_c19_pb';
+    const prevGlobal = await pricingService.getGlobalPricingSettings();
+
+    // Verify all new callbacks are registered & <= 64 bytes
+    const c19Callbacks = [
+      'adm:profit',
+      'adm:prc_sup',
+      'adm:prc_gl_m:FIXED',
+      'adm:prc_gl_m:PERCENT',
+      'adm:prc_gl_p:F:0.05',
+      'adm:prc_gl_p:P:0.20',
+      'adm:prc_gl_e:FIXED',
+      'adm:prc_gl_e:PERCENT',
+      'adm:prc_sv:ventebot',
+      'adm:prc_ss:P:ventebot:0.15',
+      'adm:prc_se:F:ventebot',
+      'adm:prc_sc:ventebot',
+      `adm_set_pm:${prodA}:0.20`,
+      'adm:prc_pe:f',
+      'adm:tkt_stat',
+      'adm:set_flags',
+    ];
+    for (const cb of c19Callbacks) {
+      assert.strictEqual(isRegisteredCallbackRoute(cb), true, `Unregistered C19 callback: ${cb}`);
+      assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `Callback exceeds 64 bytes: ${cb}`);
+    }
+
+    await db.query(
+      `INSERT INTO supplier_products (id, supplier, supplier_product_id, original_name, original_description, latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload)
+       VALUES
+         ($1, 'aitoolshop', 'rem_c19_a', 'C19 Cursor Plus', 'Dev', '1.0000', 10, FALSE, TRUE, 'account', '{}'),
+         ($2, 'ventebot', 'rem_c19_b', 'C19 Midjourney Pro', 'Art', '2.0000', 10, FALSE, TRUE, 'account', '{}')
+       ON CONFLICT (id) DO NOTHING`,
+      [prodA, prodB]
+    );
+
+    const ordIds = ['ord_c19_1', 'ord_c19_2', 'ord_c19_3', 'ord_c19_fail'];
+    try {
+      const beforeReport = await pricingService.getProfitAnalytics();
+
+      // Insert fulfilled orders today across 2 products & 2 suppliers, plus 1 FAILED order that MUST be excluded
+      await db.query(
+        `INSERT INTO local_orders (id, user_id, idempotency_key, product_id, quantity, unit_price, total_price, supplier_cost, status, created_at, updated_at)
+         VALUES
+           ('ord_c19_1', 'u_c19', 'idem_c19_1', $1, 1, '1.5000', '1.5000', '1.0000', 'COMPLETED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+           ('ord_c19_2', 'u_c19', 'idem_c19_2', $1, 1, '1.5000', '1.5000', '1.0000', 'COMPLETED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+           ('ord_c19_3', 'u_c19', 'idem_c19_3', $2, 1, '5.0000', '5.0000', '2.0000', 'PENDING_INVITE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+           ('ord_c19_fail', 'u_c19', 'idem_c19_fail', $2, 1, '99.0000', '99.0000', '1.0000', 'FAILED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [prodA, prodB]
+      );
+      await db.query(
+        `INSERT INTO supplier_orders (id, local_order_id, idempotency_key, supplier_status, fulfilled_supplier_id)
+         VALUES
+           ('so_c19_1', 'ord_c19_1', 'so_idem_c19_1', 'completed', 'aitoolshop'),
+           ('so_c19_2', 'ord_c19_2', 'so_idem_c19_2', 'completed', 'aitoolshop'),
+           ('so_c19_3', 'ord_c19_3', 'so_idem_c19_3', 'pending_invite', 'ventebot')`
+      );
+
+      // Added today deltas: +8.00 revenue (1.5+1.5+5.0), +4.00 profit (0.5+0.5+3.0), +3 orders (FAILED ignored)
+      const afterReport = await pricingService.getProfitAnalytics();
+      assert.strictEqual(
+        new Decimal(afterReport.todayRevenue).minus(beforeReport.todayRevenue).toFixed(2),
+        '8.00',
+        'Today Revenue must exclude FAILED orders and sum COMPLETED + PENDING_INVITE'
+      );
+      assert.strictEqual(
+        new Decimal(afterReport.todayProfit).minus(beforeReport.todayProfit).toFixed(2),
+        '4.00',
+        'Today Profit must equal sum(total_price - supplier_cost)'
+      );
+      assert.strictEqual(afterReport.todayOrders - beforeReport.todayOrders, 3);
+      assert.ok(new Decimal(afterReport.monthlyRevenue).greaterThanOrEqualTo(8));
+      assert.ok(new Decimal(afterReport.monthlyProfit).greaterThanOrEqualTo(4));
+      assert.ok(afterReport.topProduct && afterReport.topSupplier && afterReport.mostProfitableProduct);
+
+      // Simulate Admin Control Center & Pricing Center UI callbacks
+      const sent: Array<{ method: string; body: any }> = [];
+      telegramClient.setTransportOverride(async (method, body) => {
+        sent.push({ method, body });
+        return { ok: true, result: { message_id: 9912 } };
+      });
+
+      const fireAdm = async (cbData: string) => {
+        sent.length = 0;
+        await adminHandler.handleCallback({
+          id: 'cb_c19_' + Math.random().toString(36).slice(2, 6),
+          from: { id: adminNum, is_bot: false, first_name: 'Admin' },
+          data: cbData,
+          message: { message_id: 9912, date: Math.floor(Date.now() / 1000), chat: { id: adminNum, type: 'private' } },
+        } as any);
+        return sent.find(m => m.method === 'editMessageText' || m.method === 'sendMessage')?.body;
+      };
+
+      const pc = await fireAdm('adm:price');
+      assert.ok(String(pc?.text || '').includes('PRICING CENTER'));
+
+      const pcFixed = await fireAdm('adm:prc_gl_m:FIXED');
+      assert.ok(String(pcFixed?.text || '').includes('Fixed (+USDT)'));
+
+      const supList = await fireAdm('adm:prc_sup');
+      assert.ok(String(supList?.text || '').includes('SUPPLIER PRICING OVERRIDES'));
+
+      const supDet = await fireAdm('adm:prc_sv:ventebot');
+      assert.ok(String(supDet?.text || '').includes('VENTEBOT'));
+
+      const supSet = await fireAdm('adm:prc_ss:P:ventebot:0.15');
+      assert.ok(String(supSet?.text || '').includes('+15%'));
+
+      const prodDet = await fireAdm(`adm_pr:${prodA}`);
+      assert.ok(String(prodDet?.text || '').includes('Supplier Cost (Admin Only)'));
+
+      const prodPct = await fireAdm(`adm_set_pm:${prodA}:0.20`);
+      assert.ok(String(prodPct?.text || '').includes('+20%'));
+
+      const profitScreen = await fireAdm('adm:profit');
+      assert.ok(String(profitScreen?.text || '').includes('PROFIT ANALYTICS'));
+      assert.ok(String(profitScreen?.text || '').includes("Today's Revenue"));
+      assert.ok(String(profitScreen?.text || '').includes('Monthly Profit'));
+
+      const tktAnalytics = await fireAdm('adm:tkt_stat');
+      assert.ok(String(tktAnalytics?.text || '').includes('SUPPORT TICKET ANALYTICS'));
+
+      const flagsScreen = await fireAdm('adm:set_flags');
+      assert.ok(String(flagsScreen?.text || '').includes('SYSTEM & FEATURE FLAGS'));
+    } finally {
+      telegramClient.setTransportOverride(null);
+      await pricingService.setGlobalPricingRule(
+        {
+          markupType: prevGlobal.markupType || 'AUTO',
+          defaultFixedMarkup: prevGlobal.defaultFixedMarkup || '0.05',
+          defaultPercentMarkup: prevGlobal.defaultPercentMarkup || '0.15',
+        },
+        adminId
+      ).catch(() => {});
+      await pricingService.clearSupplierPricingOverride('ventebot', adminId).catch(() => {});
+      await db.query('DELETE FROM product_overrides WHERE product_id IN ($1, $2)', [prodA, prodB]).catch(() => {});
+      await db.query('DELETE FROM supplier_orders WHERE local_order_id = ANY($1)', [ordIds]).catch(() => {});
+      await db.query('DELETE FROM local_orders WHERE id = ANY($1)', [ordIds]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id IN ($1, $2)', [prodA, prodB]).catch(() => {});
+      await redis.del(`adm_prc_prod:${adminId}`).catch(() => {});
     }
   });
 

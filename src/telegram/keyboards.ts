@@ -759,7 +759,7 @@ export function getLanguageKeyboard(currentLang: SupportedLanguage = 'en'): Tele
 }
 
 /**
- * Admin Main Menu Keyboard — Logically grouped for public release operations
+ * Admin Control Center Keyboard — Clean 6-section navigation preserving all backend powers
  */
 export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): TelegramInlineKeyboardMarkup {
   return perfTracker.measureRender(() => {
@@ -770,39 +770,16 @@ export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): Telegr
   return menuCache.set(cacheKey, {
     inline_keyboard: filterNonEmptyRows([
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Dashboard', fallbackEmoji: '🏠', style: 'primary', callbackData: 'adm:dash', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Orders', fallbackEmoji: '📦', style: 'default', callbackData: 'adm:ord', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Wallets', fallbackEmoji: '💰', style: 'default', callbackData: 'adm:wal', forceVisible: true }),
-      ]),
-      ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Deposits', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Products', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:prod:1', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Pricing', fallbackEmoji: '💲', style: 'default', callbackData: 'adm:price', forceVisible: true }),
-      ]),
-      ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Categories', fallbackEmoji: '🗂️', style: 'default', callbackData: 'adm:cat', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Giveaways', fallbackEmoji: '🎁', style: 'default', callbackData: 'adm:gw', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Referrals', fallbackEmoji: '👥', style: 'default', callbackData: 'adm:ref', forceVisible: true }),
-      ]),
-      ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Tickets', fallbackEmoji: '🎫', style: 'primary', callbackData: 'adm:tkt', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Auto Promo', fallbackEmoji: '📣', style: 'primary', callbackData: 'adm:promo', forceVisible: true }),
-      ]),
-      ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Announcements', fallbackEmoji: '📢', style: 'default', callbackData: 'adm:ann', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Channels', fallbackEmoji: '📡', style: 'default', callbackData: 'adm:ch', forceVisible: true }),
-      ]),
-      ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ settingKey: 'btn.adm.ui_editor', lang, callbackData: 'adm:ui', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Settings', fallbackEmoji: '⚙️', style: 'default', callbackData: 'adm:set', forceVisible: true }),
-      ]),
-      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Overview', fallbackEmoji: '📊', style: 'primary', callbackData: 'adm:dash', forceVisible: true }),
         ButtonBuilder.buildButton({ text: 'Suppliers', fallbackEmoji: '🏭', style: 'primary', callbackData: 'adm:sup', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Sync Now', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sync', forceVisible: true }),
       ]),
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'Diagnostics', fallbackEmoji: '🔬', style: 'primary', callbackData: 'adm:diag', forceVisible: true }),
-        ButtonBuilder.buildButton({ text: 'Launch Audit', fallbackEmoji: '🚀', style: 'success', callbackData: 'adm:audit', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Store', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:sec:store', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Growth', fallbackEmoji: '👥', style: 'primary', callbackData: 'adm:sec:growth', forceVisible: true }),
+      ]),
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Support', fallbackEmoji: '🎫', style: 'primary', callbackData: 'adm:tkt', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Settings', fallbackEmoji: '⚙️', style: 'default', callbackData: 'adm:set', forceVisible: true }),
       ]),
       ...(config.binance.diagnosticEnabled
         ? [
@@ -822,6 +799,133 @@ export function getAdminMainMenuKeyboard(lang: SupportedLanguage = 'en'): Telegr
       ]),
     ]),
   });
+  });
+}
+
+/**
+ * Admin Overview Section Keyboard
+ */
+export function getAdminOverviewKeyboard(): TelegramInlineKeyboardMarkup {
+  return perfTracker.measureRender(() => {
+    const cacheKey = 'admin_sec:overview';
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
+
+    return menuCache.set(cacheKey, {
+      inline_keyboard: filterNonEmptyRows([
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Profit Analytics', fallbackEmoji: '📈', style: 'success', callbackData: 'adm:profit', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Sync Catalogue', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sync', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Pending Deposits', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Launch Audit', fallbackEmoji: '🚀', style: 'success', callbackData: 'adm:audit', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Perf Benchmark', fallbackEmoji: '⚡', style: 'default', callbackData: 'adm:perf', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'System Health', fallbackEmoji: '🩺', style: 'default', callbackData: 'adm:hlth', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Diagnostics', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:diag', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Control Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ]),
+    });
+  });
+}
+
+/**
+ * Admin Store Management Section Keyboard
+ */
+export function getAdminStoreSectionKeyboard(): TelegramInlineKeyboardMarkup {
+  return perfTracker.measureRender(() => {
+    const cacheKey = 'admin_sec:store';
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
+
+    return menuCache.set(cacheKey, {
+      inline_keyboard: filterNonEmptyRows([
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Products', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:prod:1', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Categories', fallbackEmoji: '🗂️', style: 'default', callbackData: 'adm:cat', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Pricing Center', fallbackEmoji: '💰', style: 'primary', callbackData: 'adm:price', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Product Mapping', fallbackEmoji: '🧠', style: 'primary', callbackData: 'adm:sup_map', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Orders', fallbackEmoji: '📦', style: 'primary', callbackData: 'adm:ord', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Deposits', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Wallets', fallbackEmoji: '💰', style: 'default', callbackData: 'adm:wal', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Profit Analytics', fallbackEmoji: '📈', style: 'success', callbackData: 'adm:profit', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Control Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ]),
+    });
+  });
+}
+
+/**
+ * Admin Growth & Promotions Section Keyboard
+ */
+export function getAdminGrowthSectionKeyboard(): TelegramInlineKeyboardMarkup {
+  return perfTracker.measureRender(() => {
+    const cacheKey = 'admin_sec:growth';
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
+
+    return menuCache.set(cacheKey, {
+      inline_keyboard: filterNonEmptyRows([
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Referrals', fallbackEmoji: '👥', style: 'primary', callbackData: 'adm:ref', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Giveaways', fallbackEmoji: '🎁', style: 'primary', callbackData: 'adm:gw', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Auto Promo', fallbackEmoji: '📣', style: 'primary', callbackData: 'adm:promo', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Broadcasts', fallbackEmoji: '📢', style: 'default', callbackData: 'adm:ann', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Required Channels', fallbackEmoji: '📡', style: 'default', callbackData: 'adm:ch', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Control Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ]),
+    });
+  });
+}
+
+/**
+ * Admin Supplier Center Hub Keyboard
+ */
+export function getAdminSupplierCenterKeyboard(): TelegramInlineKeyboardMarkup {
+  return perfTracker.measureRender(() => {
+    const cacheKey = 'admin_sec:suppliers';
+    const cached = menuCache.get(cacheKey);
+    if (cached) return cached;
+
+    return menuCache.set(cacheKey, {
+      inline_keyboard: filterNonEmptyRows([
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Overview', fallbackEmoji: '📊', style: 'primary', callbackData: 'adm:sup_ov', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Suppliers', fallbackEmoji: '🏭', style: 'primary', callbackData: 'adm:sup_list', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Sync', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sup_sync_hub', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Balances', fallbackEmoji: '💰', style: 'default', callbackData: 'adm:sup_bals', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Product Mapping', fallbackEmoji: '🧠', style: 'primary', callbackData: 'adm:sup_map', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Health', fallbackEmoji: '📈', style: 'default', callbackData: 'adm:sup_hlth', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Diagnostics', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:sup_diag_hub', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Control Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ]),
+    });
   });
 }
 
@@ -849,6 +953,10 @@ export function preloadCommonMenus(): number {
     getBackHomeKeyboard('m:dep', lang);
     getAdminMainMenuKeyboard(lang);
   }
+  getAdminOverviewKeyboard();
+  getAdminStoreSectionKeyboard();
+  getAdminGrowthSectionKeyboard();
+  getAdminSupplierCenterKeyboard();
   return menuCache.size();
 }
 

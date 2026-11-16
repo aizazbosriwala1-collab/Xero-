@@ -8,6 +8,7 @@ import {
   SupplierReadOnlyDiagnosticResult,
   maskSupplierRef,
 } from '../../services/supplier.js';
+import { supplierEcosystemService } from '../../services/supplierEcosystem.js';
 import { pricingService } from '../../services/pricing.js';
 import { orderService } from '../../services/order.js';
 import { giveawayService, GiveawayRewardType } from '../../services/giveaway.js';
@@ -30,6 +31,10 @@ import { SupportedLanguage, getUserLanguage, t } from '../../services/i18n.js';
 import { ButtonBuilder } from '../buttonBuilder.js';
 import {
   getAdminMainMenuKeyboard,
+  getAdminOverviewKeyboard,
+  getAdminStoreSectionKeyboard,
+  getAdminGrowthSectionKeyboard,
+  getAdminSupplierCenterKeyboard,
   getAdminUiCenterKeyboard,
   getAdminUiSectionKeyboard,
   getAdminUiItemEditorKeyboard,
@@ -106,75 +111,190 @@ export class AdminHandler {
       return;
     }
 
-    // Dashboard (single aggregated SQL round-trip)
+    // Dashboard / Overview (single aggregated SQL round-trip)
     if (data === 'adm:dash') {
       const stats = await db.queryRow<{
         usersCount: string;
         ordersCount: string;
         pendingDeposits: string;
         productsCount: string;
+        activeSuppliers: string;
+        lowBalanceCount: string;
       }>(`
         SELECT
           (SELECT COUNT(*) FROM users) as "usersCount",
           (SELECT COUNT(*) FROM local_orders) as "ordersCount",
           (SELECT COUNT(*) FROM deposits WHERE status = 'PENDING_REVIEW') as "pendingDeposits",
-          (SELECT COUNT(*) FROM supplier_products) as "productsCount"
+          (SELECT COUNT(*) FROM supplier_products) as "productsCount",
+          (SELECT COUNT(*) FROM suppliers WHERE is_enabled = TRUE) as "activeSuppliers",
+          (SELECT COUNT(*) FROM suppliers WHERE is_enabled = TRUE AND last_balance_usdt IS NOT NULL AND last_balance_usdt < low_balance_threshold) as "lowBalanceCount"
       `);
 
+      const lowBalCount = parseInt(stats?.lowBalanceCount || '0', 10);
       const text =
-        `📊 *XERO KHAN EXECUTIVE DASHBOARD*\n\n` +
+        `📊 *MASTER XERO OVERVIEW*\n\n` +
         `• Registered Users: *${stats?.usersCount || 0}*\n` +
         `• Total Orders Placed: *${stats?.ordersCount || 0}*\n` +
         `• Pending Deposit Reviews: *${stats?.pendingDeposits || 0}*\n` +
-        `• Catalogued Products: *${stats?.productsCount || 0}*\n\n` +
-        `🛡️ *Safety Flags:*\n` +
+        `• Catalogued Products: *${stats?.productsCount || 0}*\n` +
+        `• Active Suppliers: *${stats?.activeSuppliers || 1}*\n` +
+        (lowBalCount > 0 ? `• ⚠️ Low Balance Suppliers: *${lowBalCount}*\n` : '') +
+        `\n🛡️ *Safety Flags:*\n` +
         `• Recovery Mode: *${config.safety.recoveryMode}*\n` +
         `• Live Supplier Ordering: *${config.safety.liveOrderingEnabled ? 'ENABLED' : 'DISABLED (Protected)'}*\n` +
         `• Manual Payments: *${config.safety.manualPaymentsEnabled ? 'ACTIVE' : 'DISABLED'}*`;
 
       await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: {
-          inline_keyboard: [
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'TRIGGER SUPPLIER SYNC', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sync' }),
-            ]),
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'REVIEW PENDING DEPOSITS', fallbackEmoji: '💳', style: 'primary', callbackData: 'adm:dep' }),
-            ]),
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'UI & BUTTONS EDITOR', fallbackEmoji: '🎨', style: 'primary', callbackData: 'adm:ui' }),
-            ]),
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main' }),
-            ]),
-          ],
-        },
+        reply_markup: getAdminOverviewKeyboard(),
       });
       return;
     }
 
-    // Pricing Overview (cached global pricing rules)
-    if (data === 'adm:price') {
-      const val = await pricingService.getGlobalPricingSettings();
-      const text =
-        `💲 *GLOBAL PRICING ENGINE*\n\n` +
-        `• Default Percent Markup: \`${val.defaultPercentMarkup || '0.15'}\`\n` +
-        `• Default Fixed Markup: \`${val.defaultFixedMarkup || '0.05'} USDT\`\n` +
-        `• Min Markup Floor: \`${val.minMarkupFloor || '0.02'} USDT\`\n\n` +
-        `To edit individual product prices or markups, open *🛍️ PRODUCTS*:`;
+    // Store Management Section Hub
+    if (data === 'adm:sec:store') {
+      await redis.clearFsmState(userId);
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `🛍️ *STORE MANAGEMENT*\n\nManage products, categories, pricing markups, multi-supplier product mapping, customer orders, deposits, and wallets:`,
+        { reply_markup: getAdminStoreSectionKeyboard() }
+      );
+      return;
+    }
 
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: {
-          inline_keyboard: [
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'OPEN PRODUCT PRICING', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:prod:1' }),
-            ]),
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main' }),
-            ]),
-          ],
-        },
-      });
+    // Growth & Promotions Section Hub
+    if (data === 'adm:sec:growth') {
+      await redis.clearFsmState(userId);
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        `👥 *GROWTH & PROMOTIONS*\n\nManage referrals, custom giveaways, automated channel promotions, broadcasts, and required channels:`,
+        { reply_markup: getAdminGrowthSectionKeyboard() }
+      );
+      return;
+    }
+
+    // Pricing Center (3-Layer Hierarchy: Product Override > Supplier Override > Global Pricing)
+    if (data === 'adm:price') {
+      await redis.clearFsmState(userId);
+      await this.renderAdminPricingCenter(chatId, messageId);
+      return;
+    }
+
+    if (data.startsWith('adm:prc_gl_m:')) {
+      const mode = data.slice('adm:prc_gl_m:'.length) as 'FIXED' | 'PERCENT' | 'AUTO';
+      await pricingService.setGlobalPricingRule({ markupType: mode }, userId);
+      await this.renderAdminPricingCenter(
+        chatId,
+        messageId,
+        `✅ Global markup mode updated to *${mode === 'FIXED' ? 'Fixed (+USDT)' : mode === 'PERCENT' ? 'Percentage (+%)' : 'Auto (Max % / Fixed)'}*.`
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:prc_gl_p:')) {
+      const rest = data.slice('adm:prc_gl_p:'.length);
+      const [mCode, valStr] = rest.split(':');
+      if (mCode === 'F') {
+        await pricingService.setGlobalPricingRule({ markupType: 'FIXED', defaultFixedMarkup: valStr }, userId);
+        await this.renderAdminPricingCenter(chatId, messageId, `✅ Global Fixed Markup set to \`+${valStr} USDT\`.`);
+      } else {
+        await pricingService.setGlobalPricingRule({ markupType: 'PERCENT', defaultPercentMarkup: valStr }, userId);
+        const pctLabel = new Decimal(valStr).times(100).toFixed(0);
+        await this.renderAdminPricingCenter(chatId, messageId, `✅ Global Percentage Markup set to \`+${pctLabel}%\`.`);
+      }
+      return;
+    }
+
+    if (data === 'adm:prc_gl_e:FIXED' || data === 'adm:prc_gl_e:PERCENT') {
+      const mode = data.endsWith(':FIXED') ? 'FIXED' : 'PERCENT';
+      await redis.setFsmState(userId, { step: 'ADMIN_PRICE_GLOBAL_VAL', data: { mode } });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        mode === 'FIXED'
+          ? `✏️ *CUSTOM GLOBAL FIXED MARKUP*\n\nEnter the fixed USDT markup to add above supplier cost (e.g. \`0.05\`, \`0.15\`, \`0.50\`):`
+          : `✏️ *CUSTOM GLOBAL PERCENTAGE MARKUP*\n\nEnter the percentage markup to add above supplier cost (e.g. \`15\` for +15%, \`25\` for +25%):`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: 'adm:price', forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data === 'adm:prc_sup') {
+      await redis.clearFsmState(userId);
+      await this.renderAdminSupplierPricingList(chatId, messageId);
+      return;
+    }
+
+    if (data.startsWith('adm:prc_sv:')) {
+      const supplierId = data.slice('adm:prc_sv:'.length);
+      await redis.clearFsmState(userId);
+      await this.renderAdminSupplierPricingDetail(chatId, messageId, supplierId);
+      return;
+    }
+
+    if (data.startsWith('adm:prc_ss:')) {
+      const [, , mCode, supplierId, valStr] = data.split(':');
+      const mode = mCode === 'F' ? 'FIXED' : 'PERCENT';
+      await pricingService.setSupplierPricingOverride(supplierId, mode, valStr, userId);
+      const label =
+        mode === 'FIXED'
+          ? `+${valStr} USDT`
+          : `+${new Decimal(valStr).times(100).toFixed(0)}%`;
+      await this.renderAdminSupplierPricingDetail(
+        chatId,
+        messageId,
+        supplierId,
+        `✅ Supplier pricing override set to \`${label}\` (${mode}).`
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:prc_se:')) {
+      const [, , mCode, supplierId] = data.split(':');
+      await redis.setFsmState(userId, { step: 'ADMIN_PRICE_SUP_VAL', data: { supplierId, mode: mCode } });
+      await telegramClient.editMessageText(
+        chatId,
+        messageId,
+        mCode === 'F'
+          ? `✏️ *SUPPLIER FIXED MARKUP (${this.escapeDiagMarkdown(supplierId)})*\n\nEnter the fixed USDT markup for this supplier (e.g. \`0.10\`, \`0.25\`):`
+          : `✏️ *SUPPLIER PERCENTAGE MARKUP (${this.escapeDiagMarkdown(supplierId)})*\n\nEnter the percentage markup for this supplier (e.g. \`15\` for +15%, \`20\` for +20%):`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ButtonBuilder.buildActionRow([
+                ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: `adm:prc_sv:${supplierId}`, forceVisible: true }),
+              ]),
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    if (data.startsWith('adm:prc_sc:')) {
+      const supplierId = data.slice('adm:prc_sc:'.length);
+      await pricingService.clearSupplierPricingOverride(supplierId, userId);
+      await this.renderAdminSupplierPricingDetail(
+        chatId,
+        messageId,
+        supplierId,
+        `✅ Supplier pricing override cleared. Now inherits Global Pricing rules.`
+      );
+      return;
+    }
+
+    if (data === 'adm:profit') {
+      await redis.clearFsmState(userId);
+      await this.renderAdminProfitAnalytics(chatId, messageId);
       return;
     }
 
@@ -1304,6 +1424,11 @@ export class AdminHandler {
       return;
     }
 
+    if (data === 'adm:tkt_stat') {
+      await this.renderAdminTicketAnalytics(chatId, messageId);
+      return;
+    }
+
     if (data.startsWith('adm:tkt_v:')) {
       const ticketId = data.slice('adm:tkt_v:'.length);
       await this.renderAdminTicketDetail(chatId, messageId, ticketId);
@@ -1791,11 +1916,216 @@ export class AdminHandler {
     }
 
     // =========================================================================
-    // SUPPLIER CONTROL CENTER (NO DELETE CAPABILITY)
+    // SUPPLIER CENTER & MULTI-SUPPLIER ECOSYSTEM (NO DELETE CAPABILITY)
     // =========================================================================
-    if (data === 'adm:sup' || data.startsWith('adm:sup_v:') || data.startsWith('adm:sup_bal:') || data.startsWith('adm:sup_ord:') || data.startsWith('adm:sup_sync:') || data.startsWith('adm:sup_tog:')) {
+    if (
+      data === 'adm:sup' ||
+      data === 'adm:sup_ov' ||
+      data === 'adm:sup_list' ||
+      data === 'adm:sup_sync_hub' ||
+      data === 'adm:sup_sync_all' ||
+      data === 'adm:sup_bals' ||
+      data === 'adm:sup_bals_r' ||
+      data === 'adm:sup_map' ||
+      data === 'adm:sup_hlth' ||
+      data === 'adm:sup_diag_hub' ||
+      data.startsWith('adm:sup_map_pg:') ||
+      data.startsWith('adm:smp:') ||
+      data.startsWith('adm:sms:') ||
+      data.startsWith('adm:smpk:') ||
+      data.startsWith('adm:smclr:') ||
+      data.startsWith('adm:smcid:') ||
+      data.startsWith('adm:sup_drv_d:') ||
+      data.startsWith('adm:sup_thr:') ||
+      data.startsWith('adm:sup_v:') ||
+      data.startsWith('adm:sup_bal:') ||
+      data.startsWith('adm:sup_ord:') ||
+      data.startsWith('adm:sup_sync:') ||
+      data.startsWith('adm:sup_tog:')
+    ) {
       if (data === 'adm:sup') {
         await this.renderAdminSuppliersHub(chatId, messageId);
+        return;
+      }
+
+      if (data === 'adm:sup_ov') {
+        await this.renderAdminSupplierOverview(chatId, messageId);
+        return;
+      }
+
+      if (data === 'adm:sup_list') {
+        await this.renderAdminSupplierList(chatId, messageId);
+        return;
+      }
+
+      if (data === 'adm:sup_sync_hub') {
+        await this.renderAdminSupplierSyncHub(chatId, messageId);
+        return;
+      }
+
+      if (data === 'adm:sup_sync_all') {
+        const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+        const notes: string[] = [];
+        for (const s of summaries.filter(x => x.isEnabled && x.syncEnabled)) {
+          const r = await supplierService.syncSupplierViaDriver(s.id);
+          notes.push(`${r.ok ? '✅' : '⚠️'} ${s.name}: ${r.message}`);
+        }
+        await this.renderAdminSupplierSyncHub(
+          chatId,
+          messageId,
+          notes.length > 0 ? notes.join('\n') : 'ℹ️ No enabled suppliers with Sync ON.'
+        );
+        return;
+      }
+
+      if (data === 'adm:sup_bals' || data === 'adm:sup_bals_r') {
+        let notice: string | undefined;
+        if (data === 'adm:sup_bals_r') {
+          const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+          const refreshed: string[] = [];
+          for (const s of summaries.filter(x => x.isEnabled)) {
+            const b = await supplierService.checkSupplierBalanceViaDriver(s.id);
+            refreshed.push(b.ok ? `✅ ${s.name}: ${b.balanceUsdt} ${b.currency}` : `⚠️ ${s.name}: ${b.error || 'N/A'}`);
+          }
+          notice = refreshed.join('\n') || 'ℹ️ No active suppliers to query.';
+        }
+        await this.renderAdminSupplierBalances(chatId, messageId, notice);
+        return;
+      }
+
+      if (data === 'adm:sup_hlth') {
+        await this.renderAdminSupplierHealth(chatId, messageId);
+        return;
+      }
+
+      if (data === 'adm:sup_diag_hub') {
+        await this.renderAdminSupplierDiagHub(chatId, messageId);
+        return;
+      }
+
+      if (data.startsWith('adm:sup_drv_d:')) {
+        const supId = data.slice('adm:sup_drv_d:'.length);
+        const diag = await supplierService.runSupplierDriverDiagnostics(supId);
+        const summary =
+          `${diag.ok ? '✅' : '⚠️'} *Driver Diagnostics (${this.escapeDiagMarkdown(diag.driverKey)})*\n` +
+          `Latency: \`${diag.latencyMs}ms\`\n` +
+          diag.checks.map(c => `${c.ok ? '✅' : '❌'} *${this.escapeDiagMarkdown(c.name)}*: ${this.escapeDiagMarkdown(c.detail)}`).join('\n');
+        await this.renderAdminSupplierDetail(chatId, messageId, supId, summary);
+        return;
+      }
+
+      if (data.startsWith('adm:sup_thr:')) {
+        const supId = data.slice('adm:sup_thr:'.length);
+        const ctrl = await supplierService.getSupplierControl(supId);
+        await redis.setFsmState(userId, { step: 'ADMIN_SUP_THRESHOLD', data: { supplierId: supId } }, 300);
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `⚠️ *LOW BALANCE THRESHOLD*\n\nSupplier: *${this.escapeDiagMarkdown(ctrl.name)}*\n\nEnter minimum balance alert threshold in USDT (e.g. \`20\`):`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'default', callbackData: `adm:sup_v:${supId}`, forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      if (data === 'adm:sup_map' || data.startsWith('adm:sup_map_pg:')) {
+        const pg = data.startsWith('adm:sup_map_pg:') ? parseInt(data.slice('adm:sup_map_pg:'.length), 10) || 1 : 1;
+        await this.renderAdminProductMappingList(chatId, messageId, pg);
+        return;
+      }
+
+      if (data.startsWith('adm:smp:')) {
+        const prodId = data.slice('adm:smp:'.length);
+        await redis.set(`adm_map_ctx:${userId}`, prodId, 1800);
+        await this.renderAdminProductMappingDetail(chatId, messageId, prodId);
+        return;
+      }
+
+      if (data.startsWith('adm:sms:')) {
+        const slotRank = parseInt(data.slice('adm:sms:'.length), 10) as 1 | 2 | 3 | 4;
+        const prodId = await redis.get(`adm_map_ctx:${userId}`);
+        if (!prodId) {
+          await this.renderAdminProductMappingList(chatId, messageId, 1, 'ℹ️ Mapping session expired. Select a product again.');
+          return;
+        }
+        await this.renderAdminMappingSlotEditor(chatId, messageId, prodId, slotRank);
+        return;
+      }
+
+      if (data.startsWith('adm:smpk:')) {
+        const rest = data.slice('adm:smpk:'.length);
+        const [slotStr, supId] = rest.split(':');
+        const slotRank = parseInt(slotStr, 10) as 1 | 2 | 3 | 4;
+        const prodId = await redis.get(`adm_map_ctx:${userId}`);
+        if (!prodId || !supId) {
+          await this.renderAdminProductMappingList(chatId, messageId, 1);
+          return;
+        }
+        const spRow = await db.queryRow<{ supplier_product_id: string }>(
+          'SELECT supplier_product_id FROM supplier_products WHERE id = $1',
+          [prodId]
+        );
+        const mirrorRow = await db.queryRow<{ supplier_product_id: string }>(
+          'SELECT supplier_product_id FROM supplier_catalog_mirror WHERE supplier_id = $1 LIMIT 1',
+          [supId]
+        );
+        const remoteId = mirrorRow?.supplier_product_id || spRow?.supplier_product_id || prodId;
+        await supplierEcosystemService.assignMappingSlot(
+          { masterProductId: prodId, slotRank, supplierId: supId, supplierProductId: remoteId },
+          userId
+        );
+        await this.renderAdminProductMappingDetail(
+          chatId,
+          messageId,
+          prodId,
+          `✅ Slot *${slotRank}* mapped to \`${supId}\` (ID: \`${remoteId}\`).`
+        );
+        return;
+      }
+
+      if (data.startsWith('adm:smclr:')) {
+        const slotRank = parseInt(data.slice('adm:smclr:'.length), 10) as 1 | 2 | 3 | 4;
+        const prodId = await redis.get(`adm_map_ctx:${userId}`);
+        if (!prodId) {
+          await this.renderAdminProductMappingList(chatId, messageId, 1);
+          return;
+        }
+        await supplierEcosystemService.clearMappingSlot(prodId, slotRank, userId);
+        await this.renderAdminProductMappingDetail(chatId, messageId, prodId, `🧹 Cleared Slot *${slotRank}* mapping.`);
+        return;
+      }
+
+      if (data.startsWith('adm:smcid:')) {
+        const rest = data.slice('adm:smcid:'.length);
+        const [slotStr, supId] = rest.split(':');
+        const slotRank = parseInt(slotStr, 10) as 1 | 2 | 3 | 4;
+        const prodId = await redis.get(`adm_map_ctx:${userId}`);
+        if (!prodId || !supId) {
+          await this.renderAdminProductMappingList(chatId, messageId, 1);
+          return;
+        }
+        await redis.setFsmState(userId, { step: 'ADMIN_MAP_SUP_PROD_ID', data: { prodId, slotRank, supId } }, 300);
+        await telegramClient.editMessageText(
+          chatId,
+          messageId,
+          `🆔 *SET SUPPLIER PRODUCT ID*\n\nMaster Product: \`${prodId}\`\nSlot: *${slotRank}*\nSupplier: \`${supId}\`\n\nEnter the remote supplier's exact Product ID:`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                ButtonBuilder.buildActionRow([
+                  ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'default', callbackData: `adm:sms:${slotRank}`, forceVisible: true }),
+                ]),
+              ],
+            },
+          }
+        );
         return;
       }
 
@@ -1807,10 +2137,10 @@ export class AdminHandler {
 
       if (data.startsWith('adm:sup_bal:')) {
         const supId = data.slice('adm:sup_bal:'.length);
-        const bal = await supplierService.getBalance();
-        const notice = bal
-          ? `✅ Live Supplier Balance: \`${bal.balanceUsdt.toFixed(4)} ${bal.currency}\``
-          : '⚠️ Unable to fetch live supplier balance right now.';
+        const bal = await supplierService.checkSupplierBalanceViaDriver(supId);
+        const notice = bal.ok
+          ? `✅ Live Supplier Balance: \`${bal.balanceUsdt} ${bal.currency}\``
+          : `⚠️ ${this.escapeDiagMarkdown(bal.error || 'Unable to fetch live supplier balance right now.')}`;
         await this.renderAdminSupplierDetail(chatId, messageId, supId, notice);
         return;
       }
@@ -1832,17 +2162,13 @@ export class AdminHandler {
 
       if (data.startsWith('adm:sup_sync:')) {
         const supId = data.slice('adm:sup_sync:'.length);
-        try {
-          const syncRes = await supplierService.syncCatalogue();
-          await this.renderAdminSupplierDetail(
-            chatId,
-            messageId,
-            supId,
-            `✅ Sync complete: ${syncRes.importedCount} new, ${syncRes.updatedCount} updated (${syncRes.totalCount} total).`
-          );
-        } catch (err: any) {
-          await this.renderAdminSupplierDetail(chatId, messageId, supId, `❌ Sync failed: ${this.escapeDiagMarkdown(err.message)}`);
-        }
+        const syncRes = await supplierService.syncSupplierViaDriver(supId);
+        await this.renderAdminSupplierDetail(
+          chatId,
+          messageId,
+          supId,
+          `${syncRes.ok ? '✅' : '⚠️'} ${this.escapeDiagMarkdown(syncRes.message)}`
+        );
         return;
       }
 
@@ -1876,6 +2202,7 @@ export class AdminHandler {
     // =========================================================================
     if (
       data === 'adm:set' ||
+      data === 'adm:set_flags' ||
       data === 'adm:set_maint' ||
       data === 'adm:set_gw' ||
       data === 'adm:set_ban' ||
@@ -1884,6 +2211,11 @@ export class AdminHandler {
       data.startsWith('adm:ban_e:') ||
       data.startsWith('adm:ban_clr:')
     ) {
+      if (data === 'adm:set_flags') {
+        await this.renderAdminFeatureFlags(chatId, messageId);
+        return;
+      }
+
       if (data === 'adm:set_maint') {
         const curr = await settingsService.getMaintenanceConfig();
         const next = await settingsService.updateMaintenanceConfig({ enabled: !curr.enabled }, userId);
@@ -2530,38 +2862,8 @@ export class AdminHandler {
     // Edit Product Price Quick Actions
     if (data.startsWith('adm_pr:')) {
       const [, productId] = data.split(':');
-      const product = await db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]);
-      if (!product) return;
-
-      const priceInfo = await pricingService.calculatePrice(productId);
-      const text =
-        `💲 *EDIT PRODUCT PRICING*\n\n` +
-        `Product: *${product.original_name}*\n` +
-        `Supplier Cost: \`${priceInfo.supplierCost.toFixed(4)} USDT\`\n` +
-        `Current Retail: \`${priceInfo.customerUnitPrice.toFixed(2)} USDT\`\n` +
-        `Active Rule: *${priceInfo.ruleApplied}*\n\n` +
-        `Choose a pricing adjustment:`;
-
-      await telegramClient.editMessageText(chatId, messageId, text, {
-        reply_markup: {
-          inline_keyboard: [
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: '+0.05 Fixed Markup', style: 'primary', callbackData: `adm_set_fm:${productId}:0.05` }),
-              ButtonBuilder.buildButton({ text: '+0.10 Fixed Markup', style: 'primary', callbackData: `adm_set_fm:${productId}:0.10` }),
-            ]),
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: '+0.25 Fixed Markup', style: 'primary', callbackData: `adm_set_fm:${productId}:0.25` }),
-              ButtonBuilder.buildButton({ text: '+0.50 Fixed Markup', style: 'primary', callbackData: `adm_set_fm:${productId}:0.50` }),
-            ]),
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'Reset to Default Pricing', fallbackEmoji: '🔄', style: 'danger', callbackData: `adm_reset_pr:${productId}` }),
-            ]),
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'BACK TO PRODUCTS', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:prod:1' }),
-            ]),
-          ],
-        },
-      });
+      await redis.set(`adm_prc_prod:${userId}`, productId, 1800).catch(() => {});
+      await this.renderAdminProductPricingDetail(chatId, messageId, productId);
       return;
     }
 
@@ -2569,21 +2871,57 @@ export class AdminHandler {
     if (data.startsWith('adm_set_fm:')) {
       const [, productId, markupStr] = data.split(':');
       await pricingService.setFixedMarkup(productId, markupStr, userId);
-      const newPrice = await pricingService.calculatePrice(productId);
-      await telegramClient.editMessageText(
+      await this.renderAdminProductPricingDetail(
         chatId,
         messageId,
-        `✅ *PRICING UPDATED*\n\nFixed markup of \`+${markupStr} USDT\` saved. New retail price is \`${newPrice.customerUnitPrice.toFixed(2)} USDT\`.\nCustomer catalogue reflects this immediately without server restart.`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              ButtonBuilder.buildActionRow([
-                ButtonBuilder.buildButton({ text: 'BACK TO PRODUCTS', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:prod:1' }),
-              ]),
-            ],
-          },
-        }
+        productId,
+        `✅ Fixed markup of \`+${markupStr} USDT\` saved. Customer catalog updated immediately.`
       );
+      return;
+    }
+
+    // Apply Percentage Markup (in-place update)
+    if (data.startsWith('adm_set_pm:')) {
+      const [, productId, pctStr] = data.split(':');
+      await pricingService.setPercentMarkup(productId, pctStr, userId);
+      const pctLabel = new Decimal(pctStr).times(100).toFixed(0);
+      await this.renderAdminProductPricingDetail(
+        chatId,
+        messageId,
+        productId,
+        `✅ Percentage markup of \`+${pctLabel}%\` saved. Customer catalog updated immediately.`
+      );
+      return;
+    }
+
+    // Custom Product Pricing Prompt (Fixed Markup, % Markup, or Fixed Retail Price)
+    if (data.startsWith('adm:prc_pe:')) {
+      const rest = data.slice('adm:prc_pe:'.length);
+      const parts = rest.split(':');
+      const mode = (parts[0] || 'f') as 'f' | 'p' | 'r';
+      const productId = parts[1] || (await redis.get(`adm_prc_prod:${userId}`).catch(() => null)) || '';
+      if (!productId) {
+        await telegramClient.editMessageText(chatId, messageId, '⚠️ Select a product first.', {
+          reply_markup: getAdminStoreSectionKeyboard(),
+        });
+        return;
+      }
+      await redis.setFsmState(userId, { step: 'ADMIN_PRICE_PROD_VAL', data: { productId, mode } });
+      const promptMsg =
+        mode === 'r'
+          ? `💲 *SET FIXED RETAIL PRICE*\n\nEnter exact customer retail price in USDT (e.g. \`0.50\`, \`1.25\`):`
+          : mode === 'p'
+          ? `📈 *SET PRODUCT % MARKUP*\n\nEnter percentage markup above supplier cost (e.g. \`20\` for +20%):`
+          : `➕ *SET PRODUCT FIXED MARKUP*\n\nEnter fixed USDT markup above supplier cost (e.g. \`0.05\`, \`0.25\`):`;
+      await telegramClient.editMessageText(chatId, messageId, promptMsg, {
+        reply_markup: {
+          inline_keyboard: [
+            ButtonBuilder.buildActionRow([
+              ButtonBuilder.buildButton({ text: 'Cancel', fallbackEmoji: '❌', style: 'danger', callbackData: `adm_pr:${productId}`, forceVisible: true }),
+            ]),
+          ],
+        },
+      });
       return;
     }
 
@@ -2591,15 +2929,12 @@ export class AdminHandler {
     if (data.startsWith('adm_reset_pr:')) {
       const [, productId] = data.split(':');
       await pricingService.resetPricing(productId, userId);
-      await telegramClient.editMessageText(chatId, messageId, '✅ *PRICING RESET*\n\nProduct pricing reset to global default rule.', {
-        reply_markup: {
-          inline_keyboard: [
-            ButtonBuilder.buildActionRow([
-              ButtonBuilder.buildButton({ text: 'BACK TO PRODUCTS', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:prod:1' }),
-            ]),
-          ],
-        },
-      });
+      await this.renderAdminProductPricingDetail(
+        chatId,
+        messageId,
+        productId,
+        '✅ Product pricing override cleared. Now uses Supplier Override or Global Pricing.'
+      );
       return;
     }
 
@@ -3582,6 +3917,126 @@ export class AdminHandler {
       await this.renderAdminPromoHub(chatId, undefined, `✅ Auto Promotion interval set to \`${mins}\` minutes.`);
       return;
     }
+
+    if (fsm.step === 'ADMIN_SUP_THRESHOLD') {
+      const supId = String(fsm.data?.supplierId || 'aitoolshop');
+      const cleaned = text.trim();
+      const val = Number(cleaned);
+      if (!Number.isFinite(val) || val < 0) {
+        await telegramClient.sendMessage(chatId, '⚠️ Invalid threshold. Please enter a non-negative USDT amount (e.g. `20`):');
+        return;
+      }
+      await supplierEcosystemService.setLowBalanceThreshold(supId, val, userId);
+      await redis.clearFsmState(userId);
+      await this.renderAdminSupplierDetail(chatId, undefined, supId, `✅ Low balance threshold updated to \`${val.toFixed(2)} USDT\`.`);
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_MAP_SUP_PROD_ID') {
+      const { prodId, slotRank, supId } = fsm.data || {};
+      const cleanRemoteId = text.trim();
+      if (!prodId || !slotRank || !supId || !cleanRemoteId) {
+        await redis.clearFsmState(userId);
+        await telegramClient.sendMessage(chatId, '⚠️ Mapping session incomplete. Reopen Product Mapping.');
+        return;
+      }
+      await supplierEcosystemService.assignMappingSlot(
+        {
+          masterProductId: String(prodId),
+          slotRank: Number(slotRank) as 1 | 2 | 3 | 4,
+          supplierId: String(supId),
+          supplierProductId: cleanRemoteId,
+        },
+        userId
+      );
+      await redis.clearFsmState(userId);
+      await this.renderAdminProductMappingDetail(
+        chatId,
+        undefined,
+        String(prodId),
+        `✅ Slot *${slotRank}* mapped to \`${supId}\` (Remote ID: \`${this.escapeDiagMarkdown(cleanRemoteId)}\`).`
+      );
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_PRICE_GLOBAL_VAL') {
+      const mode = fsm.data?.mode === 'FIXED' ? 'FIXED' : 'PERCENT';
+      try {
+        const cleaned = text.trim().replace(/%/g, '');
+        const dec = new Decimal(cleaned);
+        if (dec.isNaN() || dec.lessThan(0)) throw new Error('Enter a non-negative number.');
+        if (mode === 'FIXED') {
+          await pricingService.setGlobalPricingRule(
+            { markupType: 'FIXED', defaultFixedMarkup: dec.toFixed(4) },
+            userId
+          );
+          await redis.clearFsmState(userId);
+          await this.renderAdminPricingCenter(chatId, undefined, `✅ Global Fixed Markup set to \`+${dec.toFixed(2)} USDT\`.`);
+        } else {
+          if (dec.greaterThan(500)) throw new Error('Percentage must be <= 500%.');
+          const ratio = dec.dividedBy(100);
+          await pricingService.setGlobalPricingRule(
+            { markupType: 'PERCENT', defaultPercentMarkup: ratio.toFixed(4) },
+            userId
+          );
+          await redis.clearFsmState(userId);
+          await this.renderAdminPricingCenter(chatId, undefined, `✅ Global Percentage Markup set to \`+${dec.toFixed(1)}%\`.`);
+        }
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nPlease try again:`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_PRICE_SUP_VAL') {
+      const { supplierId, mode } = fsm.data || {};
+      try {
+        const cleaned = text.trim().replace(/%/g, '');
+        const dec = new Decimal(cleaned);
+        if (dec.isNaN() || dec.lessThan(0)) throw new Error('Enter a non-negative number.');
+        if (mode === 'F') {
+          await pricingService.setSupplierPricingOverride(String(supplierId), 'FIXED', dec.toFixed(4), userId);
+          await redis.clearFsmState(userId);
+          await this.renderAdminSupplierPricingDetail(chatId, undefined, String(supplierId), `✅ Supplier Fixed Markup set to \`+${dec.toFixed(2)} USDT\`.`);
+        } else {
+          if (dec.greaterThan(500)) throw new Error('Percentage must be <= 500%.');
+          const ratio = dec.dividedBy(100);
+          await pricingService.setSupplierPricingOverride(String(supplierId), 'PERCENT', ratio.toFixed(4), userId);
+          await redis.clearFsmState(userId);
+          await this.renderAdminSupplierPricingDetail(chatId, undefined, String(supplierId), `✅ Supplier Percentage Markup set to \`+${dec.toFixed(1)}%\`.`);
+        }
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nPlease try again:`);
+      }
+      return;
+    }
+
+    if (fsm.step === 'ADMIN_PRICE_PROD_VAL') {
+      const { productId, mode } = fsm.data || {};
+      try {
+        const cleaned = text.trim().replace(/%/g, '');
+        const dec = new Decimal(cleaned);
+        if (dec.isNaN() || dec.lessThan(0)) throw new Error('Enter a non-negative number.');
+        if (mode === 'r') {
+          await pricingService.setFixedRetailPrice(String(productId), dec.toFixed(4), userId);
+          await redis.clearFsmState(userId);
+          await this.renderAdminProductPricingDetail(chatId, undefined, String(productId), `✅ Fixed retail price set to \`$${dec.toFixed(2)} USDT\`.`);
+        } else if (mode === 'p') {
+          if (dec.greaterThan(500)) throw new Error('Percentage must be <= 500%.');
+          const ratio = dec.dividedBy(100);
+          await pricingService.setPercentMarkup(String(productId), ratio.toFixed(4), userId);
+          await redis.clearFsmState(userId);
+          await this.renderAdminProductPricingDetail(chatId, undefined, String(productId), `✅ Percentage markup set to \`+${dec.toFixed(1)}%\`.`);
+        } else {
+          await pricingService.setFixedMarkup(String(productId), dec.toFixed(4), userId);
+          await redis.clearFsmState(userId);
+          await this.renderAdminProductPricingDetail(chatId, undefined, String(productId), `✅ Fixed markup set to \`+${dec.toFixed(2)} USDT\`.`);
+        }
+      } catch (err: any) {
+        await telegramClient.sendMessage(chatId, `⚠️ *VALIDATION ERROR*\n\n${err.message}\n\nPlease try again:`);
+      }
+      return;
+    }
   }
 
   public async handleAdminPhotoInput(msg: TelegramMessage, fsm: UserFsmState): Promise<void> {
@@ -4555,22 +5010,79 @@ export class AdminHandler {
   }
 
   private async renderAdminSuppliersHub(chatId: number, messageId: number | undefined): Promise<void> {
-    const suppliers = await supplierService.listSuppliers();
-    let text = `🏭 *SUPPLIER CONTROL CENTER*\n\n_Suppliers are managed safely via operational toggles (deletion is disabled to protect order history)._\n\n`;
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    const activeCount = summaries.filter(s => s.isEnabled).length;
+    const onlineCount = summaries.filter(s => s.online).length;
+    const lowBalCount = summaries.filter(s => s.isLowBalance).length;
+    const ordersToday = summaries.reduce((acc, s) => acc + s.ordersToday, 0);
+
+    const text =
+      `🏭 *SUPPLIER CENTER*\n\n` +
+      `Unified Multi-Supplier Empire & Failover Architecture.\n` +
+      `_Customers never see supplier names or routing internals._\n\n` +
+      `• Total Candidates: *${summaries.length}* (*${activeCount}* enabled • *${onlineCount}* online)\n` +
+      `• Orders Today: *${ordersToday}*\n` +
+      `• Low Balance Alerts: *${lowBalCount > 0 ? `⚠️ ${lowBalCount}` : '0'}*\n\n` +
+      `Select a Supplier Center module:`;
+
+    const markup = getAdminSupplierCenterKeyboard();
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierOverview(chatId: number, messageId: number | undefined): Promise<void> {
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    let text = `📊 *SUPPLIER OVERVIEW*\n\n`;
+    for (const s of summaries) {
+      const statusBadge = s.online ? '🟢 Online' : '🔴 Offline';
+      const balLabel = s.balanceUsdt !== null ? `${s.balanceUsdt} USDT` : '—';
+      const warnTag = s.isLowBalance ? ' ⚠️ LOW' : '';
+      text +=
+        `*${this.escapeDiagMarkdown(s.name)}* (${statusBadge})\n` +
+        `• Balance: \`${balLabel}\`${warnTag} | Products: \`${s.productsCount}\`\n` +
+        `• Orders Today: \`${s.ordersToday}\` | Fails: \`${s.failuresToday}\` | Success: \`${s.successRatePct}%\` | Avg: \`${s.avgResponseLabel}\`\n\n`;
+    }
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Manage Suppliers', fallbackEmoji: '🏭', style: 'primary', callbackData: 'adm:sup_list', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Product Mapping', fallbackEmoji: '🧠', style: 'primary', callbackData: 'adm:sup_map', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierList(chatId: number, messageId: number | undefined): Promise<void> {
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    let text =
+      `🏭 *REGISTERED SUPPLIERS (${summaries.length})*\n\n` +
+      `_Safe operational toggles only — deletion is disabled to preserve ledger & order history._\n\n`;
     const rows: any[][] = [];
 
-    for (const s of suppliers) {
-      const statusBadge = s.isEnabled ? '✅ ENABLED' : '❌ DISABLED';
+    for (const s of summaries) {
+      const statusBadge = s.online ? '🟢 Online' : '🔴 Offline';
+      const bal = s.balanceUsdt !== null ? `${s.balanceUsdt} USDT` : 'Not queried';
       text +=
         `• *${this.escapeDiagMarkdown(s.name)}* (${statusBadge})\n` +
-        `  Routing: ${s.routingEnabled ? '✅' : '❌'} | Ordering: ${s.orderingEnabled ? '✅' : '❌'} | Sync: ${s.syncEnabled ? '✅' : '❌'}\n` +
-        (s.lastBalanceUsdt ? `  Last Balance: \`${s.lastBalanceUsdt} USDT\`\n` : '');
+        `  Driver: \`${s.driverKey}\` | Bal: \`${bal}\` | Products: \`${s.productsCount}\`\n`;
       rows.push(
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({
-            text: `Manage ${s.name}`,
-            fallbackEmoji: '🏭',
-            style: 'primary',
+            text: `${s.isEnabled ? '🟢' : '⚪'} ${s.name}`,
+            style: s.isEnabled ? 'primary' : 'default',
             callbackData: `adm:sup_v:${s.id}`,
             forceVisible: true,
           }),
@@ -4580,14 +5092,387 @@ export class AdminHandler {
 
     rows.push(
       ButtonBuilder.buildActionRow([
-        ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
       ])
     );
 
     if (messageId) {
-      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: { inline_keyboard: rows } });
     } else {
-      await telegramClient.sendMessage(chatId, text, { reply_markup: { inline_keyboard: rows } });
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: { inline_keyboard: rows } });
+    }
+  }
+
+  private async renderAdminSupplierSyncHub(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    let text = (notice ? `${notice}\n\n` : '') + `🔄 *SUPPLIER MIRROR & CATALOG SYNC*\n\n`;
+    const rows: any[][] = [
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Sync All Enabled Suppliers', fallbackEmoji: '⚡', style: 'success', callbackData: 'adm:sup_sync_all', forceVisible: true }),
+      ]),
+    ];
+
+    for (const s of summaries) {
+      text +=
+        `• *${this.escapeDiagMarkdown(s.name)}* — Products: \`${s.productsCount}\`\n` +
+        `  Last Sync: \`${s.lastSyncAt || 'Not synced yet'}\`\n`;
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: `Sync ${s.name}`,
+            fallbackEmoji: '🔄',
+            style: s.isEnabled ? 'primary' : 'default',
+            callbackData: `adm:sup_sync:${s.id}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierBalances(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `💰 *SUPPLIER BALANCES & LOW-BALANCE ALERTS*\n\n`;
+    const rows: any[][] = [
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Refresh Enabled Balances', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sup_bals_r', forceVisible: true }),
+      ]),
+    ];
+
+    for (const s of summaries) {
+      const balLabel = s.balanceUsdt !== null ? `${s.balanceUsdt} USDT` : 'Not queried';
+      const statusTag = !s.isEnabled ? '⚪ Disabled' : s.isLowBalance ? '⚠️ LOW BALANCE' : '✅ Healthy';
+      text +=
+        `• *${this.escapeDiagMarkdown(s.name)}*: \`${balLabel}\`\n` +
+        `  Threshold: \`${s.lowBalanceThreshold} USDT\` | ${statusTag}\n`;
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: `Query ${s.name}`,
+            fallbackEmoji: '💰',
+            style: 'default',
+            callbackData: `adm:sup_bal:${s.id}`,
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: `Alert: ${s.lowBalanceThreshold}`,
+            fallbackEmoji: '⚠️',
+            style: 'default',
+            callbackData: `adm:sup_thr:${s.id}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierHealth(chatId: number, messageId: number | undefined): Promise<void> {
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    let text = `📈 *SUPPLIER HEALTH & RELIABILITY*\n\n`;
+
+    for (const s of summaries) {
+      const badge =
+        s.apiStatus === 'Healthy'
+          ? '🟢 Healthy'
+          : s.apiStatus === 'Warning'
+            ? '🟡 Warning'
+            : s.apiStatus === 'Failed'
+              ? '🔴 Failed'
+              : '⚫ Offline';
+      text +=
+        `*${this.escapeDiagMarkdown(s.name)}* — ${badge}\n` +
+        `• Orders Today: \`${s.ordersToday}\` | Failures Today: \`${s.failuresToday}\`\n` +
+        `• Success Rate: \`${s.successRatePct}%\` | Avg Response: \`${s.avgResponseLabel}\`\n` +
+        (s.lastError ? `• Last Error: \`${this.escapeDiagMarkdown(s.lastError.slice(0, 80))}\`\n` : '') +
+        `\n`;
+    }
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Refresh Health', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:sup_hlth', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Diagnostics', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:sup_diag_hub', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierDiagHub(chatId: number, messageId: number | undefined): Promise<void> {
+    const summaries = await supplierEcosystemService.getSupplierDashboardSummaries();
+    let text =
+      `🔬 *SUPPLIER DRIVER DIAGNOSTICS*\n\n` +
+      `Run live read-only driver checks across any supplier driver:\n\n`;
+    const rows: any[][] = [
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'AiToolShop Read-Only Inspector', fallbackEmoji: '🔍', style: 'primary', callbackData: 'adm:sup_diag', forceVisible: true }),
+      ]),
+    ];
+
+    for (const s of summaries) {
+      text += `• *${this.escapeDiagMarkdown(s.name)}* (\`${s.driverKey}\`) — ${s.apiStatus}\n`;
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: `Run Diag: ${s.name}`,
+            fallbackEmoji: '🧪',
+            style: s.isEnabled ? 'primary' : 'default',
+            callbackData: `adm:sup_drv_d:${s.id}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminProductMappingList(
+    chatId: number,
+    messageId: number | undefined,
+    page = 1,
+    notice?: string
+  ): Promise<void> {
+    const pageSize = 6;
+    const { items, total } = await supplierEcosystemService.listMasterProductsWithMappings(page, pageSize);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const curPage = Math.min(Math.max(1, page), totalPages);
+
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `🧠 *PRODUCT SUPPLIER MAPPING* (Page ${curPage}/${totalPages})\n\n` +
+      `Assign Primary + Backup 1..3 suppliers for automatic failover.\n` +
+      `_Customers always see canonical Master Xero products only._\n\n`;
+
+    const rows: any[][] = [];
+    if (items.length === 0) {
+      text += `_No master products catalogued yet. Run Supplier Sync first._`;
+    } else {
+      for (const item of items) {
+        const chainSummary = item.slots.map(s => `${s.slotLabel}:${s.supplierId}${s.supplierEnabled ? '' : '(OFF)'}`).join(' → ');
+        text += `• *${this.escapeDiagMarkdown(item.canonicalName)}*\n  \`${chainSummary}\`\n`;
+        rows.push(
+          ButtonBuilder.buildActionRow([
+            ButtonBuilder.buildButton({
+              text: `${item.fulfillableByAnyEnabledSupplier ? '🟢' : '⚠️'} ${item.canonicalName}`.slice(0, 44),
+              style: 'primary',
+              callbackData: `adm:smp:${item.productId}`,
+              forceVisible: true,
+            }),
+          ])
+        );
+      }
+    }
+
+    if (totalPages > 1) {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: '⬅️ Prev',
+            style: 'default',
+            callbackData: curPage > 1 ? `adm:sup_map_pg:${curPage - 1}` : 'noop',
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: `${curPage}/${totalPages}`,
+            style: 'default',
+            callbackData: 'noop',
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: 'Next ➡️',
+            style: 'default',
+            callbackData: curPage < totalPages ? `adm:sup_map_pg:${curPage + 1}` : 'noop',
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Store Hub', fallbackEmoji: '🛍️', style: 'default', callbackData: 'adm:sec:store', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminProductMappingDetail(
+    chatId: number,
+    messageId: number | undefined,
+    productId: string,
+    notice?: string
+  ): Promise<void> {
+    const view = await supplierEcosystemService.getProductMappings(productId);
+    if (!view) {
+      await this.renderAdminProductMappingList(chatId, messageId, 1, '⚠️ Product not found.');
+      return;
+    }
+
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `🧠 *MAPPING: ${this.escapeDiagMarkdown(view.canonicalName)}*\n` +
+      `Product ID: \`${view.productId}\`\n` +
+      `Customer Availability: *${view.fulfillableByAnyEnabledSupplier ? '✅ Available' : '⚠️ No Active Supplier'}*\n\n`;
+
+    const slotByRank = new Map(view.slots.map(s => [s.slotRank, s]));
+    const labels: Array<{ rank: 1 | 2 | 3 | 4; label: string }> = [
+      { rank: 1, label: 'Primary Supplier' },
+      { rank: 2, label: 'Backup Supplier 1' },
+      { rank: 3, label: 'Backup Supplier 2' },
+      { rank: 4, label: 'Backup Supplier 3' },
+    ];
+
+    const rows: any[][] = [];
+    for (const { rank, label } of labels) {
+      const assigned = slotByRank.get(rank);
+      if (assigned) {
+        const badge = assigned.supplierEnabled ? '🟢' : '🔴';
+        text += `• *${label}:* ${badge} *${this.escapeDiagMarkdown(assigned.supplierName)}* (ID: \`${assigned.supplierProductId}\`)\n`;
+      } else {
+        text += `• *${label}:* _Unassigned_\n`;
+      }
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: `Edit ${label}`,
+            fallbackEmoji: '✏️',
+            style: assigned ? 'primary' : 'default',
+            callbackData: `adm:sms:${rank}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'All Mapped Products', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup_map', forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '🏭', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminMappingSlotEditor(
+    chatId: number,
+    messageId: number | undefined,
+    productId: string,
+    slotRank: 1 | 2 | 3 | 4
+  ): Promise<void> {
+    const [view, suppliers] = await Promise.all([
+      supplierEcosystemService.getProductMappings(productId),
+      supplierService.listSuppliers(),
+    ]);
+    const slotLabel = slotRank === 1 ? 'Primary' : `Backup ${slotRank - 1}`;
+    const prodName = view?.canonicalName || productId;
+
+    const text =
+      `✏️ *ASSIGN ${slotLabel.toUpperCase()} SUPPLIER*\n\n` +
+      `Product: *${this.escapeDiagMarkdown(prodName)}*\n\n` +
+      `Tap a supplier to assign this slot immediately, or set a custom remote Product ID:`;
+
+    const rows: any[][] = [];
+    for (const s of suppliers) {
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: `${s.isEnabled ? '🟢' : '⚪'} ${s.name}`,
+            style: s.isEnabled ? 'primary' : 'default',
+            callbackData: `adm:smpk:${slotRank}:${s.id}`,
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: 'Custom ID',
+            fallbackEmoji: '🆔',
+            style: 'default',
+            callbackData: `adm:smcid:${slotRank}:${s.id}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: `Clear ${slotLabel}`, fallbackEmoji: '🧹', style: 'danger', callbackData: `adm:smclr:${slotRank}`, forceVisible: true }),
+        ButtonBuilder.buildButton({ text: 'Back', fallbackEmoji: '⬅️', style: 'default', callbackData: `adm:smp:${productId}`, forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
     }
   }
 
@@ -4597,27 +5482,38 @@ export class AdminHandler {
     supplierId: string,
     notice?: string
   ): Promise<void> {
-    const s = await supplierService.getSupplierControl(supplierId);
+    const [s, summaries] = await Promise.all([
+      supplierService.getSupplierControl(supplierId),
+      supplierEcosystemService.getSupplierDashboardSummaries(),
+    ]);
+    const summary = summaries.find(x => x.id === supplierId);
+    const statusBadge = summary?.online ? '🟢 Online' : '🔴 Offline';
+    const warnBal = summary?.isLowBalance ? ' ⚠️ LOW BALANCE' : '';
+
     const text =
       (notice ? `${notice}\n\n` : '') +
       `🏭 *SUPPLIER: ${this.escapeDiagMarkdown(s.name.toUpperCase())}*\n\n` +
-      `• Status: ${s.isEnabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-      `• Routing: ${s.routingEnabled ? '✅ ON' : '❌ OFF'}\n` +
-      `• Ordering: ${s.orderingEnabled ? '✅ ON' : '❌ OFF'}\n` +
-      `• Catalogue Sync: ${s.syncEnabled ? '✅ ON' : '❌ OFF'}\n` +
-      `• Env Live Safety Gate: \`LIVE_ORDERING_ENABLED=${config.safety.liveOrderingEnabled}\`\n` +
-      `• Last Balance: \`${s.lastBalanceUsdt ? `${s.lastBalanceUsdt} USDT` : 'Not queried'}\`\n` +
+      `• Status: ${statusBadge} (${s.isEnabled ? 'Enabled' : 'Disabled'})\n` +
+      `• Routing: ${s.routingEnabled ? '✅ ON' : '❌ OFF'} | Ordering: ${s.orderingEnabled ? '✅ ON' : '❌ OFF'} | Sync: ${s.syncEnabled ? '✅ ON' : '❌ OFF'}\n` +
+      `• Balance: \`${s.lastBalanceUsdt ? `${s.lastBalanceUsdt} USDT` : 'Not queried'}\`${warnBal} (Alert < \`${summary?.lowBalanceThreshold || '20.00'} USDT\`)\n` +
+      `• Products Mirrored: \`${summary?.productsCount ?? 0}\`\n` +
+      `• API Status: *${summary?.apiStatus || 'Offline'}* | Avg Response: \`${summary?.avgResponseLabel || '0ms'}\`\n` +
+      `• Orders Today: \`${summary?.ordersToday ?? 0}\` | Failures Today: \`${summary?.failuresToday ?? 0}\` | Success: \`${summary?.successRatePct || '0.0'}%\`\n` +
       `• Last Sync: \`${s.lastSyncAt || 'Not synced yet'}\``;
 
     const markup = {
       inline_keyboard: [
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: 'Check Balance', fallbackEmoji: '💰', style: 'primary', callbackData: `adm:sup_bal:${s.id}`, forceVisible: true }),
-          ButtonBuilder.buildButton({ text: 'Orders (Read-Only)', fallbackEmoji: '📦', style: 'primary', callbackData: `adm:sup_ord:${s.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Set Alert Limit', fallbackEmoji: '⚠️', style: 'default', callbackData: `adm:sup_thr:${s.id}`, forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: 'Sync Catalogue', fallbackEmoji: '🔄', style: 'primary', callbackData: `adm:sup_sync:${s.id}`, forceVisible: true }),
-          ButtonBuilder.buildButton({ text: 'Read-Only Diag', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:sup_diag', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Orders (Read-Only)', fallbackEmoji: '📦', style: 'default', callbackData: `adm:sup_ord:${s.id}`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Driver Diagnostics', fallbackEmoji: '🧪', style: 'primary', callbackData: `adm:sup_drv_d:${s.id}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Legacy Diag', fallbackEmoji: '🔬', style: 'default', callbackData: 'adm:sup_diag', forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
           ButtonBuilder.buildButton({ text: s.isEnabled ? 'Disable Supplier' : 'Enable Supplier', style: s.isEnabled ? 'danger' : 'success', callbackData: `adm:sup_tog:en:${s.id}`, forceVisible: true }),
@@ -4628,15 +5524,16 @@ export class AdminHandler {
           ButtonBuilder.buildButton({ text: s.syncEnabled ? 'Sync: ON' : 'Sync: OFF', style: s.syncEnabled ? 'success' : 'danger', callbackData: `adm:sup_tog:sy:${s.id}`, forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
-          ButtonBuilder.buildButton({ text: 'Back to Suppliers', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'All Suppliers', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sup_list', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Supplier Center', fallbackEmoji: '🏭', style: 'default', callbackData: 'adm:sup', forceVisible: true }),
         ]),
       ],
     };
 
     if (messageId) {
-      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
     } else {
-      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
     }
   }
 
@@ -4681,6 +5578,7 @@ export class AdminHandler {
           ButtonBuilder.buildButton({ text: 'UI Labels & Buttons', fallbackEmoji: '🎨', style: 'primary', callbackData: 'adm:ui', forceVisible: true }),
         ]),
         ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Feature Flags', fallbackEmoji: '🚩', style: 'default', callbackData: 'adm:set_flags', forceVisible: true }),
           ButtonBuilder.buildButton({ text: 'BACK TO ADMIN', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
         ]),
       ],
@@ -4690,6 +5588,403 @@ export class AdminHandler {
       await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
     } else {
       await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminFeatureFlags(
+    chatId: number,
+    messageId: number | undefined
+  ): Promise<void> {
+    const [maint, promo, chCfg, gwCfg, refCfg] = await Promise.all([
+      settingsService.getMaintenanceConfig(),
+      promotionService.getConfig(),
+      channelService.getConfig(),
+      giveawayService.getSettings(),
+      referralService.getSettings(),
+    ]);
+
+    const text =
+      `🚩 *SYSTEM & FEATURE FLAGS*\n\n` +
+      `🛡️ *Safety & Payments:*\n` +
+      `• Live Supplier Ordering: \`${config.safety.liveOrderingEnabled ? 'ON' : 'OFF'}\`\n` +
+      `• Recovery Mode: \`${config.safety.recoveryMode ? 'ON' : 'OFF'}\`\n` +
+      `• Manual Payments: \`${config.safety.manualPaymentsEnabled ? 'ON' : 'OFF'}\`\n` +
+      `• Binance Pay: \`${config.binance.enabled ? 'ON' : 'OFF'}\`\n\n` +
+      `⚡ *Live Platform Modules:*\n` +
+      `• Maintenance Mode: ${maint.enabled ? '⚠️ ON' : '✅ OFF'}\n` +
+      `• Auto Promotion: ${promo.enabled ? '✅ ON' : '⏸️ OFF'}\n` +
+      `• Required Channel Gate: ${chCfg.verificationEnabled ? '✅ ON' : '⚪ OFF'}\n` +
+      `• Giveaways System: ${gwCfg.enabled ? '✅ ON' : '⏸️ OFF'}\n` +
+      `• Referral System: ${refCfg.rewardsEnabled ? '✅ ON' : '⏸️ OFF'}`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Toggle Maintenance', fallbackEmoji: '🚧', style: maint.enabled ? 'success' : 'danger', callbackData: 'adm:set_maint', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Auto Promo', fallbackEmoji: '📣', style: 'primary', callbackData: 'adm:promo', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Settings Center', fallbackEmoji: '⚙️', style: 'default', callbackData: 'adm:set', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Control Center', fallbackEmoji: '👑', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text, { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text, { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminPricingCenter(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const [globalCfg, supOverrides] = await Promise.all([
+      pricingService.getGlobalPricingSettings(),
+      pricingService.listSupplierPricingOverrides(),
+    ]);
+    const activeMode = globalCfg.markupType || 'AUTO';
+    const fixedVal = new Decimal(globalCfg.defaultFixedMarkup || '0.05').toFixed(2);
+    const pctVal = new Decimal(globalCfg.defaultPercentMarkup || '0.15').times(100).toFixed(0);
+    const activeSupOverrides = supOverrides.filter(s => s.pricingMode && s.pricingMarkupValue !== null);
+
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `💰 *PRICING CENTER*\n\n` +
+      `⚡ *Active Pricing Precedence:*\n` +
+      `1. *Product Override* (wins always)\n` +
+      `2. *Supplier Override* (per supplier)\n` +
+      `3. *Global Pricing* (default fallback)\n` +
+      `4. *Cost Floor* (zero loss guard)\n\n` +
+      `🌐 *Global Rule:*\n` +
+      `• Markup Type: *${activeMode === 'FIXED' ? 'Fixed (+USDT)' : activeMode === 'PERCENT' ? 'Percentage (+%)' : 'Auto (Max % / Fixed)'}*\n` +
+      `• Fixed Markup: \`+${fixedVal} USDT\`\n` +
+      `• Percent Markup: \`+${pctVal}%\`\n\n` +
+      `🏭 *Supplier Overrides Active:* *${activeSupOverrides.length}*`;
+
+    if (activeSupOverrides.length > 0) {
+      text += '\n';
+      for (const s of activeSupOverrides) {
+        const lbl =
+          s.pricingMode === 'FIXED'
+            ? `+${new Decimal(s.pricingMarkupValue || 0).toFixed(2)} USDT`
+            : `+${new Decimal(s.pricingMarkupValue || 0).times(100).toFixed(0)}%`;
+        text += `• ${this.escapeDiagMarkdown(s.supplierName)}: \`${lbl}\`\n`;
+      }
+    }
+
+    const presetRow =
+      activeMode === 'FIXED'
+        ? [
+            ButtonBuilder.buildButton({ text: '+0.05 USDT', style: 'primary', callbackData: 'adm:prc_gl_p:F:0.05', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: '+0.10 USDT', style: 'primary', callbackData: 'adm:prc_gl_p:F:0.10', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: '+0.25 USDT', style: 'primary', callbackData: 'adm:prc_gl_p:F:0.25', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: 'Custom', fallbackEmoji: '✏️', style: 'default', callbackData: 'adm:prc_gl_e:FIXED', forceVisible: true }),
+          ]
+        : [
+            ButtonBuilder.buildButton({ text: '+10%', style: 'primary', callbackData: 'adm:prc_gl_p:P:0.10', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: '+15%', style: 'primary', callbackData: 'adm:prc_gl_p:P:0.15', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: '+20%', style: 'primary', callbackData: 'adm:prc_gl_p:P:0.20', forceVisible: true }),
+            ButtonBuilder.buildButton({ text: 'Custom %', fallbackEmoji: '✏️', style: 'default', callbackData: 'adm:prc_gl_e:PERCENT', forceVisible: true }),
+          ];
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: activeMode === 'FIXED' ? '✅ Fixed Mode' : 'Fixed Mode',
+            fallbackEmoji: '💲',
+            style: activeMode === 'FIXED' ? 'success' : 'default',
+            callbackData: 'adm:prc_gl_m:FIXED',
+            forceVisible: true,
+          }),
+          ButtonBuilder.buildButton({
+            text: activeMode === 'PERCENT' ? '✅ % Mode' : '% Mode',
+            fallbackEmoji: '📈',
+            style: activeMode === 'PERCENT' ? 'success' : 'default',
+            callbackData: 'adm:prc_gl_m:PERCENT',
+            forceVisible: true,
+          }),
+        ]),
+        ButtonBuilder.buildActionRow(presetRow),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Supplier Pricing', fallbackEmoji: '🏭', style: 'primary', callbackData: 'adm:prc_sup', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Product Pricing', fallbackEmoji: '🛍️', style: 'primary', callbackData: 'adm:prod:1', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Profit Analytics', fallbackEmoji: '📈', style: 'success', callbackData: 'adm:profit', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Store Hub', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:sec:store', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierPricingList(
+    chatId: number,
+    messageId: number | undefined,
+    notice?: string
+  ): Promise<void> {
+    const suppliers = await pricingService.listSupplierPricingOverrides();
+    let text =
+      (notice ? `${notice}\n\n` : '') +
+      `🏭 *SUPPLIER PRICING OVERRIDES*\n\n` +
+      `Set per-supplier markups. Products without a Product Override inherit their active supplier's markup:\n\n`;
+
+    const rows: any[][] = [];
+    for (const s of suppliers) {
+      const ruleText = s.pricingMode
+        ? s.pricingMode === 'FIXED'
+          ? `Fixed +${new Decimal(s.pricingMarkupValue || 0).toFixed(2)} USDT`
+          : `Percent +${new Decimal(s.pricingMarkupValue || 0).times(100).toFixed(0)}%`
+        : 'Inherits Global';
+      text += `• *${this.escapeDiagMarkdown(s.supplierName)}* (${s.isEnabled ? '🟢' : '⚪'}) — \`${ruleText}\`\n`;
+      rows.push(
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({
+            text: `${s.supplierName}: ${ruleText}`,
+            fallbackEmoji: '🏭',
+            style: s.pricingMode ? 'primary' : 'default',
+            callbackData: `adm:prc_sv:${s.supplierId}`,
+            forceVisible: true,
+          }),
+        ])
+      );
+    }
+
+    rows.push(
+      ButtonBuilder.buildActionRow([
+        ButtonBuilder.buildButton({ text: 'Pricing Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:price', forceVisible: true }),
+      ])
+    );
+
+    const markup = { inline_keyboard: rows };
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminSupplierPricingDetail(
+    chatId: number,
+    messageId: number | undefined,
+    supplierId: string,
+    notice?: string
+  ): Promise<void> {
+    const overrides = await pricingService.listSupplierPricingOverrides();
+    const s = overrides.find(x => x.supplierId === supplierId);
+    if (!s) {
+      await this.renderAdminSupplierPricingList(chatId, messageId, '⚠️ Supplier not found.');
+      return;
+    }
+
+    const currentRule = s.pricingMode
+      ? s.pricingMode === 'FIXED'
+        ? `Fixed +${new Decimal(s.pricingMarkupValue || 0).toFixed(2)} USDT`
+        : `Percentage +${new Decimal(s.pricingMarkupValue || 0).times(100).toFixed(0)}%`
+      : 'Inherits Global Rule';
+
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `🏭 *SUPPLIER PRICING: ${this.escapeDiagMarkdown(s.supplierName.toUpperCase())}*\n\n` +
+      `• Current Rule: \`${currentRule}\`\n` +
+      `• Status: ${s.isEnabled ? '🟢 Enabled' : '⚪ Disabled'}\n\n` +
+      `Choose a preset or enter a custom markup:`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: '+10%', style: 'primary', callbackData: `adm:prc_ss:P:${s.supplierId}:0.10`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+15%', style: 'primary', callbackData: `adm:prc_ss:P:${s.supplierId}:0.15`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+20%', style: 'primary', callbackData: `adm:prc_ss:P:${s.supplierId}:0.20`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: '+0.05 USDT', style: 'primary', callbackData: `adm:prc_ss:F:${s.supplierId}:0.05`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+0.15 USDT', style: 'primary', callbackData: `adm:prc_ss:F:${s.supplierId}:0.15`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+0.50 USDT', style: 'primary', callbackData: `adm:prc_ss:F:${s.supplierId}:0.50`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Custom Fixed', fallbackEmoji: '✏️', style: 'default', callbackData: `adm:prc_se:F:${s.supplierId}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Custom %', fallbackEmoji: '✏️', style: 'default', callbackData: `adm:prc_se:P:${s.supplierId}`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Inherit Global', fallbackEmoji: '🔄', style: 'danger', callbackData: `adm:prc_sc:${s.supplierId}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Supplier List', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:prc_sup', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminProductPricingDetail(
+    chatId: number,
+    messageId: number | undefined,
+    productId: string,
+    notice?: string
+  ): Promise<void> {
+    const product = await db.queryRow<any>('SELECT * FROM supplier_products WHERE id = $1', [productId]);
+    if (!product) {
+      await telegramClient.sendMessage(chatId, '⚠️ Product not found.');
+      return;
+    }
+
+    const priceInfo = await pricingService.calculatePrice(productId);
+    const margin = priceInfo.customerUnitPrice.minus(priceInfo.supplierCost);
+    const text =
+      (notice ? `${notice}\n\n` : '') +
+      `💲 *EDIT PRODUCT PRICING*\n\n` +
+      `• Product: *${this.escapeDiagMarkdown(product.original_name)}*\n` +
+      `• Effective Supplier: \`${priceInfo.effectiveSupplierId || 'aitoolshop'}\`\n` +
+      `• Supplier Cost (Admin Only): \`${priceInfo.supplierCost.toFixed(4)} USDT\`\n` +
+      `• Customer Price: \`${priceInfo.customerUnitPrice.toFixed(2)} USDT\`\n` +
+      `• Net Margin / Unit: \`+${margin.toFixed(2)} USDT\`\n` +
+      `• Active Rule: *${priceInfo.ruleApplied}*\n\n` +
+      `Choose a quick markup or set custom pricing:`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: '+0.05 Fixed', style: 'primary', callbackData: `adm_set_fm:${productId}:0.05`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+0.10 Fixed', style: 'primary', callbackData: `adm_set_fm:${productId}:0.10`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+0.25 Fixed', style: 'primary', callbackData: `adm_set_fm:${productId}:0.25`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: '+10%', style: 'primary', callbackData: `adm_set_pm:${productId}:0.10`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+20%', style: 'primary', callbackData: `adm_set_pm:${productId}:0.20`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: '+30%', style: 'primary', callbackData: `adm_set_pm:${productId}:0.30`, forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Custom Fixed', fallbackEmoji: '✏️', style: 'default', callbackData: 'adm:prc_pe:f', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Custom %', fallbackEmoji: '✏️', style: 'default', callbackData: 'adm:prc_pe:p', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Fixed Retail', fallbackEmoji: '💲', style: 'default', callbackData: 'adm:prc_pe:r', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Reset Override', fallbackEmoji: '🔄', style: 'danger', callbackData: `adm_reset_pr:${productId}`, forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Products', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:prod:1', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminProfitAnalytics(
+    chatId: number,
+    messageId: number | undefined
+  ): Promise<void> {
+    const rpt = await pricingService.getProfitAnalytics();
+
+    const text =
+      `📈 *PROFIT ANALYTICS*\n\n` +
+      `📅 *Today:*\n` +
+      `• Today's Revenue: \`$${rpt.todayRevenue} USDT\` (${rpt.todayOrders} orders)\n` +
+      `• Today's Profit: \`+$${rpt.todayProfit} USDT\`\n\n` +
+      `🗓️ *This Month:*\n` +
+      `• Monthly Revenue: \`$${rpt.monthlyRevenue} USDT\` (${rpt.monthlyOrders} orders)\n` +
+      `• Monthly Profit: \`+$${rpt.monthlyProfit} USDT\`\n\n` +
+      `🏦 *All-Time Summary:*\n` +
+      `• Total Revenue: \`$${rpt.allTimeRevenue} USDT\` (${rpt.allTimeOrders} orders)\n` +
+      `• Total Net Profit: \`+$${rpt.allTimeProfit} USDT\`\n\n` +
+      `🏆 *Leaders:*\n` +
+      `• Top Product: ${rpt.topProduct ? `*${this.escapeDiagMarkdown(rpt.topProduct.name)}* (${rpt.topProduct.ordersCount} orders • \`$${rpt.topProduct.revenue}\`)` : '_No orders yet_'}\n` +
+      `• Top Supplier: ${rpt.topSupplier ? `*${this.escapeDiagMarkdown(rpt.topSupplier.supplierName)}* (${rpt.topSupplier.ordersCount} orders • \`$${rpt.topSupplier.revenue}\`)` : '_No orders yet_'}\n` +
+      `• Most Profitable Product: ${rpt.mostProfitableProduct ? `*${this.escapeDiagMarkdown(rpt.mostProfitableProduct.name)}* (\`+$${rpt.mostProfitableProduct.profit} USDT\`)` : '_No orders yet_'}`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Refresh', fallbackEmoji: '🔄', style: 'primary', callbackData: 'adm:profit', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Pricing Center', fallbackEmoji: '💰', style: 'primary', callbackData: 'adm:price', forceVisible: true }),
+        ]),
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Overview', fallbackEmoji: '📊', style: 'default', callbackData: 'adm:dash', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Control Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
+    }
+  }
+
+  private async renderAdminTicketAnalytics(
+    chatId: number,
+    messageId: number | undefined
+  ): Promise<void> {
+    const [statusRows, msgCount] = await Promise.all([
+      db.query<{ status: string; issueType: string; cnt: string }>(
+        `SELECT status, issue_type as "issueType", COUNT(*) as cnt
+         FROM support_tickets
+         GROUP BY status, issue_type`
+      ),
+      db.queryRow<{ cnt: string }>('SELECT COUNT(*) as cnt FROM support_messages'),
+    ]);
+
+    let openCnt = 0;
+    let waitingCnt = 0;
+    let closedCnt = 0;
+    const byIssue = new Map<string, number>();
+
+    for (const r of statusRows.rows) {
+      const n = parseInt(r.cnt || '0', 10);
+      if (r.status === 'OPEN') openCnt += n;
+      else if (r.status === 'WAITING') waitingCnt += n;
+      else if (r.status === 'CLOSED') closedCnt += n;
+      byIssue.set(r.issueType || 'GENERAL', (byIssue.get(r.issueType || 'GENERAL') || 0) + n);
+    }
+
+    const total = openCnt + waitingCnt + closedCnt;
+    const issuesSummary =
+      byIssue.size > 0
+        ? Array.from(byIssue.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => `• ${this.escapeDiagMarkdown(k)}: \`${v}\``)
+            .join('\n')
+        : '_No ticket history yet_';
+
+    const text =
+      `📊 *SUPPORT TICKET ANALYTICS*\n\n` +
+      `• Total Tickets: \`${total}\`\n` +
+      `• Open (Awaiting Admin): \`${openCnt}\`\n` +
+      `• Waiting (Replied): \`${waitingCnt}\`\n` +
+      `• Closed: \`${closedCnt}\`\n` +
+      `• Total Messages Exchanged: \`${msgCount?.cnt || 0}\`\n\n` +
+      `🗂️ *By Issue Type:*\n${issuesSummary}`;
+
+    const markup = {
+      inline_keyboard: [
+        ButtonBuilder.buildActionRow([
+          ButtonBuilder.buildButton({ text: 'Support Inbox', fallbackEmoji: '🎫', style: 'primary', callbackData: 'adm:tkt', forceVisible: true }),
+          ButtonBuilder.buildButton({ text: 'Control Center', fallbackEmoji: '⬅️', style: 'default', callbackData: 'adm:main', forceVisible: true }),
+        ]),
+      ],
+    };
+
+    if (messageId) {
+      await telegramClient.editMessageText(chatId, messageId, text.slice(0, 3900), { reply_markup: markup });
+    } else {
+      await telegramClient.sendMessage(chatId, text.slice(0, 3900), { reply_markup: markup });
     }
   }
 
@@ -5103,10 +6398,20 @@ export class AdminHandler {
     filter: 'OPEN_ONLY' | 'ALL' = 'OPEN_ONLY',
     notice?: string
   ): Promise<void> {
-    const tickets = await supportService.listAdminTickets({ statusFilter: filter, limit: 12 });
+    const [tickets, analytics] = await Promise.all([
+      supportService.listAdminTickets({ statusFilter: filter, limit: 12 }),
+      db.queryRow<{ openCnt: string; closedCnt: string; totalCnt: string }>(
+        `SELECT
+           COUNT(*) FILTER (WHERE status != 'CLOSED') as "openCnt",
+           COUNT(*) FILTER (WHERE status = 'CLOSED') as "closedCnt",
+           COUNT(*) as "totalCnt"
+         FROM support_tickets`
+      ).catch(() => ({ openCnt: '0', closedCnt: '0', totalCnt: '0' })),
+    ]);
     let text =
       (notice ? `${notice}\n\n` : '') +
-      `🎫 *SUPPORT TICKETS (${filter === 'OPEN_ONLY' ? 'OPEN & WAITING' : 'ALL'})*\n\n`;
+      `🎫 *SUPPORT TICKETS (${filter === 'OPEN_ONLY' ? 'OPEN & WAITING' : 'ALL'})*\n` +
+      `📊 Open: *${analytics?.openCnt || 0}* | Closed: *${analytics?.closedCnt || 0}* | Total: *${analytics?.totalCnt || 0}*\n\n`;
 
     const rows: any[][] = [
       ButtonBuilder.buildActionRow([
@@ -5115,6 +6420,13 @@ export class AdminHandler {
           fallbackEmoji: '🔄',
           style: 'primary',
           callbackData: filter === 'OPEN_ONLY' ? 'adm:tkt_all' : 'adm:tkt',
+          forceVisible: true,
+        }),
+        ButtonBuilder.buildButton({
+          text: 'Analytics',
+          fallbackEmoji: '📊',
+          style: 'default',
+          callbackData: 'adm:tkt_stat',
           forceVisible: true,
         }),
       ]),

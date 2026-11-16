@@ -112,6 +112,8 @@ apiRouter.post('/api/admin/price', async (req: Request, res: Response) => {
       await pricingService.setFixedRetailPrice(productId, value, admin);
     } else if (type === 'fixed_markup') {
       await pricingService.setFixedMarkup(productId, value, admin);
+    } else if (type === 'percent_markup') {
+      await pricingService.setPercentMarkup(productId, value, admin);
     } else if (type === 'reset') {
       await pricingService.resetPricing(productId, admin);
     } else {

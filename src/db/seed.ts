@@ -105,14 +105,35 @@ export async function seedInitialData(): Promise<void> {
      WHERE slug = 'developer' AND is_visible = TRUE`
   );
 
-  // 3. Seed Primary Supplier Control Record (never deletable from UI)
+  // 3. Seed Primary Supplier & Candidate Supplier Framework Records (never deletable from UI)
   await db.query(`
     INSERT INTO suppliers (
-      id, name, base_url, is_enabled, routing_enabled, ordering_enabled, sync_enabled,
+      id, name, base_url, priority, driver_key, api_status, low_balance_threshold,
+      is_enabled, routing_enabled, ordering_enabled, sync_enabled,
       created_at, updated_at
-    ) VALUES ($1, $2, $3, TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    ON CONFLICT (id) DO NOTHING
-  `, ['aitoolshop', 'AiToolShop Reseller', config.supplier.baseUrl]);
+    ) VALUES ($1, $2, $3, 100, 'aitoolshop', 'Healthy', 20.0000, TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ON CONFLICT (id) DO UPDATE SET
+      driver_key = COALESCE(suppliers.driver_key, 'aitoolshop')
+  `, ['aitoolshop', 'Main Supplier (AiToolShop)', config.supplier.baseUrl]);
+
+  const futureCandidates = [
+    { id: 'ventebot', name: 'VenteBot', url: 'https://api.ventebot.example/v1', priority: 200, driverKey: 'ventebot' },
+    { id: 'nystore', name: 'NyStore', url: 'https://api.nystore.example/v1', priority: 300, driverKey: 'nystore' },
+    { id: 'cupponshub', name: "Cuppon'sHub", url: 'https://api.cupponshub.example/v1', priority: 400, driverKey: 'cupponshub' },
+    { id: 'zfour', name: 'ZFour', url: 'https://api.zfour.example/v1', priority: 500, driverKey: 'zfour' },
+  ];
+
+  for (const sup of futureCandidates) {
+    await db.query(
+      `INSERT INTO suppliers (
+        id, name, base_url, priority, driver_key, api_status, low_balance_threshold,
+        is_enabled, routing_enabled, ordering_enabled, sync_enabled,
+        created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, 'Offline', 20.0000, FALSE, FALSE, FALSE, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO NOTHING`,
+      [sup.id, sup.name, sup.url, sup.priority, sup.driverKey]
+    );
+  }
 
   // 4. Seed Default System Settings
   const defaultSettings = [
