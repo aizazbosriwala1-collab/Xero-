@@ -75,6 +75,21 @@ export function parseReadOnlyLiveVerifiedEnv(raw?: string): boolean {
   return raw.trim() === 'true';
 }
 
+export function parseLiveOrderingEnabledEnv(raw?: unknown): boolean {
+  if (typeof raw === 'boolean') {
+    return raw;
+  }
+  if (typeof raw !== 'string') {
+    return false;
+  }
+  const normalized = raw
+    .trim()
+    .replace(/^['"]+|['"]+$/g, '')
+    .trim()
+    .toLowerCase();
+  return normalized === 'true';
+}
+
 export function normalizeBotUsername(raw?: string | null): string | undefined {
   if (typeof raw !== 'string') {
     return undefined;
@@ -114,6 +129,28 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     };
   };
 
+  let liveOrderingOverride: boolean | undefined;
+  const safety: AppConfig['safety'] = {
+    recoveryMode: env.RECOVERY_MODE !== 'false', // Defaults to true
+    liveOrderingEnabled: parseLiveOrderingEnabledEnv(env.LIVE_ORDERING_ENABLED), // Defaults to false
+    manualPaymentsEnabled: env.MANUAL_PAYMENTS_ENABLED !== 'false', // Defaults to true
+  };
+  Object.defineProperty(safety, 'liveOrderingEnabled', {
+    enumerable: true,
+    configurable: true,
+    get(): boolean {
+      if (liveOrderingOverride !== undefined) {
+        return liveOrderingOverride;
+      }
+      return parseLiveOrderingEnabledEnv(env.LIVE_ORDERING_ENABLED);
+    },
+    set(val: boolean) {
+      const envVal = parseLiveOrderingEnabledEnv(env.LIVE_ORDERING_ENABLED);
+      const next = Boolean(val);
+      liveOrderingOverride = next === envVal ? undefined : next;
+    },
+  });
+
   return {
     nodeEnv: env.NODE_ENV || 'development',
     port: parseInt(env.PORT || '3000', 10),
@@ -152,11 +189,7 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       diagnosticEnabled: env.BINANCE_DIAGNOSTIC_ENABLED === 'true',
       readOnlyLiveVerified: parseReadOnlyLiveVerifiedEnv(env.READ_ONLY_LIVE_VERIFIED),
     },
-    safety: {
-      recoveryMode: env.RECOVERY_MODE !== 'false', // Defaults to true
-      liveOrderingEnabled: env.LIVE_ORDERING_ENABLED === 'true', // Defaults to false
-      manualPaymentsEnabled: env.MANUAL_PAYMENTS_ENABLED !== 'false', // Defaults to true
-    },
+    safety,
   };
 }
 

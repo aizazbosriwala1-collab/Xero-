@@ -1,5 +1,7 @@
 import assert from 'assert';
 import crypto from 'crypto';
+import http from 'http';
+import express from 'express';
 import Decimal from 'decimal.js';
 import { db } from '../src/db/index.js';
 import { runMigrations, verifySchemaVersion } from '../src/db/migrate.js';
@@ -33,6 +35,7 @@ import {
   DEFAULT_AITOOLSHOP_BASE_URL,
   parseBoundedClockToleranceSeconds,
   parseReadOnlyLiveVerifiedEnv,
+  parseLiveOrderingEnabledEnv,
   normalizeBotUsername,
   getSanitizedConfig,
 } from '../src/config/env.js';
@@ -52,7 +55,7 @@ import { promotionService } from '../src/services/promotion.js';
 import { menuCache } from '../src/telegram/menuCache.js';
 import { supplierDriverRegistry, NyStoreDriver } from '../src/services/supplierDrivers.js';
 import { supplierEcosystemService } from '../src/services/supplierEcosystem.js';
-import { handleNyStoreWebhookHttp } from '../src/api/routes.js';
+import { apiRouter, handleNyStoreWebhookHttp } from '../src/api/routes.js';
 import {
   getCustomerMainReplyKeyboard,
   getCustomerMainInlineKeyboard,
@@ -10016,6 +10019,99 @@ export async function runComprehensiveTests() {
       await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
       await redis.del('supplier_ctrl:zfour').catch(() => {});
       await supplierEcosystemService.invalidateAvailabilityCache().catch(() => {});
+    }
+  });
+
+  currentCategory = 'Live Ordering Env Parsing & Safety Gate';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('LiveOrdering 1: parseLiveOrderingEnabledEnv & buildConfig normalize true, TRUE, "true", and true<space>', 'unit', async () => {
+    for (const truthy of ['true', 'TRUE', '"true"', 'true ', ' "TRUE" ', "'true'"]) {
+      assert.strictEqual(parseLiveOrderingEnabledEnv(truthy), true, `Expected ${JSON.stringify(truthy)} to parse as true`);
+      const cfg = buildConfig({ LIVE_ORDERING_ENABLED: truthy } as NodeJS.ProcessEnv);
+      assert.strictEqual(cfg.safety.liveOrderingEnabled, true, `Expected buildConfig(${JSON.stringify(truthy)}) to enable liveOrderingEnabled`);
+    }
+    for (const falsy of [undefined, '', '   ', 'false', 'FALSE', '"false"', '0', 'no']) {
+      assert.strictEqual(parseLiveOrderingEnabledEnv(falsy), false, `Expected ${JSON.stringify(falsy)} to parse as false`);
+      const cfg = buildConfig((falsy === undefined ? {} : { LIVE_ORDERING_ENABLED: falsy }) as NodeJS.ProcessEnv);
+      assert.strictEqual(cfg.safety.liveOrderingEnabled, false, `Expected buildConfig(${JSON.stringify(falsy)}) to disable liveOrderingEnabled`);
+    }
+  });
+
+  await it('LiveOrdering 2: process.env.LIVE_ORDERING_ENABLED updates config, /api/health, and checkout guard dynamically', 'mock_integration', async () => {
+    const origEnv = process.env.LIVE_ORDERING_ENABLED;
+    const adminId = String(config.telegram.adminIds[0]);
+    const prodId = `prod_live_gate_${Date.now()}`;
+    const userId = '988499';
+
+    const app = express();
+    app.use(apiRouter);
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const address = server.address() as { port: number };
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+
+    try {
+      await ensureAuditUser(userId, '0.0000');
+      await db.query(
+        `INSERT INTO supplier_products (
+          id, supplier, supplier_product_id, original_name, original_description,
+          latest_cost, latest_stock, is_unlimited, is_available, supplier_type, raw_payload
+        ) VALUES ($1, 'aitoolshop', 'sp_live_gate_1', 'Live Gate Test Product', 'Tools', '1.0000', 5, FALSE, TRUE, 'account', '{}')
+        ON CONFLICT (id) DO UPDATE SET is_available = TRUE, latest_cost = '1.0000', latest_stock = 5`,
+        [prodId]
+      );
+      await pricingService.setFixedRetailPrice(prodId, '2.00', adminId);
+
+      // 1. When unset / false -> blocked at safety gate & health returns false
+      delete process.env.LIVE_ORDERING_ENABLED;
+      assert.strictEqual(config.safety.liveOrderingEnabled, false);
+      assert.strictEqual((getSanitizedConfig().safety as any).liveOrderingEnabled, false);
+      const healthOff = await fetch(`${baseUrl}/api/health`).then((r) => r.json() as Promise<any>);
+      assert.strictEqual(healthOff.config.safety.liveOrderingEnabled, false);
+
+      const blockedRes = await orderService.checkout({
+        userId,
+        productId: prodId,
+        quantity: 1,
+      });
+      assert.strictEqual(blockedRes.success, false);
+      assert.ok(blockedRes.message.includes('LIVE_ORDERING_ENABLED=false'));
+
+      // 2. When set to normalized variants -> /api/health returns true and checkout guard passes through to balance check
+      for (const variant of ['true', 'TRUE', '"true"', 'true ']) {
+        process.env.LIVE_ORDERING_ENABLED = variant;
+        assert.strictEqual(config.safety.liveOrderingEnabled, true, `config should reflect ${JSON.stringify(variant)}`);
+        assert.strictEqual((getSanitizedConfig().safety as any).liveOrderingEnabled, true);
+
+        const healthOn = await fetch(`${baseUrl}/api/health`).then((r) => r.json() as Promise<any>);
+        assert.strictEqual(healthOn.config.safety.liveOrderingEnabled, true, `/api/health must return liveOrderingEnabled: true for ${JSON.stringify(variant)}`);
+
+        let passedSafetyGate = false;
+        try {
+          await orderService.checkout({
+            userId,
+            productId: prodId,
+            quantity: 1,
+          });
+        } catch (err: any) {
+          assert.ok(
+            err.message.includes('Insufficient wallet balance') || err.message.includes('temporarily unavailable'),
+            `Expected checkout to pass LIVE_ORDERING_ENABLED gate and hit downstream balance/supplier check, got: ${err.message}`
+          );
+          passedSafetyGate = true;
+        }
+        assert.strictEqual(passedSafetyGate, true, `Checkout must pass LIVE_ORDERING_ENABLED gate for ${JSON.stringify(variant)}`);
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (origEnv === undefined) {
+        delete process.env.LIVE_ORDERING_ENABLED;
+      } else {
+        process.env.LIVE_ORDERING_ENABLED = origEnv;
+      }
+      await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
+      await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
     }
   });
 

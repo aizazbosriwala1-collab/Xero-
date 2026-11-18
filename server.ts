@@ -32,6 +32,7 @@ async function startServer() {
   binanceService.validateReceiverConfigAtStartup();
 
   const sanitized = getSanitizedConfig();
+  logger.info(`LIVE_ORDERING_ENABLED: ${config.safety.liveOrderingEnabled}`);
   logger.info('Runtime configuration loaded safely', { config: sanitized });
 
   // 1. Initialize Express App
