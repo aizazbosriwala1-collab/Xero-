@@ -11,6 +11,7 @@ import { manualPaymentService } from './manualPayment.js';
 import { giveawayService } from './giveaway.js';
 import { referralService } from './referral.js';
 import { announcementService } from './announcement.js';
+import { walletService } from './wallet.js';
 import { perfTracker, CallbackPerfRecord } from './perfTracker.js';
 import { createLogger } from './logger.js';
 
@@ -98,14 +99,21 @@ export class LaunchAuditService {
       // 2. Wallet Working
       (async (): Promise<AuditAreaCheck> => {
         try {
-          const [wCount, lCount] = await Promise.all([
-            db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM wallets'),
+          const [recon, lCount] = await Promise.all([
+            walletService.reconcileAllWallets(),
             db.queryRow<{ c: string }>('SELECT COUNT(*) as c FROM ledger_entries'),
           ]);
+          if (recon.unbalancedCount > 0 || recon.negativeBalanceCount > 0 || recon.invalidLockCount > 0) {
+            return {
+              area: 'Wallet Working',
+              status: 'FAIL',
+              summary: `Reconciliation issue: ${recon.unbalancedCount} unbalanced, ${recon.negativeBalanceCount} negative, ${recon.invalidLockCount} invalid locks.`,
+            };
+          }
           return {
             area: 'Wallet Working',
             status: 'PASS',
-            summary: `Ledger operational (${wCount?.c || 0} wallets, ${lCount?.c || 0} ledger entries).`,
+            summary: `Ledger reconciled (${recon.totalWallets} wallets, ${lCount?.c || 0} ledger entries, 0 discrepancies).`,
           };
         } catch (err: any) {
           return {
@@ -315,12 +323,25 @@ export class LaunchAuditService {
       (async (): Promise<AuditAreaCheck> => {
         try {
           const hasAdmins = config.telegram.adminIds.length > 0;
+          if (!hasAdmins) {
+            return {
+              area: 'Admin Panel Working',
+              status: 'FAIL',
+              summary: 'TELEGRAM_ADMIN_IDS is empty.',
+            };
+          }
+          const isProd = (process.env.NODE_ENV || config.nodeEnv) === 'production';
+          if (isProd && (!config.telegram.webhookSecret || !config.adminApiSecret)) {
+            return {
+              area: 'Admin Panel Working',
+              status: 'WARN',
+              summary: `${config.telegram.adminIds.length} admin ID(s) active; configure TELEGRAM_WEBHOOK_SECRET and ADMIN_API_SECRET for full HTTP hardening.`,
+            };
+          }
           return {
             area: 'Admin Panel Working',
-            status: hasAdmins ? 'PASS' : 'FAIL',
-            summary: hasAdmins
-              ? `${config.telegram.adminIds.length} authorized admin ID(s) active.`
-              : 'TELEGRAM_ADMIN_IDS is empty.',
+            status: 'PASS',
+            summary: `${config.telegram.adminIds.length} authorized admin ID(s) active.`,
           };
         } catch (err: any) {
           return {
@@ -435,6 +456,80 @@ export class LaunchAuditService {
       totalDurationMs,
       summary:
         `Total latency: ${totalDurationMs}ms | Slow (>300ms): ${slowCallbacks300.length} | Slow (>500ms): ${slowCallbacks.length} | L1 (4s) + Redis (60s) + Prebuilt Menus active.`,
+    };
+  }
+
+  /**
+   * Read-only backup & restore readiness verification across persistence mode,
+   * schema migration completeness, delivery encryption key health, wallet reconciliation,
+   * and configuration export capability.
+   */
+  public async getBackupAndRestoreReadiness(): Promise<{
+    ready: boolean;
+    persistenceMode: 'POSTGRES' | 'IN_MEMORY';
+    migrationCount: number;
+    latestMigration: number;
+    expectedMigrationCount: number;
+    encryptionReady: boolean;
+    walletReconciled: boolean;
+    settingsExportAvailable: boolean;
+    summary: string;
+  }> {
+    const isInMemory = db.getIsInMemory();
+    const persistenceMode = isInMemory ? 'IN_MEMORY' : 'POSTGRES';
+
+    let migrationCount = 0;
+    let latestMigration = 0;
+    try {
+      const migRes = await db.queryRow<{ c: string; maxVer: number | null }>(
+        'SELECT COUNT(*) as c, MAX(version) as "maxVer" FROM schema_migrations'
+      );
+      migrationCount = parseInt(migRes?.c || '0', 10);
+      latestMigration = Number(migRes?.maxVer || 0);
+    } catch {
+      migrationCount = 0;
+      latestMigration = 0;
+    }
+
+    let encryptionReady = false;
+    try {
+      const probe = 'backup_restore_probe';
+      const cipher = encryptionService.encrypt(probe);
+      encryptionReady = encryptionService.decrypt(cipher) === probe;
+    } catch {
+      encryptionReady = false;
+    }
+
+    const recon = await walletService.reconcileAllWallets();
+    const walletReconciled = recon.unbalancedCount === 0 && recon.negativeBalanceCount === 0 && recon.invalidLockCount === 0;
+
+    let settingsExportAvailable = false;
+    try {
+      const exported = await uiConfigService.exportSettingsJson();
+      settingsExportAvailable = Boolean(exported && exported.length > 2);
+    } catch {
+      settingsExportAvailable = false;
+    }
+
+    const expectedMigrationCount = 10;
+    const ready =
+      migrationCount >= expectedMigrationCount &&
+      latestMigration >= expectedMigrationCount &&
+      encryptionReady &&
+      walletReconciled &&
+      settingsExportAvailable &&
+      (!isInMemory || config.nodeEnv !== 'production');
+
+    return {
+      ready,
+      persistenceMode,
+      migrationCount,
+      latestMigration,
+      expectedMigrationCount,
+      encryptionReady,
+      walletReconciled,
+      settingsExportAvailable,
+      summary: `${persistenceMode} | Migrations=${migrationCount}/${expectedMigrationCount} | AES-256-GCM=${encryptionReady ? 'OK' : 'FAIL'} | Ledger=${walletReconciled ? 'BALANCED' : 'DISCREPANCY'} | UI Export=${settingsExportAvailable ? 'READY' : 'FAIL'}`,
     };
   }
 }

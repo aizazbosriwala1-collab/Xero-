@@ -320,12 +320,18 @@ export class ManualPaymentService {
     let suggestedUsdAmount: string | null = null;
 
     if (data.submittedPkrAmount !== undefined && data.submittedPkrAmount !== null && String(data.submittedPkrAmount).trim() !== '') {
-      const pkrDec = new Decimal(data.submittedPkrAmount);
-      if (pkrDec.greaterThan(0)) {
-        submittedPkrAmount = pkrDec.toFixed(2);
-        if (settings.autoSuggestCredit) {
-          suggestedUsdAmount = this.calculateSuggestedUsd(pkrDec, settings.pkrPerUsd);
-        }
+      let pkrDec: Decimal;
+      try {
+        pkrDec = new Decimal(String(data.submittedPkrAmount).trim());
+      } catch {
+        throw new Error('Invalid PKR amount format. Please enter a numeric amount.');
+      }
+      if (!pkrDec.isFinite() || pkrDec.lessThanOrEqualTo(0)) {
+        throw new Error('Submitted PKR amount must be a positive number.');
+      }
+      submittedPkrAmount = pkrDec.toFixed(2);
+      if (settings.autoSuggestCredit) {
+        suggestedUsdAmount = this.calculateSuggestedUsd(pkrDec, settings.pkrPerUsd);
       }
     } else if (data.ocrText) {
       const parsed = this.extractPkrAmountFromText(data.ocrText, settings);
@@ -384,11 +390,16 @@ export class ManualPaymentService {
       throw new Error(`Payment method ${data.methodCode} is currently disabled or unavailable.`);
     }
 
-    const amountDec = new Decimal(data.amount);
+    let amountDec: Decimal;
+    try {
+      amountDec = new Decimal(data.amount);
+    } catch {
+      throw new Error('Invalid deposit amount format.');
+    }
     const minDec = new Decimal(method.minAmount);
     const maxDec = new Decimal(method.maxAmount);
 
-    if (amountDec.lessThan(minDec) || amountDec.greaterThan(maxDec)) {
+    if (!amountDec.isFinite() || amountDec.lessThan(minDec) || amountDec.greaterThan(maxDec)) {
       throw new Error(`Deposit amount must be between ${minDec.toFixed(2)} and ${maxDec.toFixed(2)}.`);
     }
 
@@ -518,12 +529,17 @@ export class ManualPaymentService {
         throw new Error(`Deposit cannot be approved because status is ${deposit.status}.`);
       }
 
-      const creditDec =
-        opts.customUsdAmount !== undefined
-          ? new Decimal(opts.customUsdAmount)
-          : new Decimal(deposit.amount || 0);
+      let creditDec: Decimal;
+      try {
+        creditDec =
+          opts.customUsdAmount !== undefined
+            ? new Decimal(opts.customUsdAmount)
+            : new Decimal(deposit.amount || 0);
+      } catch {
+        throw new Error('Invalid custom USD credit amount format.');
+      }
 
-      if (creditDec.isNaN() || creditDec.lessThanOrEqualTo(0)) {
+      if (!creditDec.isFinite() || creditDec.lessThanOrEqualTo(0)) {
         throw new Error('Credit USD amount must be greater than 0.00.');
       }
       if (creditDec.greaterThan(5000)) {

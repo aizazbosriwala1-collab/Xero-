@@ -86,6 +86,13 @@ export default function App() {
   // Smoke test runner state
   const [smokeReport, setSmokeReport] = useState<any>(null);
   const [runningTests, setRunningTests] = useState(false);
+  const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [adminSecret, setAdminSecret] = useState('');
+
+  const authHeaders = (extra?: Record<string, string>): Record<string, string> => ({
+    ...(extra || {}),
+    ...(adminSecret.trim() ? { Authorization: `Bearer ${adminSecret.trim()}` } : {}),
+  });
 
   // Fetch initial data
   const fetchData = async () => {
@@ -93,13 +100,13 @@ export default function App() {
       const [healthRes, catRes, depRes, binRes, wallRes] = await Promise.all([
         fetch('/api/health').then(r => r.json()).catch(() => null),
         fetch('/api/catalog').then(r => r.json()).catch(() => ({ items: [] })),
-        fetch('/api/admin/deposits').then(r => r.json()).catch(() => []),
-        fetch('/api/binance/diagnostics').then(r => r.json()).catch(() => null),
-        fetch(`/api/wallet/${currentUser.id}`).then(r => r.json()).catch(() => null),
+        fetch('/api/admin/deposits', { headers: authHeaders() }).then(r => (r.ok ? r.json() : [])).catch(() => []),
+        fetch('/api/binance/diagnostics', { headers: authHeaders() }).then(r => (r.ok ? r.json() : null)).catch(() => null),
+        fetch(`/api/wallet/${currentUser.id}`, { headers: authHeaders() }).then(r => (r.ok ? r.json() : null)).catch(() => null),
       ]);
       setSystemHealth(healthRes);
       setProducts(catRes.items || []);
-      setDeposits(depRes || []);
+      setDeposits(Array.isArray(depRes) ? depRes : []);
       setBinanceDiag(binRes);
       setWalletData(wallRes);
     } catch (e) {
@@ -155,7 +162,7 @@ export default function App() {
 
       const res = await fetch('/api/telegram/simulate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload),
       });
       const data = await res.json();
@@ -232,12 +239,19 @@ export default function App() {
   const handleSyncSupplier = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/admin/sync', { method: 'POST' });
+      const res = await fetch('/api/admin/sync', { method: 'POST', headers: authHeaders() });
       const data = await res.json();
+      if (!res.ok) {
+        setNotice({ type: 'error', text: data.error || 'Supplier sync unauthorized or failed' });
+        return;
+      }
       await fetchData();
-      alert(`Supplier Sync Complete!\nImported: ${data.result?.importedCount}\nUpdated: ${data.result?.updatedCount}\nTotal Catalogue: ${data.result?.totalCount}`);
+      setNotice({
+        type: 'success',
+        text: `Supplier Sync Complete — Imported: ${data.result?.importedCount ?? 0}, Updated: ${data.result?.updatedCount ?? 0}, Total Catalogue: ${data.result?.totalCount ?? 0}`,
+      });
     } catch (e: any) {
-      alert(`Sync failed: ${e.message}`);
+      setNotice({ type: 'error', text: `Sync failed: ${e.message}` });
     } finally {
       setLoading(false);
     }
@@ -247,9 +261,9 @@ export default function App() {
   const handleSavePrice = async () => {
     if (!editingProduct) return;
     try {
-      await fetch('/api/admin/price', {
+      const res = await fetch('/api/admin/price', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           productId: editingProduct.id,
           type: editPriceType,
@@ -257,10 +271,16 @@ export default function App() {
           adminId: String(currentUser.id),
         }),
       });
+      const data = await res.json();
+      if (!res.ok) {
+        setNotice({ type: 'error', text: data.error || 'Failed to update product pricing' });
+        return;
+      }
       setEditingProduct(null);
+      setNotice({ type: 'success', text: `Updated pricing for ${editingProduct.name}.` });
       await fetchData();
     } catch (e: any) {
-      alert(e.message);
+      setNotice({ type: 'error', text: e.message });
     }
   };
 
@@ -269,17 +289,18 @@ export default function App() {
     try {
       const res = await fetch(`/api/admin/deposits/${id}/approve`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ adminId: String(currentUser.id) }),
       });
       const data = await res.json();
-      if (data.success) {
+      if (res.ok && data.success) {
+        setNotice({ type: 'success', text: `Deposit ${id} approved.` });
         await fetchData();
       } else {
-        alert(data.error);
+        setNotice({ type: 'error', text: data.error || 'Failed to approve deposit' });
       }
     } catch (e: any) {
-      alert(e.message);
+      setNotice({ type: 'error', text: e.message });
     }
   };
 
@@ -289,11 +310,11 @@ export default function App() {
     try {
       const startTime = Date.now();
       // Run suite of checks via internal API endpoints
-      const healthCheck = await fetch('/health').then(r => r.json());
-      const readyCheck = await fetch('/ready').then(r => r.json());
-      const catCheck = await fetch('/api/catalog').then(r => r.json());
-      const binCheck = await fetch('/api/binance/diagnostics').then(r => r.json());
-      const walletCheck = await fetch(`/api/wallet/${currentUser.id}`).then(r => r.json());
+      await fetch('/health').then(r => r.json());
+      await fetch('/ready').then(r => r.json());
+      await fetch('/api/catalog').then(r => r.json());
+      await fetch('/api/binance/diagnostics', { headers: authHeaders() }).then(r => r.json()).catch(() => null);
+      await fetch(`/api/wallet/${currentUser.id}`, { headers: authHeaders() }).then(r => r.json()).catch(() => null);
 
       const latencyMs = Date.now() - startTime;
 
@@ -318,7 +339,7 @@ export default function App() {
         ]
       });
     } catch (err: any) {
-      alert(`Smoke test execution error: ${err.message}`);
+      setNotice({ type: 'error', text: `Smoke test execution error: ${err.message}` });
     } finally {
       setRunningTests(false);
     }
@@ -370,6 +391,14 @@ export default function App() {
             </button>
           </div>
 
+          <input
+            type="password"
+            value={adminSecret}
+            onChange={(e) => setAdminSecret(e.target.value)}
+            placeholder="Admin Token (optional)"
+            className="hidden sm:block bg-slate-800/80 border border-slate-700/60 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 w-36"
+          />
+
           <button
             onClick={fetchData}
             className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition"
@@ -379,6 +408,24 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {notice && (
+        <div
+          className={`px-6 py-2.5 text-xs flex items-center justify-between border-b ${
+            notice.type === 'error'
+              ? 'bg-rose-950/60 border-rose-800/60 text-rose-200'
+              : 'bg-emerald-950/60 border-emerald-800/60 text-emerald-200'
+          }`}
+        >
+          <span>{notice.text}</span>
+          <button
+            onClick={() => setNotice(null)}
+            className="ml-4 text-slate-300 hover:text-white font-semibold cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Main Tabs Navigation */}
       <div className="border-b border-slate-800 bg-slate-900/40 px-6 flex overflow-x-auto space-x-1">

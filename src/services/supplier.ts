@@ -180,7 +180,9 @@ export class SupplierService {
   private externalBaseUrls: Record<string, string> = {};
   private externalBaseUrlOverridden: Record<string, boolean> = {};
   private externalApiKeys: Record<string, string | undefined> = {};
+  private externalApiKeyOverridden: Record<string, boolean> = {};
   private externalWebhookSecrets: Record<string, string | undefined> = {};
+  private externalWebhookSecretOverridden: Record<string, boolean> = {};
   private fetchOverride: ((url: string, init?: RequestInit) => Promise<Response>) | null = null;
 
   constructor() {
@@ -203,9 +205,11 @@ export class SupplierService {
       cupponshub: config.suppliers.cupponshub.apiKey,
       zfour: config.suppliers.zfour.apiKey,
     };
+    this.externalApiKeyOverridden = {};
     this.externalWebhookSecrets = {
       nystore: config.suppliers.nystore.webhookSecret,
     };
+    this.externalWebhookSecretOverridden = {};
   }
 
   public setFetchOverride(fn: ((url: string, init?: RequestInit) => Promise<Response>) | null) {
@@ -237,9 +241,11 @@ export class SupplierService {
     }
     if ('apiKey' in opts) {
       this.externalApiKeys[id] = opts.apiKey;
+      this.externalApiKeyOverridden[id] = true;
     }
     if ('webhookSecret' in opts) {
       this.externalWebhookSecrets[id] = opts.webhookSecret;
+      this.externalWebhookSecretOverridden[id] = true;
     }
   }
 
@@ -264,7 +270,35 @@ export class SupplierService {
   }
 
   public getSupplierWebhookSecret(supplierId: string): string | undefined {
-    return this.externalWebhookSecrets[supplierId.toLowerCase()];
+    const id = supplierId.toLowerCase();
+    if (this.externalWebhookSecretOverridden[id]) {
+      return this.externalWebhookSecrets[id];
+    }
+    const extCfg = (config.suppliers as Record<string, { webhookSecret?: string }>)[id];
+    return extCfg?.webhookSecret || this.externalWebhookSecrets[id];
+  }
+
+  public async syncConfiguredSupplierEndpoints(): Promise<void> {
+    const externalIds: Array<'ventebot' | 'nystore' | 'cupponshub' | 'zfour'> = [
+      'ventebot',
+      'nystore',
+      'cupponshub',
+      'zfour',
+    ];
+    for (const id of externalIds) {
+      const cfg = config.suppliers[id];
+      if (!cfg || this.isPlaceholderUrl(cfg.baseUrl)) continue;
+      const resolvedUrl = cfg.baseUrl.replace(/\/+$/, '');
+      await db.query(
+        `UPDATE suppliers
+         SET base_url = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2
+           AND (base_url IS NULL OR base_url = '' OR base_url LIKE '%.example%' OR base_url LIKE '%.invalid%')`,
+        [resolvedUrl, id]
+      ).catch(() => {});
+      await redis.del(`supplier_ctrl:${id}`).catch(() => {});
+    }
+    await redis.del('supplier_ctrl:list').catch(() => {});
   }
 
   public resetTestState() {
@@ -471,7 +505,7 @@ export class SupplierService {
 
   private isPlaceholderUrl(url?: string | null): boolean {
     const clean = String(url || '').trim().toLowerCase();
-    return !clean || clean.includes('.example') || clean.includes('.invalid');
+    return !clean || /\.(example|invalid)(?:[:/]|$)/i.test(clean);
   }
 
   private resolveEffectiveBaseUrl(supplierId: string, dbBaseUrl?: string): string {
@@ -479,7 +513,10 @@ export class SupplierService {
     if (cleanId === 'aitoolshop') {
       return this.baseUrl.replace(/\/+$/, '');
     }
-    const extUrl = this.externalBaseUrls[cleanId];
+    const extCfg = (config.suppliers as Record<string, { baseUrl?: string }>)[cleanId];
+    const extUrl = this.externalBaseUrlOverridden[cleanId]
+      ? this.externalBaseUrls[cleanId]
+      : extCfg?.baseUrl || this.externalBaseUrls[cleanId];
     if (extUrl !== undefined) {
       if (this.externalBaseUrlOverridden[cleanId] && extUrl) {
         return extUrl.replace(/\/+$/, '');
@@ -500,8 +537,12 @@ export class SupplierService {
     if (cleanId === 'aitoolshop') {
       return this.apiKey;
     }
-    if (Object.prototype.hasOwnProperty.call(this.externalApiKeys, cleanId)) {
+    if (this.externalApiKeyOverridden[cleanId]) {
       return this.externalApiKeys[cleanId] || (this.fetchOverride ? this.apiKey : undefined);
+    }
+    const extCfg = (config.suppliers as Record<string, { apiKey?: string }>)[cleanId];
+    if (extCfg) {
+      return extCfg.apiKey || this.externalApiKeys[cleanId] || (this.fetchOverride ? this.apiKey : undefined);
     }
     return undefined;
   }
@@ -532,7 +573,7 @@ export class SupplierService {
         supplierName: ctrl.name,
         baseUrl: effectiveBase,
         apiKey: this.resolveSupplierApiKey(supplierId),
-        webhookSecret: this.externalWebhookSecrets[supplierId.toLowerCase()],
+        webhookSecret: this.getSupplierWebhookSecret(supplierId),
         fetchFn: trackedOverride,
         delegates: {
           getBalanceDetailed: () => this.getBalanceDetailed(),
@@ -898,12 +939,16 @@ export class SupplierService {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 8000);
-      const res = await this.performFetch(`${this.baseUrl}/balance`, {
-        method: 'GET',
-        headers: this.getHeaders(),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      let res: Response;
+      try {
+        res = await this.performFetch(`${this.baseUrl}/balance`, {
+          method: 'GET',
+          headers: this.getHeaders(),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
 
       if (!res.ok) {
         logger.error('Supplier balance request failed', { status: res.status });
@@ -959,12 +1004,16 @@ export class SupplierService {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 12000);
-      const res = await this.performFetch(`${this.baseUrl}/products`, {
-        method: 'GET',
-        headers: this.getHeaders(),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      let res: Response;
+      try {
+        res = await this.performFetch(`${this.baseUrl}/products`, {
+          method: 'GET',
+          headers: this.getHeaders(),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
 
       if (!res.ok) {
         logger.warn('Supplier /products returned non-200 status', { status: res.status });
@@ -1010,12 +1059,16 @@ export class SupplierService {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
-      const res = await this.performFetch(`${this.baseUrl}/orders`, {
-        method: 'GET',
-        headers: this.getHeaders(),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      let res: Response;
+      try {
+        res = await this.performFetch(`${this.baseUrl}/orders`, {
+          method: 'GET',
+          headers: this.getHeaders(),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
 
       const rawText = await res.text();
       let data: any = null;
@@ -1094,12 +1147,16 @@ export class SupplierService {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
-      const res = await this.performFetch(`${this.baseUrl}/order/${encodeURIComponent(cleanRef)}`, {
-        method: 'GET',
-        headers: this.getHeaders(),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      let res: Response;
+      try {
+        res = await this.performFetch(`${this.baseUrl}/order/${encodeURIComponent(cleanRef)}`, {
+          method: 'GET',
+          headers: this.getHeaders(),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
 
       const rawText = await res.text();
       let data: any = null;
@@ -1956,13 +2013,17 @@ export class SupplierService {
         'Idempotency-Key': payload.idempotency_key,
       };
 
-      const res = await this.performFetch(`${endpointBase}/order`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      let res: Response;
+      try {
+        res = await this.performFetch(`${endpointBase}/order`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
 
       const rawText = await res.text();
       let data: any = null;

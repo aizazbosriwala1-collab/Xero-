@@ -1,4 +1,5 @@
-import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
+import { Router, Request, Response, NextFunction } from 'express';
 import { db } from '../db/index.js';
 import { config, getSanitizedConfig } from '../config/env.js';
 import { telegramBotRouter } from '../telegram/bot.js';
@@ -14,6 +15,51 @@ import { createLogger } from '../services/logger.js';
 
 const logger = createLogger('ApiRoutes');
 export const apiRouter = Router();
+
+function timingSafeEqualSecret(a: string, b: string): boolean {
+  const digestA = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const digestB = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(digestA, digestB);
+}
+
+function extractAdminToken(req: Request): string {
+  const headerSecret = typeof req.headers['x-admin-api-secret'] === 'string'
+    ? req.headers['x-admin-api-secret'].trim()
+    : '';
+  if (headerSecret) return headerSecret;
+
+  const authHeader = typeof req.headers.authorization === 'string'
+    ? req.headers.authorization.trim()
+    : '';
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  return '';
+}
+
+export function requireAdminApiAuth(req: Request, res: Response, next: NextFunction): void {
+  const configuredSecret = config.adminApiSecret;
+  const isProd = (process.env.NODE_ENV || config.nodeEnv) === 'production';
+
+  if (!configuredSecret) {
+    if (isProd) {
+      res.status(503).json({
+        error: 'Admin API routes are disabled in production until ADMIN_API_SECRET is configured.',
+      });
+      return;
+    }
+    next();
+    return;
+  }
+
+  const provided = extractAdminToken(req);
+  if (!provided || !timingSafeEqualSecret(provided, configuredSecret)) {
+    res.status(401).json({ error: 'Unauthorized: valid admin authorization is required.' });
+    return;
+  }
+
+  next();
+}
 
 // Health check for Railway and orchestrators
 apiRouter.get('/health', (_req: Request, res: Response) => {
@@ -108,7 +154,9 @@ apiRouter.post('/api/webhooks/nystore', async (req: Request, res: Response) => {
     const rawBody = typeof (req as any).rawBody === 'string' ? (req as any).rawBody : JSON.stringify(req.body || {});
     const signatureHeader =
       (req.headers['x-nystore-signature'] as string | undefined) ||
-      (req.headers['x-signature'] as string | undefined);
+      (req.headers['x-signature'] as string | undefined) ||
+      (req.headers['x-webhook-signature'] as string | undefined) ||
+      (req.headers['x-hub-signature-256'] as string | undefined);
     const secretHeader =
       (req.headers['x-webhook-secret'] as string | undefined) ||
       (typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ')
@@ -128,10 +176,19 @@ apiRouter.post('/api/webhooks/nystore', async (req: Request, res: Response) => {
   }
 });
 
-// Telegram Browser Simulator endpoint (for testing customer & admin bot in UI)
-apiRouter.post('/api/telegram/simulate', async (req: Request, res: Response) => {
+// Telegram Browser Simulator endpoint (development/authorized admin only)
+apiRouter.post('/api/telegram/simulate', requireAdminApiAuth, async (req: Request, res: Response) => {
+  const isProd = (process.env.NODE_ENV || config.nodeEnv) === 'production';
+  if (isProd) {
+    res.status(403).json({ success: false, error: 'Telegram simulator endpoint is disabled in production.' });
+    return;
+  }
   try {
     const update = req.body;
+    if (!update || typeof update !== 'object') {
+      res.status(400).json({ success: false, error: 'Invalid Telegram update payload.' });
+      return;
+    }
     const result = await telegramBotRouter.handleUpdate(update);
     res.json({ success: true, result });
   } catch (err: any) {
@@ -166,33 +223,40 @@ apiRouter.get('/api/categories', async (_req: Request, res: Response) => {
 });
 
 // Admin: Set Product Pricing
-apiRouter.post('/api/admin/price', async (req: Request, res: Response) => {
+apiRouter.post('/api/admin/price', requireAdminApiAuth, async (req: Request, res: Response) => {
   try {
-    const { productId, type, value, adminId } = req.body;
-    const admin = adminId || 'ADMIN_API';
+    const { productId, type, value, adminId } = req.body || {};
+    if (typeof productId !== 'string' || !productId.trim()) {
+      res.status(400).json({ error: 'productId is required.' });
+      return;
+    }
+    const cleanProductId = productId.trim();
+    const admin = typeof adminId === 'string' && adminId.trim() ? adminId.trim() : 'ADMIN_API';
 
     if (type === 'fixed_price') {
-      await pricingService.setFixedRetailPrice(productId, value, admin);
+      await pricingService.setFixedRetailPrice(cleanProductId, value, admin);
     } else if (type === 'fixed_markup') {
-      await pricingService.setFixedMarkup(productId, value, admin);
+      await pricingService.setFixedMarkup(cleanProductId, value, admin);
     } else if (type === 'percent_markup') {
-      await pricingService.setPercentMarkup(productId, value, admin);
+      await pricingService.setPercentMarkup(cleanProductId, value, admin);
     } else if (type === 'reset') {
-      await pricingService.resetPricing(productId, admin);
+      await pricingService.resetPricing(cleanProductId, admin);
     } else {
       res.status(400).json({ error: 'Invalid pricing update type' });
       return;
     }
 
-    const updated = await pricingService.calculatePrice(productId);
+    const updated = await pricingService.calculatePrice(cleanProductId);
     res.json({ success: true, updated });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const msg = String(err?.message || 'Pricing update failed');
+    const isValidation = /invalid|positive|non-negative|between|not found/i.test(msg);
+    res.status(isValidation ? 400 : 500).json({ error: msg });
   }
 });
 
 // Admin: Trigger Supplier Sync
-apiRouter.post('/api/admin/sync', async (_req: Request, res: Response) => {
+apiRouter.post('/api/admin/sync', requireAdminApiAuth, async (_req: Request, res: Response) => {
   try {
     const result = await supplierService.syncCatalogue();
     res.json({ success: true, result });
@@ -202,7 +266,7 @@ apiRouter.post('/api/admin/sync', async (_req: Request, res: Response) => {
 });
 
 // Admin: Review Manual Deposits
-apiRouter.get('/api/admin/deposits', async (_req: Request, res: Response) => {
+apiRouter.get('/api/admin/deposits', requireAdminApiAuth, async (_req: Request, res: Response) => {
   try {
     const deposits = await db.query(`
       SELECT d.*, u.username, u.first_name
@@ -218,29 +282,45 @@ apiRouter.get('/api/admin/deposits', async (_req: Request, res: Response) => {
 });
 
 // Admin: Approve Deposit
-apiRouter.post('/api/admin/deposits/:id/approve', async (req: Request, res: Response) => {
+apiRouter.post('/api/admin/deposits/:id/approve', requireAdminApiAuth, async (req: Request, res: Response) => {
   try {
-    const { adminId, notes } = req.body;
-    const result = await manualPaymentService.approveDeposit(req.params.id, adminId || 'ADMIN_API', notes);
+    const depositId = String(req.params.id || '').trim();
+    if (!depositId) {
+      res.status(400).json({ error: 'Deposit ID is required.' });
+      return;
+    }
+    const { adminId, notes } = req.body || {};
+    const admin = typeof adminId === 'string' && adminId.trim() ? adminId.trim() : 'ADMIN_API';
+    const result = await manualPaymentService.approveDeposit(depositId, admin, notes);
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const msg = String(err?.message || 'Deposit approval failed');
+    const isClientErr = /not found|cannot be approved|must be greater|exceeds|disabled|invalid/i.test(msg);
+    res.status(isClientErr ? 400 : 500).json({ error: msg });
   }
 });
 
 // Admin: Reject Deposit
-apiRouter.post('/api/admin/deposits/:id/reject', async (req: Request, res: Response) => {
+apiRouter.post('/api/admin/deposits/:id/reject', requireAdminApiAuth, async (req: Request, res: Response) => {
   try {
-    const { adminId, reason } = req.body;
-    await manualPaymentService.rejectDeposit(req.params.id, adminId || 'ADMIN_API', reason || 'Rejected by admin');
+    const depositId = String(req.params.id || '').trim();
+    if (!depositId) {
+      res.status(400).json({ error: 'Deposit ID is required.' });
+      return;
+    }
+    const { adminId, reason } = req.body || {};
+    const admin = typeof adminId === 'string' && adminId.trim() ? adminId.trim() : 'ADMIN_API';
+    await manualPaymentService.rejectDeposit(depositId, admin, typeof reason === 'string' && reason.trim() ? reason.trim() : 'Rejected by admin');
     res.json({ success: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const msg = String(err?.message || 'Deposit rejection failed');
+    const isClientErr = /not found|cannot be rejected|only pending/i.test(msg);
+    res.status(isClientErr ? 400 : 500).json({ error: msg });
   }
 });
 
 // Binance: Run Read-only Diagnostics
-apiRouter.get('/api/binance/diagnostics', async (_req: Request, res: Response) => {
+apiRouter.get('/api/binance/diagnostics', requireAdminApiAuth, async (_req: Request, res: Response) => {
   try {
     const diagnostics = await binanceService.testReadOnlyVerification();
     res.json(diagnostics);
@@ -250,11 +330,16 @@ apiRouter.get('/api/binance/diagnostics', async (_req: Request, res: Response) =
 });
 
 // Wallet & Ledger history
-apiRouter.get('/api/wallet/:userId', async (req: Request, res: Response) => {
+apiRouter.get('/api/wallet/:userId', requireAdminApiAuth, async (req: Request, res: Response) => {
   try {
-    const wallet = await walletService.getBalance(req.params.userId);
-    const history = await walletService.getHistory(req.params.userId, 20);
-    const reconciliation = await walletService.reconcile(req.params.userId);
+    const userId = String(req.params.userId || '').trim();
+    if (!userId || userId.length > 64) {
+      res.status(400).json({ error: 'Valid userId is required.' });
+      return;
+    }
+    const wallet = await walletService.getBalance(userId);
+    const history = await walletService.getHistory(userId, 20);
+    const reconciliation = await walletService.reconcile(userId);
     res.json({ wallet, history, reconciliation });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

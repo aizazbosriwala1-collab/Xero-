@@ -58,6 +58,7 @@ export interface AppConfig {
     liveOrderingEnabled: boolean;
     manualPaymentsEnabled: boolean;
   };
+  adminApiSecret?: string;
 }
 
 export function parseBoundedClockToleranceSeconds(raw?: string): number {
@@ -104,6 +105,16 @@ export function normalizeBotUsername(raw?: string | null): string | undefined {
   return cleaned || undefined;
 }
 
+export function cleanEnvString(raw?: string): string {
+  if (typeof raw !== 'string') {
+    return '';
+  }
+  return raw
+    .trim()
+    .replace(/^['"]+|['"]+$/g, '')
+    .trim();
+}
+
 export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const adminIdsRaw = env.TELEGRAM_ADMIN_IDS || '';
   const adminIds = adminIdsRaw
@@ -111,22 +122,56 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     .map(id => id.trim())
     .filter(Boolean);
 
-  const explicitSupplierBaseUrl = typeof env.AITOOLSHOP_BASE_URL === 'string' ? env.AITOOLSHOP_BASE_URL.trim() : '';
+  const explicitSupplierBaseUrl = cleanEnvString(env.AITOOLSHOP_BASE_URL);
   const resolvedSupplierBaseUrl = (explicitSupplierBaseUrl || DEFAULT_AITOOLSHOP_BASE_URL).replace(/\/+$/, '');
   const parseExtSupplier = (urlKey: string, keyName: string, defaultUrl: string, secretKey?: string): ExternalSupplierEnvConfig => {
-    const rawUrl = typeof env[urlKey] === 'string' ? env[urlKey]!.trim() : '';
-    const resolvedUrl = (rawUrl || defaultUrl).replace(/\/+$/, '');
-    const rawApiKey = typeof env[keyName] === 'string' && env[keyName]!.trim().length > 0 ? env[keyName]!.trim() : undefined;
-    const rawSecret =
-      secretKey && typeof env[secretKey] === 'string' && env[secretKey]!.trim().length > 0
-        ? env[secretKey]!.trim()
-        : undefined;
-    return {
-      baseUrl: resolvedUrl,
-      baseUrlSource: rawUrl ? 'ENV_OVERRIDE' : 'CODE_DEFAULT',
-      apiKey: rawApiKey,
-      ...(secretKey ? { webhookSecret: rawSecret } : {}),
+    const readUrl = () => {
+      const rawUrl = cleanEnvString(env[urlKey]);
+      return {
+        rawUrl,
+        resolvedUrl: (rawUrl || defaultUrl).replace(/\/+$/, ''),
+      };
     };
+    const readKey = () => {
+      const k = cleanEnvString(env[keyName]);
+      return k.length > 0 ? k : undefined;
+    };
+    const readSecret = () => {
+      if (!secretKey) return undefined;
+      const s = cleanEnvString(env[secretKey]);
+      return s.length > 0 ? s : undefined;
+    };
+
+    const obj: ExternalSupplierEnvConfig = {
+      baseUrl: readUrl().resolvedUrl,
+      baseUrlSource: readUrl().rawUrl ? 'ENV_OVERRIDE' : 'CODE_DEFAULT',
+      apiKey: readKey(),
+      ...(secretKey ? { webhookSecret: readSecret() } : {}),
+    };
+
+    Object.defineProperty(obj, 'baseUrl', {
+      enumerable: true,
+      configurable: true,
+      get: () => readUrl().resolvedUrl,
+    });
+    Object.defineProperty(obj, 'baseUrlSource', {
+      enumerable: true,
+      configurable: true,
+      get: (): 'ENV_OVERRIDE' | 'CODE_DEFAULT' => (readUrl().rawUrl ? 'ENV_OVERRIDE' : 'CODE_DEFAULT'),
+    });
+    Object.defineProperty(obj, 'apiKey', {
+      enumerable: true,
+      configurable: true,
+      get: () => readKey(),
+    });
+    if (secretKey) {
+      Object.defineProperty(obj, 'webhookSecret', {
+        enumerable: true,
+        configurable: true,
+        get: () => readSecret(),
+      });
+    }
+    return obj;
   };
 
   let liveOrderingOverride: boolean | undefined;
@@ -151,7 +196,7 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
   });
 
-  return {
+  const configObj: AppConfig = {
     nodeEnv: env.NODE_ENV || 'development',
     port: parseInt(env.PORT || '3000', 10),
     databaseUrl: env.DATABASE_URL,
@@ -191,6 +236,17 @@ export function buildConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     safety,
   };
+
+  Object.defineProperty(configObj, 'adminApiSecret', {
+    enumerable: true,
+    configurable: true,
+    get(): string | undefined {
+      const s = cleanEnvString(env.ADMIN_API_SECRET);
+      return s.length > 0 ? s : undefined;
+    },
+  });
+
+  return configObj;
 }
 
 export const config: AppConfig = buildConfig(process.env);
@@ -261,5 +317,6 @@ export function getSanitizedConfig(): Record<string, unknown> {
       readOnlyLiveVerified: config.binance.readOnlyLiveVerified,
     },
     safety: { ...config.safety },
+    adminApiSecretConfigured: Boolean(config.adminApiSecret),
   };
 }

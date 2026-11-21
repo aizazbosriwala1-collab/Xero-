@@ -561,7 +561,15 @@ export class PricingService {
    * Set per-product fixed retail price.
    */
   public async setFixedRetailPrice(productId: string, price: Decimal | number | string, adminId: string): Promise<void> {
-    const priceDec = new Decimal(price);
+    let priceDec: Decimal;
+    try {
+      priceDec = new Decimal(price);
+    } catch {
+      throw new Error('Invalid fixed retail price.');
+    }
+    if (!priceDec.isFinite() || priceDec.lessThanOrEqualTo(0)) {
+      throw new Error('Fixed retail price must be a positive number greater than 0.');
+    }
     await db.query(
       `INSERT INTO product_overrides (product_id, fixed_retail_price, updated_at)
        VALUES ($1, $2, CURRENT_TIMESTAMP)
@@ -587,7 +595,15 @@ export class PricingService {
    * Set per-product fixed markup (e.g. 0.05 USDT).
    */
   public async setFixedMarkup(productId: string, markup: Decimal | number | string, adminId: string): Promise<void> {
-    const markupDec = new Decimal(markup);
+    let markupDec: Decimal;
+    try {
+      markupDec = new Decimal(markup);
+    } catch {
+      throw new Error('Invalid fixed markup.');
+    }
+    if (!markupDec.isFinite() || markupDec.lessThan(0)) {
+      throw new Error('Fixed markup must be a non-negative number.');
+    }
     await db.query(
       `INSERT INTO product_overrides (product_id, fixed_markup, updated_at)
        VALUES ($1, $2, CURRENT_TIMESTAMP)

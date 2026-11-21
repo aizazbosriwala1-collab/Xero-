@@ -174,6 +174,40 @@ function unwrapEnvelope(data: any): any {
   return { ...data, ...nested };
 }
 
+export function parseSafeDecimal(val: unknown, fallback = 0): Decimal {
+  if (val instanceof Decimal) {
+    return val.isFinite() ? val : new Decimal(fallback);
+  }
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? new Decimal(val) : new Decimal(fallback);
+  }
+  if (val && typeof val === 'object' && !Array.isArray(val)) {
+    const obj = val as Record<string, unknown>;
+    const candidate = obj.available ?? obj.amount ?? obj.balance ?? obj.usdt ?? obj.value ?? obj.total;
+    if (candidate !== undefined && candidate !== val) {
+      return parseSafeDecimal(candidate, fallback);
+    }
+    return new Decimal(fallback);
+  }
+  if (typeof val === 'string') {
+    const cleaned = val
+      .trim()
+      .replace(/,/g, '')
+      .replace(/^[$€£¥]+/, '')
+      .replace(/\s*(usdt|usd|tether)$/i, '')
+      .trim();
+    if (/^[+-]?\d+(?:\.\d+)?$/.test(cleaned)) {
+      try {
+        const d = new Decimal(cleaned);
+        return d.isFinite() ? d : new Decimal(fallback);
+      } catch {
+        return new Decimal(fallback);
+      }
+    }
+  }
+  return new Decimal(fallback);
+}
+
 function normalizeDeliveryArray(val: unknown): string[] {
   if (val === undefined || val === null) return [];
   if (Array.isArray(val)) {
@@ -648,7 +682,7 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
 
   protected isPlaceholderEndpoint(baseUrl: string): boolean {
     const clean = String(baseUrl || '').trim().toLowerCase();
-    return !clean || clean.includes('.example') || clean.includes('.invalid');
+    return !clean || /\.(example|invalid)(?:[:/]|$)/i.test(clean);
   }
 
   protected hasCredentialsAndEndpoint(ctx: DriverContext): { ready: boolean; reason?: string } {
@@ -852,10 +886,11 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
         unwrapped.balance_usdt ??
         unwrapped.available_balance ??
         unwrapped.available ??
+        unwrapped.wallet_balance ??
         data.balance ??
         data.balance_usdt ??
         0;
-      const balance = new Decimal(rawBal || 0);
+      const balance = parseSafeDecimal(rawBal, 0);
       return {
         ok: true,
         balanceUsdt: balance.toFixed(4),
@@ -911,12 +946,12 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
           integrated: true,
         };
       }
-      if (!data) {
+      if (!data || typeof data !== 'object' || data.success === false) {
         return {
           ok: false,
           products: [],
           latencyMs: Date.now() - started,
-          error: 'MALFORMED_JSON',
+          error: (data && typeof data === 'object' && data.message) ? String(data.message) : 'MALFORMED_JSON',
           integrated: true,
         };
       }
@@ -927,9 +962,19 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
           ? data.products
           : Array.isArray(data.data)
             ? data.data
-            : Array.isArray(data.items)
-              ? data.items
-              : [];
+            : Array.isArray(data.data?.products)
+              ? data.data.products
+              : Array.isArray(data.data?.items)
+                ? data.data.items
+                : Array.isArray(data.result?.products)
+                  ? data.result.products
+                  : Array.isArray(data.result?.items)
+                    ? data.result.items
+                    : Array.isArray(data.catalog)
+                      ? data.catalog
+                      : Array.isArray(data.items)
+                        ? data.items
+                        : [];
 
       const products = rawArr
         .map(p => this.normalizeRawProduct(p))
@@ -959,7 +1004,7 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
       ok: cat.ok,
       updatedItems: cat.products.map(p => ({
         supplierProductId: String(p.id),
-        costUsdt: new Decimal(p.your_cost ?? p.price_usdt ?? 0).toFixed(4),
+        costUsdt: parseSafeDecimal(p.your_cost ?? p.price_usdt ?? 0, 0).toFixed(4),
       })),
       latencyMs: Date.now() - started,
       error: cat.error,
@@ -1023,12 +1068,14 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
           const rec = unwrapEnvelope(data);
           const unitRaw = rec.unit_cost ?? rec.unit_price ?? rec.your_cost ?? rec.price_usdt ?? rec.price;
           const totalRaw = rec.total_cost ?? rec.total_price ?? rec.total;
-          const unitDec = unitRaw !== undefined
-            ? new Decimal(unitRaw)
-            : totalRaw !== undefined
-              ? new Decimal(totalRaw).div(qty)
+          const hasUnit = unitRaw !== undefined && unitRaw !== null && String(unitRaw).trim() !== '';
+          const hasTotal = totalRaw !== undefined && totalRaw !== null && String(totalRaw).trim() !== '';
+          const unitDec = hasUnit
+            ? parseSafeDecimal(unitRaw, 0)
+            : hasTotal
+              ? parseSafeDecimal(totalRaw, 0).div(qty)
               : new Decimal(0);
-          const totalDec = totalRaw !== undefined ? new Decimal(totalRaw) : unitDec.times(qty);
+          const totalDec = hasTotal ? parseSafeDecimal(totalRaw, 0) : unitDec.times(qty);
           const stockNum = rec.available_stock ?? rec.stock ?? rec.stock_quantity;
           const parsedStock = stockNum !== undefined ? Number(stockNum) : undefined;
           const isUnlimited = Boolean(rec.is_unlimited || (parsedStock !== undefined && parsedStock > 1000));
@@ -1101,7 +1148,7 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
       };
     }
 
-    const unitCost = new Decimal(found.your_cost ?? found.price_usdt ?? 0);
+    const unitCost = parseSafeDecimal(found.your_cost ?? found.price_usdt ?? 0, 0);
     const stock = Number(found.stock ?? found.stock_quantity ?? 0);
     const isUnlimited = Boolean(found.is_unlimited || stock > 1000);
     return {
@@ -1593,7 +1640,12 @@ export abstract class BaseExternalResellerDriver implements ISupplierDriver {
         };
       }
 
-      return this.parseLookupJsonPayload(data, res.status, 'GET_ORDERS_LOOKUP', params);
+      const parsedLookup = this.parseLookupJsonPayload(data, res.status, 'GET_ORDERS_LOOKUP', params);
+      if (parsedLookup.status === 'not_found' && params.supplierOrderRef?.trim()) {
+        const fb = await this.fallbackOrderRecovery(ctx, params);
+        if (fb) return fb;
+      }
+      return parsedLookup;
     } catch (err: any) {
       return {
         ok: false,
@@ -1711,6 +1763,35 @@ export class VenteBotDriver extends BaseExternalResellerDriver {
   public readonly driverKey = 'ventebot';
   public readonly displayName = 'VenteBot';
   protected readonly envPrefix = 'VENTEBOT';
+
+  protected override async fallbackOrderRecovery(
+    ctx: DriverContext,
+    params: { supplierOrderRef?: string | null; idempotencyKey?: string | null }
+  ): Promise<SupplierOrderLookupResult | null> {
+    const cleanRef = params.supplierOrderRef?.trim();
+    if (!cleanRef) return null;
+
+    for (const path of [
+      `/order/${encodeURIComponent(cleanRef)}`,
+      `/orders/${encodeURIComponent(cleanRef)}`,
+    ]) {
+      try {
+        const res = await this.doFetch(
+          ctx,
+          path,
+          { method: 'GET', headers: this.buildHeaders(ctx) },
+          10000
+        );
+        if (res.status === 404 || res.status === 405 || res.status === 501) continue;
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || typeof data !== 'object') continue;
+        return this.parseLookupJsonPayload(data, res.status, 'GET_ORDER_BY_REF', params);
+      } catch {
+        // try next fallback endpoint
+      }
+    }
+    return null;
+  }
 }
 
 /**
@@ -2049,6 +2130,7 @@ export class ZFourDriver extends BaseExternalResellerDriver {
 
     for (const path of [
       `/orders/${encodeURIComponent(cleanRef)}/track`,
+      `/orders/${encodeURIComponent(cleanRef)}`,
       `/order/${encodeURIComponent(cleanRef)}`,
     ]) {
       try {

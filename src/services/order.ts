@@ -725,14 +725,15 @@ export class OrderService {
               [msg, orderId]
             );
             await client.query(
-              `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-               VALUES ($1, $2, $3, $4, 'UNCERTAIN_MISSING_DELIVERY', $5)
+              `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+               VALUES ($1, $2, $3, $4, 'UNCERTAIN_MISSING_DELIVERY', $5, $6)
                ON CONFLICT (local_order_id) DO UPDATE
                SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
                    supplier_status = 'UNCERTAIN_MISSING_DELIVERY',
                    response_payload = EXCLUDED.response_payload,
+                   fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
                    updated_at = CURRENT_TIMESTAMP`,
-              [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload]
+              [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload, targetSupplierId]
             );
             return {
               success: false,
@@ -824,14 +825,15 @@ export class OrderService {
             );
             if (resolvedRef) {
               await client.query(
-                `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-                 VALUES ($1, $2, $3, $4, 'FAILED_AT_SUPPLIER', $5)
+                `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+                 VALUES ($1, $2, $3, $4, 'FAILED_AT_SUPPLIER', $5, $6)
                  ON CONFLICT (local_order_id) DO UPDATE
                  SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
                      supplier_status = 'FAILED_AT_SUPPLIER',
                      response_payload = EXCLUDED.response_payload,
+                     fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
                      updated_at = CURRENT_TIMESTAMP`,
-                [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload]
+                [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload, targetSupplierId]
               );
             }
             return {
@@ -905,14 +907,15 @@ export class OrderService {
             [orderId]
           );
           await client.query(
-            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-             VALUES ($1, $2, $3, $4, 'pending_invite', $5)
+            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+             VALUES ($1, $2, $3, $4, 'pending_invite', $5, $6)
              ON CONFLICT (local_order_id) DO UPDATE
              SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
                  supplier_status = 'pending_invite',
                  response_payload = EXCLUDED.response_payload,
+                 fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
                  updated_at = CURRENT_TIMESTAMP`,
-            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload]
+            [`so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`, orderId, resolvedRef, idempotencyKey, sanitizedRawPayload, targetSupplierId]
           );
           return {
             success: true,
@@ -932,12 +935,13 @@ export class OrderService {
         // 4) Not found, still pending, or transient lookup error -> keep under review (NO reorder, NO refund)
         if (resolvedRef) {
           await client.query(
-            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            `INSERT INTO supplier_orders (id, local_order_id, supplier_order_ref, idempotency_key, supplier_status, response_payload, fulfilled_supplier_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (local_order_id) DO UPDATE
              SET supplier_order_ref = COALESCE(EXCLUDED.supplier_order_ref, supplier_orders.supplier_order_ref),
                  supplier_status = EXCLUDED.supplier_status,
                  response_payload = CASE WHEN EXCLUDED.response_payload = '{}' THEN supplier_orders.response_payload ELSE EXCLUDED.response_payload END,
+                 fulfilled_supplier_id = COALESCE(supplier_orders.fulfilled_supplier_id, EXCLUDED.fulfilled_supplier_id),
                  updated_at = CURRENT_TIMESTAMP`,
             [
               `so_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
@@ -946,6 +950,7 @@ export class OrderService {
               idempotencyKey,
               lookup.status.toUpperCase(),
               sanitizedRawPayload,
+              targetSupplierId,
             ]
           );
         }
@@ -1072,9 +1077,10 @@ export class OrderService {
          FROM supplier_orders so
          JOIN local_orders lo ON lo.id = so.local_order_id
          WHERE so.supplier_order_ref = $1
-         ORDER BY so.created_at DESC
+           AND (so.fulfilled_supplier_id = $2 OR so.fulfilled_supplier_id IS NULL)
+         ORDER BY CASE WHEN so.fulfilled_supplier_id = $2 THEN 0 ELSE 1 END, so.created_at DESC
          LIMIT 1`,
-        [parsed.orderRef]
+        [parsed.orderRef, params.supplierId]
       );
     }
     if (!orderRow && parsed.idempotencyKey) {

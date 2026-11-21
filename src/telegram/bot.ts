@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { db } from '../db/index.js';
 import { config } from '../config/env.js';
 import { customerHandler } from './handlers/customer.js';
@@ -365,10 +366,15 @@ export class TelegramBotRouter {
   public async handleUpdate(update: TelegramUpdate, secretHeader?: string): Promise<{ ok: boolean; status: string }> {
     const updateStartedAt = Date.now();
 
-    // 1. Verify Telegram Webhook Secret Token if configured
-    if (config.telegram.webhookSecret && secretHeader !== config.telegram.webhookSecret) {
-      logger.warn('Unauthorized webhook request: secret token mismatch');
-      return { ok: false, status: 'UNAUTHORIZED' };
+    // 1. Verify Telegram Webhook Secret Token if configured (constant-time)
+    if (config.telegram.webhookSecret) {
+      const provided = typeof secretHeader === 'string' ? secretHeader : '';
+      const expectedDigest = crypto.createHash('sha256').update(config.telegram.webhookSecret, 'utf8').digest();
+      const providedDigest = crypto.createHash('sha256').update(provided, 'utf8').digest();
+      if (!provided || !crypto.timingSafeEqual(expectedDigest, providedDigest)) {
+        logger.warn('Unauthorized webhook request: secret token mismatch');
+        return { ok: false, status: 'UNAUTHORIZED' };
+      }
     }
 
     if (!update || !update.update_id) {

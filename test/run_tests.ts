@@ -53,7 +53,7 @@ import { launchAuditService } from '../src/services/audit.js';
 import { perfTracker } from '../src/services/perfTracker.js';
 import { promotionService } from '../src/services/promotion.js';
 import { menuCache } from '../src/telegram/menuCache.js';
-import { supplierDriverRegistry, NyStoreDriver } from '../src/services/supplierDrivers.js';
+import { supplierDriverRegistry, NyStoreDriver, parseSafeDecimal } from '../src/services/supplierDrivers.js';
 import { supplierEcosystemService } from '../src/services/supplierEcosystem.js';
 import { apiRouter, handleNyStoreWebhookHttp } from '../src/api/routes.js';
 import {
@@ -10112,6 +10112,420 @@ export async function runComprehensiveTests() {
       }
       await db.query('DELETE FROM product_overrides WHERE product_id = $1', [prodId]).catch(() => {});
       await db.query('DELETE FROM supplier_products WHERE id = $1', [prodId]).catch(() => {});
+    }
+  });
+
+  currentCategory = 'Supplier Activation & Env Binding Validation';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('SupplierActivation 1: Quoted external supplier env vars parse dynamically and sync placeholder DB endpoints', 'mock_integration', async () => {
+    const envKeys = [
+      'VENTEBOT_BASE_URL', 'VENTEBOT_API_KEY',
+      'NYSTORE_BASE_URL', 'NYSTORE_API_KEY', 'NYSTORE_WEBHOOK_SECRET',
+      'CUPPONSHUB_BASE_URL', 'CUPPONSHUB_API_KEY',
+      'ZFOUR_BASE_URL', 'ZFOUR_API_KEY',
+    ];
+    const savedEnv: Record<string, string | undefined> = {};
+    for (const k of envKeys) savedEnv[k] = process.env[k];
+
+    const origUrls = await db.query<{ id: string; base_url: string }>(
+      `SELECT id, base_url FROM suppliers WHERE id IN ('ventebot', 'nystore', 'cupponshub', 'zfour')`
+    );
+
+    try {
+      supplierService.resetTestState();
+      process.env.VENTEBOT_BASE_URL = ' "https://live-vb.test/v1/" ';
+      process.env.VENTEBOT_API_KEY = ' "vb_live_key_quoted" ';
+      process.env.NYSTORE_BASE_URL = "'https://live-ny.test/v1/'";
+      process.env.NYSTORE_API_KEY = '"ny_live_key_quoted"';
+      process.env.NYSTORE_WEBHOOK_SECRET = ' "ny_live_secret_quoted" ';
+      process.env.CUPPONSHUB_BASE_URL = ' https://live-ch.test/v1/ ';
+      process.env.CUPPONSHUB_API_KEY = 'ch_live_key_trimmed ';
+      process.env.ZFOUR_BASE_URL = '"https://live-zf.test/v1"';
+      process.env.ZFOUR_API_KEY = '"zf_live_key_quoted"';
+
+      assert.strictEqual(config.suppliers.ventebot.baseUrl, 'https://live-vb.test/v1');
+      assert.strictEqual(config.suppliers.ventebot.apiKey, 'vb_live_key_quoted');
+      assert.strictEqual(config.suppliers.nystore.baseUrl, 'https://live-ny.test/v1');
+      assert.strictEqual(config.suppliers.nystore.apiKey, 'ny_live_key_quoted');
+      assert.strictEqual(config.suppliers.nystore.webhookSecret, 'ny_live_secret_quoted');
+      assert.strictEqual(config.suppliers.cupponshub.baseUrl, 'https://live-ch.test/v1');
+      assert.strictEqual(config.suppliers.cupponshub.apiKey, 'ch_live_key_trimmed');
+      assert.strictEqual(config.suppliers.zfour.baseUrl, 'https://live-zf.test/v1');
+      assert.strictEqual(config.suppliers.zfour.apiKey, 'zf_live_key_quoted');
+      assert.strictEqual(supplierService.getSupplierWebhookSecret('nystore'), 'ny_live_secret_quoted');
+
+      // Ensure DB placeholder .example URLs are replaced on syncConfiguredSupplierEndpoints
+      await db.query(`UPDATE suppliers SET base_url = 'https://api.ventebot.example/v1' WHERE id = 'ventebot'`);
+      await db.query(`UPDATE suppliers SET base_url = 'https://api.nystore.example/v1' WHERE id = 'nystore'`);
+      await db.query(`UPDATE suppliers SET base_url = 'https://api.cupponshub.example/v1' WHERE id = 'cupponshub'`);
+      await db.query(`UPDATE suppliers SET base_url = 'https://api.zfour.example/v1' WHERE id = 'zfour'`);
+
+      await supplierService.syncConfiguredSupplierEndpoints();
+      const updated = await db.query<{ id: string; base_url: string }>(
+        `SELECT id, base_url FROM suppliers WHERE id IN ('ventebot', 'nystore', 'cupponshub', 'zfour')`
+      );
+      const byId = new Map(updated.rows.map(r => [r.id, r.base_url]));
+      assert.strictEqual(byId.get('ventebot'), 'https://live-vb.test/v1');
+      assert.strictEqual(byId.get('nystore'), 'https://live-ny.test/v1');
+      assert.strictEqual(byId.get('cupponshub'), 'https://live-ch.test/v1');
+      assert.strictEqual(byId.get('zfour'), 'https://live-zf.test/v1');
+    } finally {
+      for (const k of envKeys) {
+        if (savedEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[k];
+      }
+      for (const r of origUrls.rows) {
+        await db.query('UPDATE suppliers SET base_url = $1 WHERE id = $2', [r.base_url, r.id]).catch(() => {});
+      }
+      supplierService.resetTestState();
+      await redis.del('supplier_ctrl:list').catch(() => {});
+    }
+  });
+
+  await it('SupplierActivation 2: VenteBot fallback recovery via GET /order/:ref and NyStore direct secret header validation', 'mock_integration', async () => {
+    try {
+      supplierService.setTestExternalSupplierConfig('ventebot', {
+        baseUrl: 'https://mock-vb-fallback.local/v1',
+        apiKey: 'vb_fb_key',
+      });
+      supplierService.setFetchOverride(async (url: string) => {
+        if (url.includes('/orders/lookup')) {
+          return new Response(JSON.stringify({ found: false }), { status: 404 });
+        }
+        if (url.endsWith('/v1/order/vb_ref_fallback_99')) {
+          return new Response(JSON.stringify({
+            status: 'completed',
+            order_ref: 'vb_ref_fallback_99',
+            delivered_items: ['VB-FALLBACK-CRED-99'],
+          }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      });
+
+      const rec = await supplierService.lookupOrderReadOnly({
+        supplierId: 'ventebot',
+        supplierOrderRef: 'vb_ref_fallback_99',
+        idempotencyKey: 'idem_vb_fb_99',
+      });
+      assert.strictEqual(rec.ok, true);
+      assert.strictEqual(rec.found, true);
+      assert.strictEqual(rec.lookupMethod, 'GET_ORDER_BY_REF');
+      assert.strictEqual(rec.status, 'completed');
+      assert.deepStrictEqual(rec.delivered_items, ['VB-FALLBACK-CRED-99']);
+
+      // NyStore direct secret header verification alongside HMAC rejection on wrong secret
+      assert.strictEqual(
+        NyStoreDriver.verifyWebhookSignature({
+          rawBody: '{"event":"order.completed"}',
+          secretHeader: 'ny_direct_secret_123',
+          expectedSecret: 'ny_direct_secret_123',
+        }),
+        true
+      );
+      assert.strictEqual(
+        NyStoreDriver.verifyWebhookSignature({
+          rawBody: '{"event":"order.completed"}',
+          secretHeader: 'wrong_secret',
+          expectedSecret: 'ny_direct_secret_123',
+        }),
+        false
+      );
+    } finally {
+      supplierService.resetTestState();
+    }
+  });
+
+  await it('SupplierActivation 3: Safe Decimal/catalog error detection, ZFour /orders/:ref 200-not-found fallback, and core latency SLA', 'mock_integration', async () => {
+    assert.strictEqual(parseSafeDecimal('$1,250.50 USDT').toFixed(2), '1250.50');
+    assert.strictEqual(parseSafeDecimal({ available: '44.25' }).toFixed(2), '44.25');
+    assert.strictEqual(parseSafeDecimal(null, 0).toFixed(2), '0.00');
+
+    const adminId = String(config.telegram.adminIds[0]);
+    try {
+      await supplierService.setSupplierFlag('zfour', 'is_enabled', true, adminId);
+      await supplierService.setSupplierFlag('zfour', 'sync_enabled', true, adminId);
+      supplierService.setTestZFourConfig({
+        baseUrl: 'https://mock-zf-edge.test/v1',
+        apiKey: 'zf_edge_key',
+      });
+
+      supplierService.setFetchOverride(async (url: string) => {
+        if (url.endsWith('/v1/balance')) {
+          return new Response(JSON.stringify({ balance: { available: '$92.75 USDT' } }), { status: 200 });
+        }
+        if (url.endsWith('/v1/products')) {
+          return new Response(JSON.stringify({
+            success: true,
+            data: { products: [{ id: 'zf_nested_1', name: 'Nested Pass', your_cost: '3.25', stock: 8 }] },
+          }), { status: 200 });
+        }
+        if (url.includes('/v1/orders/lookup')) {
+          return new Response(JSON.stringify({ found: false }), { status: 200 });
+        }
+        if (url.endsWith('/v1/orders/zf_ref_200_fb/track')) {
+          return new Response('{}', { status: 404 });
+        }
+        if (url.endsWith('/v1/orders/zf_ref_200_fb')) {
+          return new Response(JSON.stringify({
+            status: 'completed',
+            order_ref: 'zf_ref_200_fb',
+            delivered_items: ['ZF-200-FB-ITEM'],
+          }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      });
+
+      const bal = await supplierService.checkSupplierBalanceViaDriver('zfour');
+      assert.strictEqual(bal.ok, true);
+      assert.strictEqual(bal.balanceUsdt, '92.7500');
+
+      const sync = await supplierService.syncSupplierViaDriver('zfour');
+      assert.strictEqual(sync.ok, true);
+      assert.strictEqual(sync.totalCount, 1);
+
+      const rec = await supplierService.lookupOrderReadOnly({
+        supplierId: 'zfour',
+        supplierOrderRef: 'zf_ref_200_fb',
+        idempotencyKey: 'idem_zf_200_fb',
+      });
+      assert.strictEqual(rec.ok, true);
+      assert.strictEqual(rec.found, true);
+      assert.strictEqual(rec.status, 'completed');
+      assert.deepStrictEqual(rec.delivered_items, ['ZF-200-FB-ITEM']);
+
+      // HTTP 200 { success: false } on /products must fail explicitly rather than wiping stock silently
+      supplierService.setFetchOverride(async (url: string) => {
+        if (url.endsWith('/v1/products')) {
+          return new Response(JSON.stringify({ success: false, message: 'Invalid supplier token' }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      });
+      const failedSync = await supplierService.syncSupplierViaDriver('zfour');
+      assert.strictEqual(failedSync.ok, false);
+      assert.ok(failedSync.message.includes('Invalid supplier token'));
+
+      // Core latency SLA check across catalog, supplier dashboard summaries, and ledger reconciliation
+      const t0 = performance.now();
+      await Promise.all([
+        pricingService.getCatalog({ includeHidden: false }),
+        supplierEcosystemService.getSupplierDashboardSummaries(),
+      ]);
+      const elapsedMs = performance.now() - t0;
+      assert.ok(elapsedMs < 500, `Expected core catalog + supplier dashboard queries under 500ms, took ${elapsedMs.toFixed(1)}ms`);
+    } finally {
+      supplierService.resetTestState();
+      await supplierService.setSupplierFlag('zfour', 'is_enabled', false, adminId).catch(() => {});
+      await supplierService.setSupplierFlag('zfour', 'sync_enabled', false, adminId).catch(() => {});
+      await db.query('DELETE FROM supplier_catalog_mirror WHERE supplier_id = $1', ['zfour']).catch(() => {});
+      await redis.del('supplier_ctrl:zfour').catch(() => {});
+    }
+  });
+
+  currentCategory = 'Final Production Hardening & Safeguards';
+  console.log(`\n--- ${currentCategory} ---`);
+
+  await it('Hardening 1: Admin/Wallet/Diagnostic/Simulator routes enforce ADMIN_API_SECRET and fail closed in production', 'mock_integration', async () => {
+    const origNodeEnv = process.env.NODE_ENV;
+    const origAdminSecret = process.env.ADMIN_API_SECRET;
+    const app = express();
+    app.use(express.json());
+    app.use(apiRouter);
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const address = server.address() as { port: number };
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+
+    try {
+      // 1. With ADMIN_API_SECRET configured -> unauthenticated and wrong secret requests get 401; valid Bearer succeeds
+      process.env.ADMIN_API_SECRET = 'prod_hardened_admin_secret_987654';
+      const unauthDeps = await fetch(`${baseUrl}/api/admin/deposits`);
+      assert.strictEqual(unauthDeps.status, 401, 'GET /api/admin/deposits must reject missing auth token');
+
+      const badWallet = await fetch(`${baseUrl}/api/wallet/123456789`, {
+        headers: { Authorization: 'Bearer wrong_secret' },
+      });
+      assert.strictEqual(badWallet.status, 401, 'GET /api/wallet/:userId must reject invalid Bearer token');
+
+      const badSim = await fetch(`${baseUrl}/api/telegram/simulate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ update_id: 1 }),
+      });
+      assert.strictEqual(badSim.status, 401, 'POST /api/telegram/simulate must reject unauthenticated calls when secret is set');
+
+      const validDeps = await fetch(`${baseUrl}/api/admin/deposits`, {
+        headers: { Authorization: 'Bearer prod_hardened_admin_secret_987654' },
+      });
+      assert.strictEqual(validDeps.status, 200, 'GET /api/admin/deposits must allow valid Bearer token');
+
+      const validWallet = await fetch(`${baseUrl}/api/wallet/123456789`, {
+        headers: { 'x-admin-api-secret': 'prod_hardened_admin_secret_987654' },
+      });
+      assert.strictEqual(validWallet.status, 200, 'GET /api/wallet/:userId must allow valid x-admin-api-secret header');
+
+      // 2. In NODE_ENV=production: simulator is always blocked (403) and missing ADMIN_API_SECRET fails closed (503)
+      process.env.NODE_ENV = 'production';
+      const prodSim = await fetch(`${baseUrl}/api/telegram/simulate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer prod_hardened_admin_secret_987654',
+        },
+        body: JSON.stringify({ update_id: 2 }),
+      });
+      assert.strictEqual(prodSim.status, 403, 'POST /api/telegram/simulate must be disabled in production');
+
+      delete process.env.ADMIN_API_SECRET;
+      const failClosedAdmin = await fetch(`${baseUrl}/api/admin/deposits`);
+      assert.strictEqual(failClosedAdmin.status, 503, 'Admin API must fail closed in production if ADMIN_API_SECRET is unset');
+      const failClosedDiag = await fetch(`${baseUrl}/api/binance/diagnostics`);
+      assert.strictEqual(failClosedDiag.status, 503, 'Binance diagnostics must fail closed in production if ADMIN_API_SECRET is unset');
+
+      // Public /api/health remains operational
+      const healthRes = await fetch(`${baseUrl}/api/health`);
+      assert.strictEqual(healthRes.status, 200);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (origNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = origNodeEnv;
+      if (origAdminSecret === undefined) delete process.env.ADMIN_API_SECRET;
+      else process.env.ADMIN_API_SECRET = origAdminSecret;
+    }
+  });
+
+  await it('Hardening 2: Timing-safe webhook secret, Giveaway atomic claim limit, and Referral bounds', 'mock_integration', async () => {
+    const origWebhookSecret = config.telegram.webhookSecret;
+    const gwUserA = '989101';
+    const gwUserB = '989102';
+    let gwId = '';
+    const adminId = String(config.telegram.adminIds[0]);
+
+    try {
+      await ensureAuditUser(gwUserA, '0.0000');
+      await ensureAuditUser(gwUserB, '0.0000');
+
+      // 1. Webhook secret check rejects mismatched secret cleanly
+      config.telegram.webhookSecret = 'super_secret_wh_token_abc';
+      const badWh = await telegramBotRouter.handleUpdate({ update_id: 99887766 }, 'wrong_token');
+      assert.strictEqual(badWh.ok, false);
+      assert.strictEqual(badWh.status, 'UNAUTHORIZED');
+
+      // 2. Giveaway global disable blocks claims & concurrent claims strictly enforce claim_limit=1
+      gwId = await giveawayService.createGiveaway(
+        {
+          title: 'Single Slot Hardening Giveaway',
+          rewardType: 'WALLET_CREDIT',
+          rewardAmountUsdt: '0.50',
+          claimLimit: 1,
+          isActive: true,
+          isPublic: true,
+        },
+        adminId
+      );
+
+      await giveawayService.updateSettings({ enabled: false }, adminId);
+      await assert.rejects(
+        () => giveawayService.claimGiveaway(gwId, gwUserA),
+        /currently disabled/i
+      );
+
+      await giveawayService.updateSettings({ enabled: true }, adminId);
+      const concurrentClaims = await Promise.allSettled([
+        giveawayService.claimGiveaway(gwId, gwUserA),
+        giveawayService.claimGiveaway(gwId, gwUserB),
+      ]);
+      const fulfilledCount = concurrentClaims.filter(r => r.status === 'fulfilled').length;
+      const rejectedCount = concurrentClaims.filter(r => r.status === 'rejected').length;
+      assert.strictEqual(fulfilledCount, 1, 'Exactly one concurrent claim must succeed for claim_limit=1');
+      assert.strictEqual(rejectedCount, 1, 'Second concurrent claim beyond claim_limit must be rejected');
+
+      // 3. Referral settings reject invalid percentage > 1 or negative threshold
+      await assert.rejects(
+        () => referralService.updateSettings({ rewardPercentage: '1.50' }, adminId),
+        /between 0 \(0%\) and 1 \(100%\)/i
+      );
+      await assert.rejects(
+        () => referralService.updateSettings({ minQualifyingOrderUsdt: '-5' }, adminId),
+        /between 0 and 100000/i
+      );
+    } finally {
+      config.telegram.webhookSecret = origWebhookSecret;
+      await giveawayService.updateSettings({ enabled: true }, adminId).catch(() => {});
+      await db.query('DELETE FROM giveaway_claims WHERE giveaway_id = $1', [gwId]).catch(() => {});
+      await db.query('DELETE FROM giveaways WHERE id = $1', [gwId]).catch(() => {});
+    }
+  });
+
+  await it('Hardening 3: Ticket ownership IDOR block, Pricing/Deposit validation, Global Wallet Reconciliation & Backup Readiness', 'mock_integration', async () => {
+    const ownerId = '989201';
+    const attackerId = '989202';
+    const adminId = String(config.telegram.adminIds[0]);
+    let ticketId = '';
+
+    try {
+      await ensureAuditUser(ownerId, '0.0000');
+      await ensureAuditUser(attackerId, '0.0000');
+
+      // 1. Cross-user customer reply on support ticket must fail
+      const tkt = await supportService.createTicketDetailed({
+        userId: ownerId,
+        issueType: 'GENERAL',
+        subject: 'Ownership test',
+        message: 'Initial customer question',
+      });
+      ticketId = tkt.id;
+
+      await assert.rejects(
+        () =>
+          supportService.addMessage({
+            ticketId,
+            senderType: 'CUSTOMER',
+            senderId: attackerId,
+            message: 'Injected third-party reply',
+          }),
+        /Access denied/i
+      );
+
+      // Owner and admin replies succeed cleanly
+      await supportService.addMessage({
+        ticketId,
+        senderType: 'CUSTOMER',
+        senderId: ownerId,
+        message: 'Legitimate owner follow-up',
+      });
+
+      // 2. Pricing & manual deposit reject negative / malformed values cleanly
+      await assert.rejects(() => pricingService.setFixedRetailPrice('any_prod', '0', adminId), /greater than 0/i);
+      await assert.rejects(() => pricingService.setFixedRetailPrice('any_prod', 'not-a-number', adminId), /Invalid fixed retail price/i);
+      await assert.rejects(() => pricingService.setFixedMarkup('any_prod', '-1.25', adminId), /non-negative/i);
+      await assert.rejects(
+        () =>
+          manualPaymentService.submitDeposit({
+            userId: ownerId,
+            methodCode: 'EASYPAISA',
+            amount: 'invalid_amt' as any,
+            txid: 'TX-BAD-AMT',
+          }),
+        /Invalid deposit amount/i
+      );
+
+      // 3. Global wallet reconciliation & backup/restore readiness checks
+      const globalRecon = await walletService.reconcileAllWallets();
+      assert.strictEqual(globalRecon.unbalancedCount, 0, 'All wallets must reconcile 1:1 with immutable ledger entries');
+      assert.strictEqual(globalRecon.negativeBalanceCount, 0);
+      assert.strictEqual(globalRecon.invalidLockCount, 0);
+
+      const backupReadiness = await launchAuditService.getBackupAndRestoreReadiness();
+      assert.strictEqual(backupReadiness.migrationCount >= 10, true, 'All 10 schema migrations must be applied');
+      assert.strictEqual(backupReadiness.encryptionReady, true, 'AES-256-GCM encryption must be verified');
+      assert.strictEqual(backupReadiness.walletReconciled, true, 'Wallet ledger must be globally reconciled');
+      assert.strictEqual(backupReadiness.settingsExportAvailable, true, 'UI/settings backup export must be operational');
+    } finally {
+      if (ticketId) {
+        await db.query('DELETE FROM support_messages WHERE ticket_id = $1', [ticketId]).catch(() => {});
+        await db.query('DELETE FROM support_tickets WHERE id = $1', [ticketId]).catch(() => {});
+      }
     }
   });
 

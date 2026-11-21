@@ -58,6 +58,9 @@ export class SupportService {
     let ticketNumber = 101;
 
     await db.withTransaction(async (client) => {
+      if (!db.getIsInMemory()) {
+        await client.query('SELECT pg_advisory_xact_lock(7421001)');
+      }
       const maxRow = await client.queryRow<{ maxNum: number | string | null }>(
         'SELECT COALESCE(MAX(ticket_number), 100) as "maxNum" FROM support_tickets'
       );
@@ -113,6 +116,9 @@ export class SupportService {
       );
       if (!tkt) {
         throw new Error(`Ticket ${params.ticketId} not found.`);
+      }
+      if (params.senderType === 'CUSTOMER' && String(tkt.user_id) !== String(params.senderId)) {
+        throw new Error('Access denied: You can only reply to your own support tickets.');
       }
       if (tkt.status === 'CLOSED' && params.senderType === 'ADMIN') {
         throw new Error('This ticket is already closed.');

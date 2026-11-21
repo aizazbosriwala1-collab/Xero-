@@ -387,15 +387,37 @@ export class ReferralService {
 
   public async updateSettings(patch: Partial<ReferralSettings>, adminId: string): Promise<ReferralSettings> {
     const curr = await this.getSettings();
+    let minOrderStr = curr.minQualifyingOrderUsdt;
+    if (patch.minQualifyingOrderUsdt !== undefined) {
+      let d: Decimal;
+      try {
+        d = new Decimal(patch.minQualifyingOrderUsdt);
+      } catch {
+        throw new Error('Minimum qualifying order amount must be a valid number.');
+      }
+      if (!d.isFinite() || d.lessThan(0) || d.greaterThan(100000)) {
+        throw new Error('Minimum qualifying order amount must be between 0 and 100000 USDT.');
+      }
+      minOrderStr = d.toFixed(2);
+    }
+
+    let rewardPctStr = curr.rewardPercentage;
+    if (patch.rewardPercentage !== undefined) {
+      let pct: Decimal;
+      try {
+        pct = new Decimal(patch.rewardPercentage);
+      } catch {
+        throw new Error('Referral reward percentage must be a valid decimal fraction.');
+      }
+      if (!pct.isFinite() || pct.lessThan(0) || pct.greaterThan(1)) {
+        throw new Error('Referral reward percentage must be between 0 (0%) and 1 (100%).');
+      }
+      rewardPctStr = pct.toFixed(4);
+    }
+
     const next: ReferralSettings = {
-      minQualifyingOrderUsdt:
-        patch.minQualifyingOrderUsdt !== undefined
-          ? new Decimal(patch.minQualifyingOrderUsdt).toFixed(2)
-          : curr.minQualifyingOrderUsdt,
-      rewardPercentage:
-        patch.rewardPercentage !== undefined
-          ? new Decimal(patch.rewardPercentage).toFixed(4)
-          : curr.rewardPercentage,
+      minQualifyingOrderUsdt: minOrderStr,
+      rewardPercentage: rewardPctStr,
       rewardsEnabled: patch.rewardsEnabled !== undefined ? Boolean(patch.rewardsEnabled) : curr.rewardsEnabled,
     };
 
@@ -654,50 +676,58 @@ export class ReferralService {
       );
     }
 
-    const existing = await db.queryRow<any>(
-      'SELECT id FROM referral_reward_claims WHERE tier_id = $1 AND user_id = $2',
-      [tierId, userId]
-    );
-    if (existing) {
-      throw new Error('You have already claimed this referral reward tier.');
-    }
-
     const claimId = `rfc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
-    await db.withTransaction(async (client) => {
-      await client.query(
-        `INSERT INTO referral_reward_claims (id, tier_id, user_id, status, reward_details, claimed_at)
-         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
-        [
-          claimId,
-          tierId,
-          userId,
-          tier.rewardType === 'WALLET_USDT' ? 'CREDITED' : 'PENDING_FULFILLMENT',
-          JSON.stringify({
-            title: tier.title,
-            rewardType: tier.rewardType,
-            rewardAmount: tier.rewardAmount,
-            rewardProductId: tier.rewardProductId,
-            rewardQuantity: tier.rewardQuantity,
-          }),
-        ]
-      );
+    try {
+      await db.withTransaction(async (client) => {
+        const existing = await client.queryRow<any>(
+          'SELECT id FROM referral_reward_claims WHERE tier_id = $1 AND user_id = $2',
+          [tierId, userId]
+        );
+        if (existing) {
+          throw new Error('You have already claimed this referral reward tier.');
+        }
 
-      if (tier.rewardType === 'WALLET_USDT' && new Decimal(tier.rewardAmount).greaterThan(0)) {
-        await walletService.executeMutation({
-          userId,
-          amount: new Decimal(tier.rewardAmount),
-          operationRef: `REF_TIER_${tierId}_${userId}`,
-          idempotencyKey: `REF_TIER_${tierId}_${userId}`,
-          entryType: 'REFERRAL_REWARD',
-          reason: `Referral milestone reward: ${tier.title}`,
-          source: 'REFERRAL_REWARD_TIER',
-          actor: 'SYSTEM',
-          metadata: { tierId, claimId, qualifiedCount: stats.qualifiedCount },
-          client,
-        });
+        await client.query(
+          `INSERT INTO referral_reward_claims (id, tier_id, user_id, status, reward_details, claimed_at)
+           VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
+          [
+            claimId,
+            tierId,
+            userId,
+            tier.rewardType === 'WALLET_USDT' ? 'CREDITED' : 'PENDING_FULFILLMENT',
+            JSON.stringify({
+              title: tier.title,
+              rewardType: tier.rewardType,
+              rewardAmount: tier.rewardAmount,
+              rewardProductId: tier.rewardProductId,
+              rewardQuantity: tier.rewardQuantity,
+            }),
+          ]
+        );
+
+        if (tier.rewardType === 'WALLET_USDT' && new Decimal(tier.rewardAmount).greaterThan(0)) {
+          await walletService.executeMutation({
+            userId,
+            amount: new Decimal(tier.rewardAmount),
+            operationRef: `REF_TIER_${tierId}_${userId}`,
+            idempotencyKey: `REF_TIER_${tierId}_${userId}`,
+            entryType: 'REFERRAL_REWARD',
+            reason: `Referral milestone reward: ${tier.title}`,
+            source: 'REFERRAL_REWARD_TIER',
+            actor: 'SYSTEM',
+            metadata: { tierId, claimId, qualifiedCount: stats.qualifiedCount },
+            client,
+          });
+        }
+      });
+    } catch (err: any) {
+      const msg = String(err?.message || '').toLowerCase();
+      if (err?.code === '23505' || msg.includes('duplicate') || msg.includes('unique')) {
+        throw new Error('You have already claimed this referral reward tier.');
       }
-    });
+      throw err;
+    }
 
     logger.info('Referral reward tier claimed', { tierId, userId, rewardType: tier.rewardType });
 

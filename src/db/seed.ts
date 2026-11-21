@@ -117,10 +117,10 @@ export async function seedInitialData(): Promise<void> {
   `, ['aitoolshop', 'Main Supplier (AiToolShop)', config.supplier.baseUrl]);
 
   const futureCandidates = [
-    { id: 'ventebot', name: 'VenteBot', url: 'https://api.ventebot.example/v1', priority: 200, driverKey: 'ventebot' },
-    { id: 'nystore', name: 'NyStore', url: 'https://api.nystore.example/v1', priority: 300, driverKey: 'nystore' },
-    { id: 'cupponshub', name: "Cuppon'sHub", url: 'https://api.cupponshub.example/v1', priority: 400, driverKey: 'cupponshub' },
-    { id: 'zfour', name: 'ZFour', url: 'https://api.zfour.example/v1', priority: 500, driverKey: 'zfour' },
+    { id: 'ventebot', name: 'VenteBot', url: config.suppliers.ventebot.baseUrl, priority: 200, driverKey: 'ventebot' },
+    { id: 'nystore', name: 'NyStore', url: config.suppliers.nystore.baseUrl, priority: 300, driverKey: 'nystore' },
+    { id: 'cupponshub', name: "Cuppon'sHub", url: config.suppliers.cupponshub.baseUrl, priority: 400, driverKey: 'cupponshub' },
+    { id: 'zfour', name: 'ZFour', url: config.suppliers.zfour.baseUrl, priority: 500, driverKey: 'zfour' },
   ];
 
   for (const sup of futureCandidates) {
@@ -130,7 +130,13 @@ export async function seedInitialData(): Promise<void> {
         is_enabled, routing_enabled, ordering_enabled, sync_enabled,
         created_at, updated_at
       ) VALUES ($1, $2, $3, $4, $5, 'Offline', 20.0000, FALSE, FALSE, FALSE, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      ON CONFLICT (id) DO NOTHING`,
+      ON CONFLICT (id) DO UPDATE SET
+        base_url = CASE
+          WHEN suppliers.base_url IS NULL OR suppliers.base_url = '' OR suppliers.base_url LIKE '%.example%' OR suppliers.base_url LIKE '%.invalid%'
+          THEN EXCLUDED.base_url
+          ELSE suppliers.base_url
+        END,
+        driver_key = COALESCE(suppliers.driver_key, EXCLUDED.driver_key)`,
       [sup.id, sup.name, sup.url, sup.priority, sup.driverKey]
     );
   }

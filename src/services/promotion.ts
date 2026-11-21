@@ -92,6 +92,7 @@ export class PromotionService {
   private readonly cfgCacheKey = 'auto_promo:cfg';
   private readonly listCacheKey = 'auto_promo:channels';
   private schedulerTimer: NodeJS.Timeout | null = null;
+  private cycleInFlight = false;
 
   private async invalidateCaches(): Promise<void> {
     await Promise.all([
@@ -856,20 +857,28 @@ export class PromotionService {
   }
 
   public async runAutoPromotionCycle(): Promise<PromotionBroadcastSummary | null> {
-    const cfg = await this.getConfig();
-    if (!cfg.enabled) return null;
-
-    if (cfg.lastPostedAt) {
-      const elapsedMs = Date.now() - new Date(cfg.lastPostedAt).getTime();
-      if (elapsedMs < cfg.intervalMinutes * 60_000) {
-        return null;
-      }
+    if (this.cycleInFlight) {
+      return null;
     }
+    this.cycleInFlight = true;
+    try {
+      const cfg = await this.getConfig();
+      if (!cfg.enabled) return null;
 
-    const channels = await this.listChannels(true);
-    if (channels.length === 0) return null;
+      if (cfg.lastPostedAt) {
+        const elapsedMs = Date.now() - new Date(cfg.lastPostedAt).getTime();
+        if (elapsedMs < cfg.intervalMinutes * 60_000) {
+          return null;
+        }
+      }
 
-    return await this.postPromotion({ adminId: 'AUTO_PROMO_SCHEDULER' });
+      const channels = await this.listChannels(true);
+      if (channels.length === 0) return null;
+
+      return await this.postPromotion({ adminId: 'AUTO_PROMO_SCHEDULER' });
+    } finally {
+      this.cycleInFlight = false;
+    }
   }
 
   public startScheduler(pollEveryMs = 60_000): void {

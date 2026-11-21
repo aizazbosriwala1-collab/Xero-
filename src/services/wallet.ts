@@ -290,6 +290,80 @@ export class WalletService {
   }
 
   /**
+   * Reconcile ALL wallets against immutable ledger_entries sums and check balance invariants.
+   */
+  public async reconcileAllWallets(): Promise<{
+    totalWallets: number;
+    unbalancedCount: number;
+    negativeBalanceCount: number;
+    invalidLockCount: number;
+    discrepancies: Array<{
+      userId: string;
+      walletBalance: string;
+      lockedBalance: string;
+      ledgerSum: string;
+    }>;
+  }> {
+    const res = await db.query<{
+      user_id: string;
+      balance: string;
+      locked_balance: string;
+      ledger_sum: string;
+    }>(`
+      SELECT
+        w.user_id,
+        w.balance::text AS balance,
+        w.locked_balance::text AS locked_balance,
+        COALESCE(SUM(l.amount), 0)::text AS ledger_sum
+      FROM wallets w
+      LEFT JOIN ledger_entries l ON l.user_id = w.user_id
+      GROUP BY w.user_id, w.balance, w.locked_balance
+    `);
+
+    const discrepancies: Array<{
+      userId: string;
+      walletBalance: string;
+      lockedBalance: string;
+      ledgerSum: string;
+    }> = [];
+    let negativeBalanceCount = 0;
+    let invalidLockCount = 0;
+
+    for (const row of res.rows) {
+      const bal = new Decimal(row.balance || 0);
+      const locked = new Decimal(row.locked_balance || 0);
+      const sum = new Decimal(row.ledger_sum || 0);
+      if (bal.isNegative() || locked.isNegative()) negativeBalanceCount++;
+      if (locked.greaterThan(bal)) invalidLockCount++;
+      if (!bal.equals(sum) || bal.isNegative() || locked.isNegative() || locked.greaterThan(bal)) {
+        discrepancies.push({
+          userId: row.user_id,
+          walletBalance: bal.toFixed(4),
+          lockedBalance: locked.toFixed(4),
+          ledgerSum: sum.toFixed(4),
+        });
+      }
+    }
+
+    if (discrepancies.length > 0) {
+      logger.error('Global wallet-ledger reconciliation discrepancy detected!', {
+        totalWallets: res.rows.length,
+        unbalancedCount: discrepancies.length,
+        negativeBalanceCount,
+        invalidLockCount,
+      });
+    }
+
+    return {
+      totalWallets: res.rows.length,
+      unbalancedCount: discrepancies.length,
+      negativeBalanceCount,
+      invalidLockCount,
+      discrepancies,
+    };
+  }
+
+  /**
    * List recent ledger entries for user or admin.
    */
   public async getHistory(userId: string, limit = 20): Promise<LedgerEntry[]> {

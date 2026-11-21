@@ -25,6 +25,7 @@ class DatabaseManager {
   private memTxQueue: Promise<void> = Promise.resolve();
 
   constructor() {
+    const isProd = config.nodeEnv === 'production';
     if (config.databaseUrl) {
       try {
         this.pool = new pg.Pool({
@@ -36,10 +37,19 @@ class DatabaseManager {
         this.isInMemory = false;
         logger.info('Initialized PostgreSQL connection pool with DATABASE_URL');
       } catch (err: any) {
+        if (isProd) {
+          logger.error('Fatal: Failed to initialize PostgreSQL pool in production', { error: err.message });
+          throw err;
+        }
         logger.warn('Failed to initialize PostgreSQL pool, falling back to in-memory PostgreSQL engine', { error: err.message });
         this.setupInMemory();
       }
     } else {
+      if (isProd) {
+        const msg = 'Fatal: DATABASE_URL is required in production (ephemeral in-memory DB fallback is disabled).';
+        logger.error(msg);
+        throw new Error(msg);
+      }
       logger.info('No DATABASE_URL configured. Initializing in-memory PostgreSQL engine for local development/testing');
       this.setupInMemory();
     }

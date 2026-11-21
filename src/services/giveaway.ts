@@ -297,66 +297,72 @@ export class GiveawayService {
     rewardType?: GiveawayRewardType;
     creditedUsdt?: string;
   }> {
-    const giveaway = await db.queryRow<any>(
-      'SELECT * FROM giveaways WHERE id = $1 AND is_active = TRUE',
-      [giveawayId]
-    );
-
-    if (!giveaway) {
-      throw new Error('This giveaway is not active or could not be found.');
-    }
-
-    if (giveaway.is_public === false) {
-      throw new Error('This giveaway is currently private.');
-    }
-
-    const now = Date.now();
-    if (giveaway.start_at && new Date(giveaway.start_at).getTime() > now) {
-      throw new Error('This giveaway has not started yet.');
-    }
-    if (giveaway.end_at && new Date(giveaway.end_at).getTime() <= now) {
-      throw new Error('This giveaway has already ended.');
-    }
-
-    const claimLimit = Number(giveaway.claim_limit || 100);
-    const claimsCount = Number(giveaway.claims_count || 0);
-    if (claimsCount >= claimLimit) {
-      throw new Error('The maximum claim limit for this giveaway has been reached.');
-    }
-
-    const existingClaim = await db.queryRow<any>(
-      'SELECT * FROM giveaway_claims WHERE giveaway_id = $1 AND user_id = $2',
-      [giveawayId, userId]
-    );
-    if (existingClaim) {
-      throw new Error('You have already claimed this giveaway reward.');
+    const settings = await this.getSettings();
+    if (!settings.enabled) {
+      throw new Error('Giveaways are currently disabled by administrator.');
     }
 
     const stats = await referralService.getStats(userId, undefined, { bypassCache: true });
-    const reqTotal = Number(giveaway.required_total_referrals || 0);
-    const reqQual = Number(giveaway.required_qualified_referrals || 0);
 
-    if (reqTotal > 0 && stats.totalReferred < reqTotal) {
-      throw new Error(`You need at least ${reqTotal} referrals (total required). Current: ${stats.totalReferred}.`);
-    }
-    if (reqQual > 0 && stats.qualifiedCount < reqQual) {
-      throw new Error(`You need at least ${reqQual} qualified referrals. Current: ${stats.qualifiedCount}.`);
-    }
+    const txOutcome = await db.withTransaction(async (client) => {
+      const giveaway = await client.queryRow<any>(
+        'SELECT * FROM giveaways WHERE id = $1 AND is_active = TRUE FOR UPDATE',
+        [giveawayId]
+      );
 
-    const rewardType: GiveawayRewardType =
-      giveaway.reward_type === 'CUSTOM_PRODUCT' || giveaway.reward_type === 'WALLET_CREDIT' || giveaway.reward_type === 'STORE_PRODUCT'
-        ? giveaway.reward_type
-        : giveaway.reward_product_id
-        ? 'STORE_PRODUCT'
-        : Number(giveaway.reward_amount_usdt || 0) > 0
-        ? 'WALLET_CREDIT'
-        : 'CUSTOM_PRODUCT';
+      if (!giveaway) {
+        throw new Error('This giveaway is not active or could not be found.');
+      }
 
-    const rewardAmountDec = new Decimal(giveaway.reward_amount_usdt || 0);
-    const claimId = `claim_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    const claimStatus = rewardType === 'WALLET_CREDIT' ? 'FULFILLED' : 'PENDING';
+      if (giveaway.is_public === false) {
+        throw new Error('This giveaway is currently private.');
+      }
 
-    await db.withTransaction(async (client) => {
+      const now = Date.now();
+      if (giveaway.start_at && new Date(giveaway.start_at).getTime() > now) {
+        throw new Error('This giveaway has not started yet.');
+      }
+      if (giveaway.end_at && new Date(giveaway.end_at).getTime() <= now) {
+        throw new Error('This giveaway has already ended.');
+      }
+
+      const claimLimit = Number(giveaway.claim_limit || 100);
+      const claimsCount = Number(giveaway.claims_count || 0);
+      if (claimsCount >= claimLimit) {
+        throw new Error('The maximum claim limit for this giveaway has been reached.');
+      }
+
+      const existingClaim = await client.queryRow<any>(
+        'SELECT id FROM giveaway_claims WHERE giveaway_id = $1 AND user_id = $2',
+        [giveawayId, userId]
+      );
+      if (existingClaim) {
+        throw new Error('You have already claimed this giveaway reward.');
+      }
+
+      const reqTotal = Number(giveaway.required_total_referrals || 0);
+      const reqQual = Number(giveaway.required_qualified_referrals || 0);
+
+      if (reqTotal > 0 && stats.totalReferred < reqTotal) {
+        throw new Error(`You need at least ${reqTotal} referrals (total required). Current: ${stats.totalReferred}.`);
+      }
+      if (reqQual > 0 && stats.qualifiedCount < reqQual) {
+        throw new Error(`You need at least ${reqQual} qualified referrals. Current: ${stats.qualifiedCount}.`);
+      }
+
+      const rewardType: GiveawayRewardType =
+        giveaway.reward_type === 'CUSTOM_PRODUCT' || giveaway.reward_type === 'WALLET_CREDIT' || giveaway.reward_type === 'STORE_PRODUCT'
+          ? giveaway.reward_type
+          : giveaway.reward_product_id
+          ? 'STORE_PRODUCT'
+          : Number(giveaway.reward_amount_usdt || 0) > 0
+          ? 'WALLET_CREDIT'
+          : 'CUSTOM_PRODUCT';
+
+      const rewardAmountDec = new Decimal(giveaway.reward_amount_usdt || 0);
+      const claimId = `claim_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      const claimStatus = rewardType === 'WALLET_CREDIT' ? 'FULFILLED' : 'PENDING';
+
       if (rewardType === 'WALLET_CREDIT') {
         if (rewardAmountDec.lessThanOrEqualTo(0)) {
           throw new Error('Giveaway wallet reward amount is misconfigured.');
@@ -380,12 +386,19 @@ export class GiveawayService {
         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
       `, [claimId, giveawayId, userId, claimStatus]);
 
-      await client.query(`
+      const incRes = await client.query(`
         UPDATE giveaways
         SET claims_count = claims_count + 1, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $1
+        WHERE id = $1 AND claims_count < claim_limit
       `, [giveawayId]);
+      if (incRes.rowCount === 0) {
+        throw new Error('The maximum claim limit for this giveaway has been reached.');
+      }
+
+      return { claimId, rewardType, rewardAmountDec, rewardLabel: giveaway.reward_label, rewardProductId: giveaway.reward_product_id, title: giveaway.title };
     });
+
+    const { claimId, rewardType, rewardAmountDec, rewardLabel, title } = txOutcome;
 
     await this.invalidateCaches();
     logger.info('Giveaway claimed by user', { giveawayId, userId, claimId, rewardType });
@@ -406,7 +419,7 @@ export class GiveawayService {
         success: true,
         claimId,
         rewardType,
-        message: `Giveaway claimed! Your reward (${giveaway.reward_label || giveaway.title}) has been recorded for delivery.`,
+        message: `Giveaway claimed! Your reward (${rewardLabel || title}) has been recorded for delivery.`,
       };
     }
 

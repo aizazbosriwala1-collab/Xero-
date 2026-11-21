@@ -35,8 +35,23 @@ async function startServer() {
   logger.info(`LIVE_ORDERING_ENABLED: ${config.safety.liveOrderingEnabled}`);
   logger.info('Runtime configuration loaded safely', { config: sanitized });
 
+  const isProd = (process.env.NODE_ENV || config.nodeEnv) === 'production';
+  if (isProd && !config.telegram.webhookSecret) {
+    logger.warn('SECURITY WARNING: TELEGRAM_WEBHOOK_SECRET is not set in production.');
+  }
+  if (isProd && !config.adminApiSecret) {
+    logger.warn('SECURITY WARNING: ADMIN_API_SECRET is not set in production (admin HTTP routes are fail-closed).');
+  }
+
   // 1. Initialize Express App
   const app = express();
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
   app.use(express.json({
     limit: '10mb',
     verify: (req: any, _res, buf) => {
@@ -54,6 +69,7 @@ async function startServer() {
     } else {
       logger.info('Database schema verified from pre-deploy migration');
     }
+    await supplierService.syncConfiguredSupplierEndpoints();
     const { uiConfigService } = await import('./src/services/uiConfig.js');
     await uiConfigService.ensureLoaded();
     uiConfigService.setCommandsChangeListener(() => {
@@ -65,9 +81,11 @@ async function startServer() {
 
   // 3. Mount API Routes & Health endpoints
   app.use(apiRouter);
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found' });
+  });
 
   // 4. Vite middleware (development) or Static files (production)
-  const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
     try {
       const { createServer: createViteServer } = await import('vite');
